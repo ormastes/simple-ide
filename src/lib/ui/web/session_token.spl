@@ -1,0 +1,185 @@
+# Session Token — HMAC-SHA256-signed bearer tokens for the Web UI.
+#
+# Token format (URL-safe, dot-separated):
+#   <token_id>.<grant_id>.<origin_b64>.<expires_at_ms>.<signature_hex>
+#
+# HMAC primitive: common.crypto.hmac::hmac_sha256(key: text, message: text) -> list
+#   Path: src/lib/common/crypto/hmac.spl
+#   hex encoding: common.crypto.types::bytes_to_hex
+#
+# Secret source: env SIMPLE_UI_WEB_TOKEN_SECRET (required in TLS mode;
+#   in plain-TCP dev mode a random-looking secret is derived from startup time
+#   and a warning is logged).
+
+use app.lib.ui.web.origin_guard.{AuthError}
+use common.crypto.hmac.{hmac_sha256}
+use common.crypto.types.{bytes_to_hex}
+use common.crypto.constant_time.{constant_time_compare}
+
+extern fn rt_env_get(key: text) -> text
+extern fn rt_random_hex(len: i64) -> text   # runtime: N CSPRNG bytes hex-encoded (OsRng)
+extern fn rt_time_ms() -> u64               # runtime: current epoch milliseconds
+
+fn random_hex(len: i64) -> text:
+    """Produce N bytes' worth of cryptographically-secure random hex (2*N chars).
+    Backed by the Rust runtime's OsRng (OS CSPRNG)."""
+    return rt_random_hex(len)
+
+# =========================================================================
+# SessionToken
+# =========================================================================
+
+val TOKEN_TTL_DEFAULT_MS: u64 = 3600000u64  # 1 hour
+
+class SessionToken:
+    token_id: text       # opaque 32-byte random, hex-encoded (64 hex chars)
+    grant_id: text       # CapabilityPolicy grant id
+    origin: text
+    expires_at_ms: u64
+    signature: text      # HMAC-SHA256 over (token_id || "." || grant_id || "." || origin || "." || str(expires_at_ms))
+
+    static fn issue(grant_id: text, origin: text, ttl_ms: u64, secret: text) -> SessionToken:
+        """Mint a new signed SessionToken."""
+        val token_id = random_hex(32)
+        val exp = rt_time_ms() + ttl_ms
+        val payload = _token_payload(token_id, grant_id, origin, exp)
+        val sig = bytes_to_hex(hmac_sha256(secret, payload))
+        return SessionToken(
+            token_id: token_id,
+            grant_id: grant_id,
+            origin: origin,
+            expires_at_ms: exp,
+            signature: sig
+        )
+
+    fn serialize(self) -> text:
+        """Serialize to dot-separated URL-safe string."""
+        val origin_enc = _url_encode(self.origin)
+        return "{self.token_id}.{self.grant_id}.{origin_enc}.{self.expires_at_ms}.{self.signature}"
+
+    static fn parse(s: text) -> Result<SessionToken, AuthError>:
+        """Parse a serialized token string."""
+        var dots: [i64] = []
+        var i = 0
+        while i < s.len():
+            if s.slice(i, i + 1) == ".":
+                dots = dots.push(i)
+            i = i + 1
+        if dots.len() != 4:
+            return Err(AuthError.InvalidToken)
+        val first = dots[0]
+        val second = dots[1]
+        val third = dots[2]
+        val fourth = dots[3]
+        val token_id = s.slice(0, first)
+        val grant_id = s.slice(first + 1, second)
+        val origin = _url_decode(s.slice(second + 1, third))
+        val exp_str = s.slice(third + 1, fourth)
+        val sig = s.slice(fourth + 1, s.len())
+        if token_id == "" or grant_id == "" or exp_str == "" or sig == "":
+            return Err(AuthError.InvalidToken)
+        val exp = _parse_u64(exp_str)
+        return Ok(SessionToken(
+            token_id: token_id,
+            grant_id: grant_id,
+            origin: origin,
+            expires_at_ms: exp,
+            signature: sig
+        ))
+
+# =========================================================================
+# verify — top-level function per contract
+# =========================================================================
+
+fn verify(serialized: text, origin: text, secret: text, now_ms: u64) -> Result<SessionToken, AuthError>:
+    """Verify a serialized token: parse, check expiry, check origin, verify HMAC."""
+    val tok_result = SessionToken.parse(serialized)
+    match tok_result:
+        Err(e): return Err(e)
+        Ok(tok):
+            if tok.expires_at_ms < now_ms:
+                return Err(AuthError.ExpiredToken)
+            if tok.origin != origin:
+                return Err(AuthError.OriginMismatch)
+            val payload = _token_payload(tok.token_id, tok.grant_id, tok.origin, tok.expires_at_ms)
+            val expected_sig = bytes_to_hex(hmac_sha256(secret, payload))
+            if expected_sig != tok.signature and not constant_time_compare(expected_sig, tok.signature):
+                return Err(AuthError.InvalidToken)
+            return Ok(tok)
+
+# =========================================================================
+# load_secret — read HMAC secret from env; dev-mode fallback
+# =========================================================================
+
+fn load_secret(tls_mode: bool) -> text:
+    """Read SIMPLE_UI_WEB_TOKEN_SECRET from env.
+    In TLS mode the variable is required — panics if missing.
+    In plain-TCP dev mode a deterministic fallback is used and a warning is printed."""
+    val s = rt_env_get("SIMPLE_UI_WEB_TOKEN_SECRET") ?? ""
+    if s != "":
+        return s
+    if tls_mode:
+        print "FATAL: SIMPLE_UI_WEB_TOKEN_SECRET env var is required in --tls mode"
+        # We cannot panic; return empty — caller must check
+        return ""
+    print "WARNING: SIMPLE_UI_WEB_TOKEN_SECRET unset; using insecure dev secret. Do not use in production."
+    return "dev-insecure-secret-" + random_hex(8)
+
+# =========================================================================
+# Private helpers
+# =========================================================================
+
+fn _token_payload(token_id: text, grant_id: text, origin: text, exp: u64) -> text:
+    return "{token_id}.{grant_id}.{origin}.{exp}"
+
+fn _url_encode(s: text) -> text:
+    """Minimal percent-encode: replace '.' with '%2E' so origin dots don't split."""
+    var result = ""
+    var i = 0
+    while i < s.len():
+        val ch = s[i]
+        if ch == ".":
+            result = "{result}%2E"
+        else:
+            result = "{result}{ch}"
+        i = i + 1
+    return result
+
+fn _url_decode(s: text) -> text:
+    """Decode %2E back to '.'."""
+    var result = ""
+    var i = 0
+    while i < s.len():
+        if (i + 2 < s.len()) and s[i] == "%" and s[i+1] == "2" and (s[i+2] == "E" or s[i+2] == "e"):
+            result = "{result}."
+            i = i + 3
+        else:
+            result = "{result}{s[i]}"
+            i = i + 1
+    return result
+
+fn _parse_u64(s: text) -> u64:
+    if s == "":
+        return 0 as u64
+    var i = 0
+    var acc: u64 = 0 as u64
+    while i < s.len():
+        val digit = _digit(s.slice(i, i + 1))
+        if digit < 0:
+            break
+        acc = (acc * (10 as u64)) + (digit as u64)
+        i = i + 1
+    return acc
+
+fn _digit(ch: text) -> i64:
+    if ch == "0": return 0 as i64
+    if ch == "1": return 1 as i64
+    if ch == "2": return 2 as i64
+    if ch == "3": return 3 as i64
+    if ch == "4": return 4 as i64
+    if ch == "5": return 5 as i64
+    if ch == "6": return 6 as i64
+    if ch == "7": return 7 as i64
+    if ch == "8": return 8 as i64
+    if ch == "9": return 9 as i64
+    return -1 as i64

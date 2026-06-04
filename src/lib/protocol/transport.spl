@@ -1,0 +1,75 @@
+# Shared JSON-RPC Transport Layer
+# Handles Content-Length protocol over stdin/stdout
+# Used by both LSP and DAP servers
+
+
+import sys
+import io.stdio as stdio
+import core.json as json
+
+# Read a JSON-RPC message from stdin
+# Messages use Content-Length header protocol:
+#   Content-Length: 123\r\n
+#   \r\n
+#   {json payload}
+fn read_message() -> Result<Dict, String>:
+    var content_length: Option<Int> = nil
+
+    loop:
+        val line = stdio.read_line()?
+        val trimmed = line.trim()
+
+        if trimmed.is_empty():
+            break
+
+        if trimmed.starts_with("Content-Length:"):
+            val parts = trimmed.split(":")
+            if parts.len() >= 2:
+                val length_str = parts[1].trim()
+                match length_str.parse_int():
+                    case Ok(length):
+                        content_length = Some(length)
+                    case Err(e):
+                        return Err("Invalid Content-Length: {e}")
+
+    match content_length:
+        case nil:
+            return Err("Missing Content-Length header")
+        case Some(length):
+            val content = stdio.read_exact(length)?
+
+            match json.parse(content):
+                case Ok(parsed):
+                    match parsed:
+                        case Dict(dict):
+                            return Ok(dict)
+                        case _:
+                            return Err("JSON payload is not an object")
+                case Err(e):
+                    return Err("JSON parse error: {e}")
+
+# Write a JSON-RPC message to stdout
+# Adds Content-Length header and proper formatting
+fn write_message(data: Dict) -> Result<Nil, String>:
+    val json_str = json.stringify(data)?
+    val content_bytes = json_str.as_bytes()
+    val content_length = content_bytes.len()
+
+    var message = "Content-Length: {content_length}\r\n"
+    message = message + "\r\n"
+    message = message + json_str
+
+    stdio.write(message)?
+    stdio.flush()?
+
+    Ok(nil)
+
+# Configurable debug logger
+fn log_debug_with_prefix(env_var: String, prefix: String, message: String):
+    # No-op in bootstrap: sys.env.get() crashes in native binaries
+    pass_dn
+
+# Configurable error logger
+fn log_error_with_prefix(prefix: String, message: String):
+    stdio.write_stderr("[{prefix} ERROR] {message}\n")
+

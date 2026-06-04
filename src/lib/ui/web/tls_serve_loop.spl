@@ -1,0 +1,445 @@
+# TLS Serve Loop
+#
+# TLS accept loop mirroring async_server.serve_loop but using
+# rt_tls_server_accept / rt_tls_server_read / rt_tls_server_write / rt_tls_server_close_connection
+# from std.nogc_sync_mut.io.tls_sffi.
+#
+# ConnStream wraps both TcpStream and TlsServerConnection so that ws_handler,
+# ui_routes, and async_server can use a single stream type for both transports.
+
+use std.nogc_sync_mut.io.tls_sffi.{
+    rt_tls_server_accept,
+    rt_tls_server_read,
+    rt_tls_server_write,
+    rt_tls_server_write_bytes,
+    rt_tls_server_close_connection
+}
+use std.nogc_sync_mut.io.sffi_common.{is_valid_handle}
+use std.nogc_sync_mut.io.tcp.{TcpStream}
+use std.nogc_async_mut.concurrent.thread.{thread_spawn2, thread_sleep}
+use common.ui.widget.{UIEvent, UIState}
+use nogc_sync_mut.ui.parse.sdn_tree.{parse_ui_to_tree}
+use common.ui.state.{init_state}
+use nogc_sync_mut.ui.session.{UISession}
+use nogc_sync_mut.ui.access_store.{ui_access_store_runtime_open_with_override}
+use app.lib.ui.web.bounded_channel.{BoundedChannel}
+use app.lib.ui.web.html.{generate_html_page}
+use app.lib.ui.web.origin_guard.{OriginGuard}
+use app.lib.ui.web.session_token.{load_secret}
+use app.lib.ui.web.ws_handler.{handle_ws_upgrade, send_ws_text}
+use app.lib.ui.web.ui_routes.{dispatch_ui_route}
+
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_tls_server_write_bytes(handle: i64, data: [u8]) -> i64
+
+# =========================================================================
+# ConnStream — thin adapter wrapping either a TLS connection handle or a
+# plain TcpStream, giving ws_handler and ui_routes a single stream surface.
+#
+# kind == "tls": uses tls_handle + rt_tls_server_* SFFI
+# kind == "tcp": uses tcp_stream field (TcpStream cast via Any)
+# =========================================================================
+
+class ConnStream:
+    kind: text            # "tls" or "tcp"
+    tls_handle: i64       # active when kind == "tls"
+    tcp_stream: Any       # active when kind == "tcp" (holds a TcpStream)
+    buffer: text          # internal read buffer for line assembly
+    open: bool
+
+    static fn from_tls(handle: i64) -> ConnStream:
+        ConnStream(kind: "tls", tls_handle: handle, tcp_stream: nil, buffer: "", open: true)
+
+    static fn from_tcp(stream: TcpStream) -> ConnStream:
+        ConnStream(kind: "tcp", tls_handle: -1, tcp_stream: stream, buffer: "", open: true)
+
+    me is_open() -> bool:
+        return self.open
+
+    me read_line() -> Result<text, text>:
+        """Read one line (terminated by \\n) from the stream.
+
+        Buffers partial reads internally. Returns the line without the
+        trailing \\r\\n or \\n.
+        """
+        loop:
+            # Scan existing buffer for a newline
+            val nl = self.buffer.find("\n")
+            if nl >= 0:
+                val line = self.buffer[0:nl]
+                self.buffer = self.buffer[nl + 1:]
+                val trimmed = if line.ends_with("\r"):
+                    line[0:line.len() - 1]
+                else:
+                    line
+                return Ok(trimmed)
+
+            # No newline yet — read more data
+            if not self.open:
+                return Err("connection closed")
+
+            if self.kind == "tcp":
+                val tcp = self.tcp_stream as TcpStream
+                match tcp.read_line():
+                    Err(e):
+                        self.open = false
+                        return Err(e)
+                    Ok(line):
+                        return Ok(line)
+            else:
+                val chunk = rt_tls_server_read(self.tls_handle, 4096)
+                if chunk == "":
+                    self.open = false
+                    return Err("connection closed")
+                self.buffer = self.buffer + chunk
+
+    me read_exact(n: i64) -> Result<text, text>:
+        """Read exactly n bytes (as text) from the stream."""
+        if self.kind == "tcp":
+            val tcp = self.tcp_stream as TcpStream
+            match tcp.read_exact(n):
+                Err(e):
+                    self.open = false
+                    return Err(e)
+                Ok(data):
+                    return Ok(data)
+        else:
+            loop:
+                if self.buffer.len() >= n as i64:
+                    val data = self.buffer[0:n]
+                    self.buffer = self.buffer[n:]
+                    return Ok(data)
+
+                if not self.open:
+                    return Err("connection closed")
+
+                val chunk = rt_tls_server_read(self.tls_handle, 4096)
+                if chunk == "":
+                    self.open = false
+                    return Err("connection closed")
+                self.buffer = self.buffer + chunk
+
+    me read_bytes(n: i64) -> Result<[u8], text>:
+        """Read exactly n bytes as a byte array from the stream."""
+        if self.kind == "tcp":
+            val tcp = self.tcp_stream as TcpStream
+            match tcp.read(n):
+                Err(e):
+                    self.open = false
+                    return Err(e)
+                Ok(data):
+                    return Ok(data)
+        else:
+            # TLS: read into text buffer then convert
+            match self.read_exact(n):
+                Err(e):
+                    return Err(e)
+                Ok(text_data):
+                    return Ok(text_data.to_bytes())
+
+    me write_all(data: text) -> Result<(), text>:
+        """Write all text data to the stream."""
+        if not self.open:
+            return Err("connection closed")
+        if self.kind == "tcp":
+            val tcp = self.tcp_stream as TcpStream
+            match tcp.write_all(data):
+                Err(e):
+                    self.open = false
+                    return Err(e)
+                Ok(()):
+                    return Ok(())
+        else:
+            val written = rt_tls_server_write(self.tls_handle, data)
+            if written < 0:
+                self.open = false
+                return Err("write failed")
+            return Ok(())
+
+    me write_all_bytes(data: [u8]) -> Result<(), text>:
+        """Write all bytes to the stream."""
+        if not self.open:
+            return Err("connection closed")
+        if self.kind == "tcp":
+            val tcp = self.tcp_stream as TcpStream
+            match tcp.write_all(data):
+                Err(e):
+                    self.open = false
+                    return Err(e)
+                Ok(()):
+                    return Ok(())
+        else:
+            val written = rt_tls_server_write_bytes(self.tls_handle, data)
+            if written < 0:
+                self.open = false
+                return Err("write failed")
+            return Ok(())
+
+    me close():
+        """Close the underlying connection."""
+        if self.open:
+            self.open = false
+            if self.kind == "tcp":
+                val tcp = self.tcp_stream as TcpStream
+                tcp.close()
+            else:
+                rt_tls_server_close_connection(self.tls_handle)
+
+# =========================================================================
+# TLS HTTP Server
+# =========================================================================
+
+class TlsWebServer:
+    file_path: text
+    port: i32
+    session: UISession
+    event_channel: BoundedChannel<UIEvent>
+    last_file_content: text
+    running: bool
+    origin_guard: OriginGuard
+    token_secret: text
+    ws_clients: [i64]
+
+    static fn new(file_path: text, port: i32, access_db_path: text) -> Result<TlsWebServer, text>:
+        val tree_result = parse_ui_to_tree(file_path)
+        match tree_result:
+            Err(e):
+                return Err(e)
+            Ok(tree):
+                var session = UISession.new(tree)
+                session.set_active_backend("web")
+                val store = ui_access_store_runtime_open_with_override(access_db_path, file_path, "web")
+                if store != nil:
+                    session.attach_access_store(store)
+                val content = if rt_file_exists(file_path):
+                    rt_file_read_text(file_path)
+                else:
+                    ""
+                var event_ch: BoundedChannel<UIEvent> = BoundedChannel.new(256)
+                return Ok(TlsWebServer(
+                    file_path: file_path,
+                    port: port,
+                    session: session,
+                    event_channel: event_ch,
+                    last_file_content: content,
+                    running: true,
+                    origin_guard: OriginGuard.from_env(),
+                    token_secret: load_secret(false),
+                    ws_clients: []
+                ))
+
+    fn start(tls_server_handle: i64):
+        """Accept-loop on the already-created TLS server handle."""
+        val file_path_copy = self.file_path
+        val event_ch = self.event_channel
+        val watcher = thread_spawn2(file_path_copy, event_ch, \fp, ch:
+            _tls_file_watcher_loop(fp, ch)
+        )
+
+        self.accept_loop(tls_server_handle)
+
+        self.running = false
+        self.event_channel.close()
+        watcher.free()
+
+    fn accept_loop(tls_server_handle: i64):
+        """Poll for TLS connections and process pending events between accepts.
+
+        Each accepted connection is handed to a dedicated thread so a blocking
+        WebSocket read loop on one client does not stall new accepts or the
+        event/file-watcher pump — mirrors the server.spl TCP pattern."""
+        while self.running:
+            val conn_handle = rt_tls_server_accept(tls_server_handle)
+            if is_valid_handle(conn_handle):
+                var conn = ConnStream.from_tls(conn_handle)
+                val handler = thread_spawn2(conn, self, \c, server:
+                    val tls_server: TlsWebServer = server
+                    TlsWebServer.handle_connection_thread(tls_server, c)
+                )
+                handler.free()
+            else:
+                # No connection ready; yield briefly so the event loop can run
+                thread_sleep(10)
+
+            self.process_events()
+
+    static fn handle_connection_thread(server: TlsWebServer, conn: ConnStream):
+        server.handle_connection(conn)
+
+    me handle_connection(conn: ConnStream):
+        """Handle a single incoming TLS HTTP connection."""
+        match conn.read_line():
+            Err(_):
+                conn.close()
+                return
+            Ok(request_line):
+                val parts = request_line.split(" ")
+                if parts.len() < 2:
+                    conn.close()
+                    return
+
+                val method = parts[0]
+                val path = parts[1]
+
+                # Read remaining headers
+                var headers = ""
+                var is_ws_upgrade = false
+                loop:
+                    match conn.read_line():
+                        Ok(header_line):
+                            if header_line.trim() == "":
+                                break
+                            headers = "{headers}{header_line}\n"
+                            if header_line.contains("Upgrade: websocket"):
+                                is_ws_upgrade = true
+                        Err(_):
+                            break
+
+                # /ui/* routes come first so /ui/ws reaches `_handle_ws_route`
+                # (adapter + read loop); the bare-upgrade branch below would
+                # otherwise hijack every WebSocket request and close it straight
+                # after the 101 response.
+                if path.starts_with("/ui/"):
+                    var body = ""
+                    if method == "POST":
+                        body = _tls_read_body(conn, headers)
+                    val handled = dispatch_ui_route(path, method, headers, body, conn, self.session, self.origin_guard, self.token_secret)
+                    if handled:
+                        return
+
+                if is_ws_upgrade:
+                    val ws_handle = conn.tls_handle
+                    self.ws_clients = self.ws_clients.push(ws_handle)
+                    handle_ws_upgrade(conn, path, headers, self.origin_guard, self.token_secret)
+                    self.ws_clients = self.ws_clients.filter(_ != ws_handle)
+                    conn.close()
+                    return
+
+                # Read body if POST
+                var body = ""
+                if method == "POST":
+                    body = _tls_read_body(conn, headers)
+
+                # Route HTTP requests
+                val response = match path:
+                    "/":
+                        val html = generate_html_page(self.session.current_state(), self.port)
+                        _tls_http_response(200, "text/html", html)
+                    "/api/state":
+                        val state_json = _tls_state_to_json(self.session.current_state())
+                        _tls_http_response(200, "application/json", state_json)
+                    _:
+                        _tls_http_response(404, "text/plain", "Not Found")
+
+                conn.write_all(response)
+                conn.close()
+
+    me process_events():
+        """Drain pending events from the event channel."""
+        loop:
+            val msg = self.event_channel.try_recv()
+            if msg == nil:
+                break
+            val event = msg as UIEvent
+            if event != nil:
+                match event:
+                    UIEvent.FileChanged:
+                        _tls_reload_file(self.file_path, self.session, self.last_file_content)
+                    _:
+                        self.session.dispatch(event)
+
+    me broadcast_render(html: text):
+        """Push an HTML render update to all connected WebSocket clients."""
+        for h in self.ws_clients:
+            var conn = ConnStream.from_tls(h)
+            send_ws_text(conn, html)
+
+# =========================================================================
+# Module-level helpers (avoid `me` for pure functions)
+# =========================================================================
+
+fn _tls_reload_file(file_path: text, session: UISession, last_content: text):
+    if not rt_file_exists(file_path):
+        return
+    val current = rt_file_read_text(file_path)
+    if current != last_content:
+        val tree_result = parse_ui_to_tree(file_path)
+        match tree_result:
+            Ok(new_tree):
+                session.update_tree(new_tree)
+            Err(e):
+                print "Warning: TLS server UI parse error: {e}"
+
+fn _tls_file_watcher_loop(file_path: Any, event_channel: Any):
+    """Periodically check file for changes; sends FileChanged events."""
+    var last_content = ""
+    if rt_file_exists(file_path as text):
+        last_content = rt_file_read_text(file_path as text)
+    loop:
+        thread_sleep(500)
+        val path = file_path as text
+        if not rt_file_exists(path):
+            continue
+        val current = rt_file_read_text(path)
+        if current != last_content:
+            last_content = current
+            val ch = event_channel as BoundedChannel<UIEvent>
+            ch.send(UIEvent.FileChanged)
+
+fn _tls_read_body(conn: ConnStream, headers: text) -> text:
+    var content_length = 0
+    for line in headers.split("\n"):
+        val trimmed = line.trim()
+        if trimmed.starts_with("Content-Length:"):
+            val len_str = trimmed.slice(15, trimmed.len())
+            content_length = len_str.trim().to_int()
+    if content_length <= 0:
+        return ""
+    match conn.read_exact(content_length as i64):
+        Ok(data):
+            return data
+        Err(_):
+            return ""
+
+fn _tls_http_response(status: i32, content_type: text, body: text) -> text:
+    val status_text = match status:
+        200: "OK"
+        400: "Bad Request"
+        404: "Not Found"
+        501: "Not Implemented"
+        _: "OK"
+    var r = "HTTP/1.1 {status} {status_text}\r\n"
+    r = "{r}Content-Type: {content_type}\r\n"
+    r = "{r}X-UI-Protocol-Version: 1\r\n"
+    r = "{r}Content-Length: {body.len()}\r\n"
+    r = "{r}Connection: close\r\n"
+    r = "{r}\r\n"
+    r = "{r}{body}"
+    return r
+
+fn _tls_state_to_json(state: UIState) -> text:
+    var json = "{"
+    json = "{json}\"mode\": \"{state.mode_name()}\","
+    json = "{json}\"title\": \"{state.tree.title_text()}\""
+    json = "{json}}"
+    return json
+
+# =========================================================================
+# Public entry point
+# =========================================================================
+
+fn serve_tls(file_path: text, port: i32, tls_server_handle: i64, access_db_path: text) -> i64:
+    """Start TLS HTTP server using the given already-created TLS server handle.
+
+    Called from server.spl when --tls flag + cert/key envs are present.
+    Returns 0 on clean shutdown, 1 on setup error.
+    """
+    val server_result = TlsWebServer.new(file_path, port, access_db_path)
+    match server_result:
+        Err(e):
+            print "Error creating TLS web server: {e}"
+            return 1
+        Ok(server):
+            server.start(tls_server_handle)
+            return 0

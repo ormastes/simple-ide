@@ -7,7 +7,7 @@ use std.nogc_async_mut.llm_diagnostics.env_scanner.{
     EnvSummary, ClaudeMdFile, SkillDef, AgentDef,
     McpServerDef, HookDef, MemoryFile, TemplateDef
 }
-use app.ui.render.ansi.{RESET, BOLD, DIM, FG_BLUE, FG_GREEN, FG_YELLOW, FG_MAGENTA, FG_CYAN}
+use app.lib.ui.render.ansi.{RESET, BOLD, DIM, FG_BLUE, FG_GREEN, FG_YELLOW, FG_MAGENTA, FG_CYAN}
 
 fn render_env_panel(env: EnvSummary, max_lines: i64) -> [text]:
     """Render environment summary as TUI lines."""

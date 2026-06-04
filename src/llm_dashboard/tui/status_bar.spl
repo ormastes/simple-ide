@@ -6,7 +6,7 @@
 use app.llm_dashboard.data.types.{LLMStatus, LLMProvider, provider_name, format_tokens}
 use app.llm_dashboard.data.store.{AgentDashboardStore}
 use app.llm_dashboard.tui.colors.{provider_color, connection_dot, status_indicator}
-use app.ui.render.ansi.{RESET, BOLD, DIM, GREEN, YELLOW, RED}
+use app.lib.ui.render.ansi.{RESET, BOLD, DIM, GREEN, YELLOW, RED}
 
 # =========================================================================
 # Status Bar Rendering

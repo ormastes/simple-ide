@@ -7,7 +7,7 @@ use app.llm_dashboard.data.types.{RoomKind, room_name, tool_to_room, ActivityEnt
     AgentMessage, McpStats, format_timestamp, truncate_text, mcp_avg_latency, format_tokens,
     ManagedTask, TaskKind, TaskState}
 use app.llm_dashboard.tui.colors.{room_color}
-use app.ui.render.ansi.{RESET, DIM, BOLD}
+use app.lib.ui.render.ansi.{RESET, DIM, BOLD}
 
 # =========================================================================
 # Room State

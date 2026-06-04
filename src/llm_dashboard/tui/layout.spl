@@ -3,11 +3,11 @@
 # Manages the room-based grid layout for the TUI dashboard.
 # Supports full-screen (2x3 grid + tree + feed) and compact (tabbed) modes.
 
-use app.ui.tui.screen.{Screen, get_terminal_size}
+use app.lib.ui.tui.screen.{Screen, get_terminal_size}
 use app.llm_dashboard.tui.colors.{room_color}
 use app.llm_dashboard.tui.rooms.{RoomState, render_room_content, render_room_header}
 use app.llm_dashboard.data.types.{RoomKind, room_name}
-use app.ui.render.ansi.{RESET, BOLD, DIM, CYAN, WHITE}
+use app.lib.ui.render.ansi.{RESET, BOLD, DIM, CYAN, WHITE}
 
 # =========================================================================
 # Layout Mode

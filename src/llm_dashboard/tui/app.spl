@@ -3,7 +3,7 @@
 # Main event loop for the TUI LLM Agent Dashboard.
 # Handles keyboard input, polling, and screen refresh.
 
-use app.ui.tui.screen.{Screen, get_terminal_size, ansi_enable_alt_screen,
+use app.lib.ui.tui.screen.{Screen, get_terminal_size, ansi_enable_alt_screen,
     ansi_disable_alt_screen, ansi_show_cursor, ansi_hide_cursor}
 use app.llm_dashboard.data.store.{AgentDashboardStore}
 use app.llm_dashboard.data.types.{RoomKind, room_name, format_timestamp}
@@ -22,7 +22,7 @@ fn detect_project_dir() -> text:
     if pwd.len() > 0:
         return pwd
     "."
-use app.ui.render.ansi.{RESET, BOLD, DIM}
+use app.lib.ui.render.ansi.{RESET, BOLD, DIM}
 
 extern fn rt_time_now_unix_micros() -> i64
 extern fn native_enable_raw_mode() -> bool

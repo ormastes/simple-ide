@@ -4,7 +4,7 @@
 
 use app.llm_dashboard.data.types.{ActivityEntry, RoomKind, room_name, format_timestamp, truncate_text}
 use app.llm_dashboard.tui.colors.{room_color, provider_color}
-use app.ui.render.ansi.{RESET, DIM, BOLD}
+use app.lib.ui.render.ansi.{RESET, DIM, BOLD}
 
 # =========================================================================
 # Feed State

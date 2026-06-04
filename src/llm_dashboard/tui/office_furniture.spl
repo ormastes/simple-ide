@@ -6,7 +6,7 @@
 # Each piece returns [text] lines that can be composited onto the screen.
 # Dimensions are kept small to fit multiple desks per room.
 
-use app.ui.render.ansi.{RESET, BOLD, DIM, FG_BLUE, FG_GREEN, FG_YELLOW,
+use app.lib.ui.render.ansi.{RESET, BOLD, DIM, FG_BLUE, FG_GREEN, FG_YELLOW,
     FG_MAGENTA, FG_CYAN, FG_WHITE, FG_RED, BG_BLACK}
 
 # =========================================================================

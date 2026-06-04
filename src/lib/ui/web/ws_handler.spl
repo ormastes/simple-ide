@@ -1,0 +1,176 @@
+# WebSocket Handler
+#
+# Handles WebSocket upgrade handshake and message processing
+# for the web UI renderer.
+
+use app.lib.ui.web.tls_serve_loop.{ConnStream}
+use app.lib.ui.web.origin_guard.{OriginGuard, AuthError}
+use app.lib.ui.web.session_token.{verify}
+# Use runtime SHA-1/base64 directly to avoid as_bytes() interpreter limitation
+extern fn rt_sha1_new() -> i64
+extern fn rt_sha1_write(handle: i64, data: text) -> i64
+extern fn rt_sha1_finish_base64(handle: i64) -> text
+extern fn rt_sha1_free(handle: i64)
+extern fn rt_text_to_bytes(s: text) -> [u8]
+extern fn rt_time_ms() -> u64
+
+# =========================================================================
+# WebSocket Upgrade
+# =========================================================================
+
+val WS_MAGIC: text = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+fn is_ws_upgrade_request(headers: text) -> bool:
+    return headers.contains("Upgrade: websocket")
+
+fn handle_ws_upgrade(stream: ConnStream, path: text, headers: text, guard: OriginGuard, secret: text):
+    """Handle WebSocket upgrade handshake with origin + token gate.
+
+    Checks Origin header against the allowlist and verifies the bearer token
+    before completing the WebSocket handshake. On failure writes 403 and returns."""
+    # --- Security gate ---
+    val origin_result = guard.check(headers)
+    match origin_result:
+        Err(_):
+            stream.write_all("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            return
+        Ok(origin):
+            # Extract bearer token from Authorization header or ?token= query param
+            val bearer = _extract_bearer(headers, path)
+            if bearer == "":
+                stream.write_all("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                return
+            val now = rt_time_ms()
+            val tok_result = verify(bearer, origin, secret, now)
+            match tok_result:
+                Err(_):
+                    stream.write_all("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                    return
+                Ok(_):
+                    pass_do_nothing
+
+    # --- Proceed with handshake ---
+    # Extract Sec-WebSocket-Key from headers
+    val key = extract_ws_key(headers)
+    if key == "":
+        return
+
+    # Compute accept hash
+    val accept = compute_ws_accept(key)
+
+    # Send upgrade response
+    var response = "HTTP/1.1 101 Switching Protocols\r\n"
+    response = "{response}Upgrade: websocket\r\n"
+    response = "{response}Connection: Upgrade\r\n"
+    response = "{response}Sec-WebSocket-Accept: {accept}\r\n"
+    response = "{response}\r\n"
+    stream.write_all(response)
+    # The WebRuntimeAdapter sends the initial snapshot via send_snapshot()
+
+fn handle_ws_wm_upgrade(stream: ConnStream, path: text, headers: text, guard: OriginGuard, secret: text):
+    """Compatibility WM upgrade entrypoint.
+
+    WM mode now shares the guarded WebSocket upgrade flow, but callers still
+    import `handle_ws_wm_upgrade` as the stable entrypoint name."""
+    handle_ws_upgrade(stream, path, headers, guard, secret)
+
+fn extract_ws_key(headers: text) -> text:
+    """Extract the Sec-WebSocket-Key from headers."""
+    val lines = headers.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.starts_with("Sec-WebSocket-Key:"):
+            val key = trimmed[18:]
+            return key.trim()
+    return ""
+
+fn compute_ws_accept(key: text) -> text:
+    """Compute the Sec-WebSocket-Accept value.
+    WebSocket spec requires: base64(SHA-1(key + magic)).
+    Uses runtime functions directly to avoid as_bytes() interpreter limitation."""
+    val combined = key + WS_MAGIC
+    val handle = rt_sha1_new()
+    rt_sha1_write(handle, combined)
+    val result = rt_sha1_finish_base64(handle)
+    rt_sha1_free(handle)
+    return result
+
+# =========================================================================
+# WebSocket Frame Operations
+# =========================================================================
+
+fn send_ws_text(stream: ConnStream, message: text) -> bool:
+    """Send a text frame over WebSocket as raw bytes.
+
+    Browser clients validate RFC6455 frame bytes strictly; `write_text()`
+    corrupts the 0x81 frame header because it encodes the header as text.
+    """
+    val payload = rt_text_to_bytes(message)
+    val len = payload.len()
+    var frame: [u8] = [0x81u8]
+
+    if len < 126:
+        frame.push(len.to_u8())
+    elif len < 65536:
+        frame.push(126u8)
+        frame.push(((len / 256) & 0xFF).to_u8())
+        frame.push((len & 0xFF).to_u8())
+    else:
+        frame.push(127u8)
+        frame.push(0u8)
+        frame.push(0u8)
+        frame.push(0u8)
+        frame.push(0u8)
+        frame.push(((len / 16777216) & 0xFF).to_u8())
+        frame.push(((len / 65536) & 0xFF).to_u8())
+        frame.push(((len / 256) & 0xFF).to_u8())
+        frame.push((len & 0xFF).to_u8())
+
+    frame = frame + payload
+    match stream.write_all_bytes(frame):
+        Err(_):
+            return false
+        Ok(()):
+            return true
+
+fn send_ws_close(stream: ConnStream, code: i64, reason: text) -> bool:
+    """Send a WebSocket close frame with status code and reason."""
+    val reason_bytes = rt_text_to_bytes(reason)
+    val reason_len = reason_bytes.len()
+    val payload_len = 2 + reason_len
+    var frame: [u8] = [0x88u8]
+    if payload_len < 126:
+        frame.push(payload_len.to_u8())
+    else:
+        frame.push(126u8)
+        frame.push(((payload_len / 256) & 0xFF).to_u8())
+        frame.push((payload_len & 0xFF).to_u8())
+    frame.push(((code / 256) & 0xFF).to_u8())
+    frame.push((code & 0xFF).to_u8())
+    frame = frame + reason_bytes
+    match stream.write_all_bytes(frame):
+        Err(_):
+            return false
+        Ok(()):
+            return true
+
+# =========================================================================
+# Bearer Token Extraction Helper
+# =========================================================================
+
+fn _extract_bearer(headers: text, path: text) -> text:
+    """Extract bearer token from Authorization header or ?token= query param."""
+    for line in headers.split("\n"):
+        val trimmed = line.trim()
+        if trimmed.lower().starts_with("authorization:"):
+            val value = trimmed[14:].trim()
+            if value.lower().starts_with("bearer "):
+                return value[7:].trim()
+    val idx = path.find("?token=")
+    if idx >= 0:
+        val after = path.slice(idx + 7, path.len())
+        val amp = after.find("&")
+        if amp >= 0:
+            return after.slice(0, amp)
+        return after
+    return ""

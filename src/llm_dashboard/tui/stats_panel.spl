@@ -4,7 +4,7 @@
 # build status, test results, TODOs, features, doc coverage.
 # Uses sparklines and progress bars for visual density.
 
-use app.ui.render.ansi.{RESET, BOLD, DIM, FG_BLUE, FG_GREEN, FG_YELLOW, FG_RED, FG_CYAN, FG_WHITE}
+use app.lib.ui.render.ansi.{RESET, BOLD, DIM, FG_BLUE, FG_GREEN, FG_YELLOW, FG_RED, FG_CYAN, FG_WHITE}
 use app.llm_dashboard.data.project_stats.{
     ProjectStats, test_pass_rate, feature_progress_pct
 }

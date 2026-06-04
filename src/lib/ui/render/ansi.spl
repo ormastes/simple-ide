@@ -1,0 +1,118 @@
+# ANSI Escape Sequences — Shared Module
+#
+# Canonical source of ANSI color codes, modifiers, and color helpers.
+# All apps should import from here (or via re-exports) instead of
+# duplicating escape sequences.
+
+# =========================================================================
+# Escape
+# =========================================================================
+
+val ESC: text = "\u{001b}"
+
+# =========================================================================
+# Reset
+# =========================================================================
+
+val RESET: text = "\u{001b}[0m"
+
+# =========================================================================
+# Modifiers
+# =========================================================================
+
+val BOLD: text = "\u{001b}[1m"
+val DIM: text = "\u{001b}[2m"
+val ITALIC: text = "\u{001b}[3m"
+val UNDERLINE: text = "\u{001b}[4m"
+val BLINK: text = "\u{001b}[5m"
+val INVERSE: text = "\u{001b}[7m"
+val STRIKETHROUGH: text = "\u{001b}[9m"
+
+# =========================================================================
+# Regular Colors (foreground)
+# =========================================================================
+
+val BLACK: text = "\u{001b}[30m"
+val RED: text = "\u{001b}[31m"
+val GREEN: text = "\u{001b}[32m"
+val YELLOW: text = "\u{001b}[33m"
+val BLUE: text = "\u{001b}[34m"
+val MAGENTA: text = "\u{001b}[35m"
+val CYAN: text = "\u{001b}[36m"
+val WHITE: text = "\u{001b}[37m"
+
+# =========================================================================
+# Bright Colors (foreground)
+# =========================================================================
+
+val BRIGHT_BLACK: text = "\u{001b}[90m"
+val BRIGHT_RED: text = "\u{001b}[91m"
+val BRIGHT_GREEN: text = "\u{001b}[92m"
+val BRIGHT_YELLOW: text = "\u{001b}[93m"
+val BRIGHT_BLUE: text = "\u{001b}[94m"
+val BRIGHT_MAGENTA: text = "\u{001b}[95m"
+val BRIGHT_CYAN: text = "\u{001b}[96m"
+val BRIGHT_WHITE: text = "\u{001b}[97m"
+
+# =========================================================================
+# Background Colors
+# =========================================================================
+
+val BG_BLACK: text = "\u{001b}[40m"
+val BG_RED: text = "\u{001b}[41m"
+val BG_GREEN: text = "\u{001b}[42m"
+val BG_YELLOW: text = "\u{001b}[43m"
+val BG_BLUE: text = "\u{001b}[44m"
+val BG_MAGENTA: text = "\u{001b}[45m"
+val BG_CYAN: text = "\u{001b}[46m"
+val BG_WHITE: text = "\u{001b}[47m"
+
+# =========================================================================
+# 256-Color Helpers
+# =========================================================================
+
+fn fg_256(n: i32) -> text:
+    """Set foreground to 256-color palette index (0-255)."""
+    return "{ESC}[38;5;{n}m"
+
+fn bg_256(n: i32) -> text:
+    """Set background to 256-color palette index (0-255)."""
+    return "{ESC}[48;5;{n}m"
+
+# =========================================================================
+# True Color (24-bit RGB) Helpers
+# =========================================================================
+
+fn fg_rgb(r: i32, g: i32, b: i32) -> text:
+    """Set foreground to 24-bit true color RGB."""
+    return "{ESC}[38;2;{r};{g};{b}m"
+
+fn bg_rgb(r: i32, g: i32, b: i32) -> text:
+    """Set background to 24-bit true color RGB."""
+    return "{ESC}[48;2;{r};{g};{b}m"
+
+# =========================================================================
+# Utility Functions
+# =========================================================================
+
+fn colorize(text_val: text, color: text) -> text:
+    """Wrap text in an ANSI color and reset."""
+    return "{color}{text_val}{RESET}"
+
+fn strip_ansi(s: text) -> text:
+    """Remove all ANSI escape sequences from a string."""
+    var result = ""
+    var in_escape = false
+    # Use split("") to iterate by character, avoiding byte/char mismatch
+    val chars = s.split("")
+    for ch in chars:
+        if ch == "":
+            pass_dn
+        elif ch == "\u{001b}":
+            in_escape = true
+        elif in_escape:
+            if ch == "m":
+                in_escape = false
+        else:
+            result = "{result}{ch}"
+    return result

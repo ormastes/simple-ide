@@ -9,7 +9,7 @@ use std.tmux.{
     tmux_capture_pane, tmux_send_keys, tmux_send_text, tmux_send_enter,
     tmux_server_running, tmux_list_sessions, tmux_list_panes
 }
-use app.ui.web.ws_handler.{extract_ws_key, compute_ws_accept, send_ws_text, escape_json_string}
+use app.lib.ui.web.ws_handler.{extract_ws_key, compute_ws_accept, send_ws_text, escape_json_string}
 use std.text.{to_int_or}
 
 # =========================================================================

@@ -3,7 +3,7 @@
 # ASCII art character representations for LLM agents.
 # Each provider has distinct visual identity; each state has animation frames.
 
-use app.ui.render.ansi.{RESET, BOLD, DIM, BRIGHT_YELLOW, BRIGHT_CYAN, BRIGHT_GREEN,
+use app.lib.ui.render.ansi.{RESET, BOLD, DIM, BRIGHT_YELLOW, BRIGHT_CYAN, BRIGHT_GREEN,
     BRIGHT_MAGENTA, BRIGHT_RED, BRIGHT_WHITE}
 use app.llm_dashboard.tui.colors.{provider_color, activity_color}
 use app.llm_dashboard.data.types.{truncate_text, provider_name}
