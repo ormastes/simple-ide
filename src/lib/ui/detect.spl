@@ -1,0 +1,103 @@
+# GUI Backend Auto-Detection
+#
+# Determines the best available GUI backend based on the environment.
+# Cross-platform: uses rt_platform_name() for reliable OS detection.
+
+extern fn rt_env_get(key: text) -> text
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_platform_name() -> text
+
+# =========================================================================
+# Platform Detection
+# =========================================================================
+
+fn is_windows() -> bool:
+    rt_platform_name() == "windows"
+
+fn is_macos() -> bool:
+    rt_platform_name() == "macos"
+
+# =========================================================================
+# Detection
+# =========================================================================
+
+fn detect_gui_backend() -> text:
+    """Auto-detect the best available GUI backend."""
+    # Explicit override via env var
+    val backend_env = rt_env_get("SIMPLE_GUI_BACKEND")
+    if backend_env != nil and backend_env != "":
+        return backend_env
+
+    # Check if in container / headless
+    if not has_display():
+        return "headless"
+
+    # Check if Tauri shell is available
+    if has_tauri_shell():
+        return "tauri"
+
+    # Fall back to Electron if available
+    if has_electron_shell():
+        return "electron"
+
+    # Prefer browser engine when a display is available (GPU or software)
+    # The browser backend works without any external dependencies — it renders
+    # entirely in-process using the 2D engine with optional GPU acceleration.
+    if has_display():
+        return "browser"
+
+    # Fallback to web mode (works everywhere with a browser)
+    return "web"
+
+fn has_display() -> bool:
+    """Check if a display server is available."""
+    # Windows always has a display (DWM)
+    if is_windows():
+        return true
+
+    # macOS always has a display
+    if is_macos():
+        return true
+
+    # Check X11
+    val display = rt_env_get("DISPLAY")
+    if display != nil and display != "":
+        return true
+
+    # Check Wayland
+    val wayland = rt_env_get("WAYLAND_DISPLAY")
+    if wayland != nil and wayland != "":
+        return true
+
+    return false
+
+fn has_tauri_shell() -> bool:
+    """Check if the Tauri shell binary (simple-tauri-shell) exists."""
+    if is_windows():
+        val result = rt_process_run("cmd", ["/c", "where simple-tauri-shell 2>nul"])
+        if result.2 == 0:
+            return true
+        if rt_file_exists("tools/tauri-shell/target/release/simple-tauri-shell.exe"):
+            return true
+        return rt_file_exists("tools/tauri-shell/src-tauri/target/release/simple-tauri-shell.exe")
+    else:
+        val result = rt_process_run("/bin/sh", ["-c", "which simple-tauri-shell 2>/dev/null"])
+        if result.2 == 0:
+            return true
+        if rt_file_exists("tools/tauri-shell/target/release/simple-tauri-shell"):
+            return true
+        return rt_file_exists("tools/tauri-shell/src-tauri/target/release/simple-tauri-shell")
+
+fn has_electron_shell() -> bool:
+    """Check if an Electron shell is available."""
+    if is_windows():
+        val result = rt_process_run("cmd", ["/c", "where electron 2>nul"])
+        if result.2 == 0:
+            return true
+        return rt_file_exists("node_modules/.bin/electron.cmd")
+    else:
+        val result = rt_process_run("/bin/sh", ["-c", "which electron 2>/dev/null"])
+        if result.2 == 0:
+            return true
+        return rt_file_exists("node_modules/.bin/electron")
