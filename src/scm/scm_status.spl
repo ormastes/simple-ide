@@ -1,0 +1,185 @@
+# SCM Status — Unified source control status model
+# Supports git and jj (Jujutsu) backends via process shell-out
+
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+extern fn rt_file_exists(path: text) -> bool
+
+# ============================================================================
+# Data Structs
+# ============================================================================
+
+struct ScmFile:
+    path: text
+    status: text
+    staged: bool
+
+struct ScmStatus:
+    backend: text
+    branch: text
+    files: [ScmFile]
+    ahead: i64
+    behind: i64
+    clean: bool
+
+# ============================================================================
+# Shell helpers
+# ============================================================================
+
+fn _scm_shell(command: text) -> (text, text, i64):
+    rt_process_run("/bin/sh", ["-c", command])
+
+fn _scm_shell_trimmed(command: text) -> text:
+    val (out, err, code) = _scm_shell(command)
+    if code == 0:
+        out.trim()
+    else:
+        ""
+
+# ============================================================================
+# Backend Detection
+# ============================================================================
+
+fn detect_backend(root: text) -> text:
+    """Detect whether repo uses jj or git. Returns 'jj', 'git', or 'none'."""
+    val jj_path = "{root}/.jj"
+    val (out, err, code) = _scm_shell("test -d '{jj_path}'")
+    if code == 0:
+        return "jj"
+    val git_path = "{root}/.git"
+    val (out2, err2, code2) = _scm_shell("test -d '{git_path}' -o -f '{git_path}'")
+    if code2 == 0:
+        return "git"
+    "none"
+
+# ============================================================================
+# Git Status Parsing
+# ============================================================================
+
+fn parse_git_status(output: text) -> [ScmFile]:
+    """Parse `git status --porcelain=v1` output into ScmFile list."""
+    var files: [ScmFile] = []
+    val trimmed = output.trim()
+    if trimmed.len() == 0:
+        return files
+    val lines = trimmed.split("\n")
+    var i = 0
+    while i < lines.len():
+        val line = lines[i]
+        if line.len() >= 3:
+            val index_code = line.slice(0, 1)
+            val wt_code = line.slice(1, 2)
+            val file_path = line.slice(3, line.len()).trim()
+            # Determine status and staged flag
+            if index_code == "?" and wt_code == "?":
+                files.push(ScmFile(path: file_path, status: "untracked", staged: false))
+            else if index_code == "R" or wt_code == "R":
+                files.push(ScmFile(path: file_path, status: "renamed", staged: index_code == "R"))
+            else if index_code == "A" or wt_code == "A":
+                files.push(ScmFile(path: file_path, status: "added", staged: index_code == "A"))
+            else if index_code == "D" or wt_code == "D":
+                files.push(ScmFile(path: file_path, status: "deleted", staged: index_code == "D"))
+            else if index_code == "M" or wt_code == "M":
+                files.push(ScmFile(path: file_path, status: "modified", staged: index_code == "M"))
+        i = i + 1
+    files
+
+fn _git_branch(root: text) -> text:
+    """Get current git branch name."""
+    _scm_shell_trimmed("cd '{root}' && git rev-parse --abbrev-ref HEAD 2>/dev/null")
+
+fn _git_ahead_behind(root: text) -> (i64, i64):
+    """Get ahead/behind counts relative to upstream."""
+    val raw = _scm_shell_trimmed("cd '{root}' && git rev-list --left-right --count HEAD...@{upstream} 2>/dev/null")
+    if raw.len() == 0:
+        return (0, 0)
+    val parts = raw.split("\t")
+    if parts.len() >= 2:
+        val ahead = int(parts[0].trim())
+        val behind = int(parts[1].trim())
+        (ahead, behind)
+    else:
+        (0, 0)
+
+# ============================================================================
+# Jujutsu Status Parsing
+# ============================================================================
+
+fn parse_jj_status(output: text) -> [ScmFile]:
+    """Parse `jj status` output into ScmFile list.
+    jj status lines look like: M path/to/file  or  A path/to/file"""
+    var files: [ScmFile] = []
+    val trimmed = output.trim()
+    if trimmed.len() == 0:
+        return files
+    val lines = trimmed.split("\n")
+    var i = 0
+    while i < lines.len():
+        val line = lines[i].trim()
+        if line.len() >= 2 and not line.starts_with("Working copy") and not line.starts_with("Parent commit"):
+            val code = line.slice(0, 1)
+            val file_path = line.slice(2, line.len()).trim()
+            if file_path.len() > 0:
+                var status = "modified"
+                if code == "A":
+                    status = "added"
+                else if code == "D":
+                    status = "deleted"
+                else if code == "R":
+                    status = "renamed"
+                # jj auto-tracks all changes, no staging concept
+                files.push(ScmFile(path: file_path, status: status, staged: true))
+        i = i + 1
+    files
+
+fn _jj_branch(root: text) -> text:
+    """Get jj working copy description or bookmark."""
+    val raw = _scm_shell_trimmed("cd '{root}' && jj log -r @ --no-graph -T 'bookmarks' 2>/dev/null")
+    if raw.len() > 0:
+        raw
+    else:
+        _scm_shell_trimmed("cd '{root}' && jj log -r @ --no-graph -T 'change_id.short()' 2>/dev/null")
+
+# ============================================================================
+# Unified Status
+# ============================================================================
+
+fn get_status(root: text) -> ScmStatus:
+    """Get unified SCM status for a repository root."""
+    val backend = detect_backend(root)
+
+    if backend == "jj":
+        val (out, err, code) = _scm_shell("cd '{root}' && jj status 2>/dev/null")
+        val files = parse_jj_status(out)
+        val branch = _jj_branch(root)
+        return ScmStatus(
+            backend: "jj",
+            branch: branch,
+            files: files,
+            ahead: 0,
+            behind: 0,
+            clean: files.len() == 0
+        )
+
+    if backend == "git":
+        val (out, err, code) = _scm_shell("cd '{root}' && git status --porcelain 2>/dev/null")
+        val files = parse_git_status(out)
+        val branch = _git_branch(root)
+        val (ahead, behind) = _git_ahead_behind(root)
+        return ScmStatus(
+            backend: "git",
+            branch: branch,
+            files: files,
+            ahead: ahead,
+            behind: behind,
+            clean: files.len() == 0
+        )
+
+    # No SCM detected
+    ScmStatus(
+        backend: "none",
+        branch: "",
+        files: [],
+        ahead: 0,
+        behind: 0,
+        clean: true
+    )

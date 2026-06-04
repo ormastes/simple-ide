@@ -12,12 +12,12 @@ use std.nogc_sync_mut.io.process_ops.{shell_int, shell_output_trimmed, shell_boo
 use std.log.{error}
 use std.text.{to_int_or}
 use std.text.{escape_json}
-use app.lib.ui.detect.{has_tauri_shell}
+use app.ui.detect.{has_tauri_shell}
 use app.llm_dashboard.main.{run_llm_dashboard}
 
 extern fn rt_platform_name() -> text
 use app.dashboard.render.adapter.{dashboard_render_request, render_dashboard, default_dashboard_config}
-use app.lib.ui.render.types.{RenderConfig, RenderResult}
+use app.ui.render.types.{RenderConfig, RenderResult}
 use app.dashboard.framework_policy.{
     FRAMEWORK_WORKER_FLAG, strip_framework_flags, is_framework_worker,
     should_isolate_dashboard_command, dashboard_command_launch,

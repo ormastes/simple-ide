@@ -1,0 +1,95 @@
+# PDF Search
+#
+# Full-text search across all pages of a PDF document.
+# Returns matching lines with page number, line position, and highlighted context.
+
+use app.pdf_viewer.pdf_document.{PdfDocument, pdf_get_page}
+
+struct PdfSearchResult:
+    page: i64
+    line: i64
+    context: text
+    match_start: i64
+
+fn pdf_search(doc: PdfDocument, query: text) -> [PdfSearchResult]:
+    """Search all pages of a document for the given query (case-insensitive)."""
+    var results: [PdfSearchResult] = []
+    if query.trim() == "":
+        return results
+    val lower_query = query.to_lower()
+    var page_idx = 1
+    while page_idx <= doc.page_count:
+        val page = pdf_get_page(doc, page_idx)
+        val lines = page.text_content.split("\n")
+        var line_num = 1
+        for line in lines:
+            val lower_line = line.to_lower()
+            val pos = _find_substring(lower_line, lower_query)
+            if pos >= 0:
+                val ctx = _build_context(line, pos, query.len(), 60)
+                val result = PdfSearchResult(
+                    page: page_idx,
+                    line: line_num,
+                    context: ctx,
+                    match_start: pos
+                )
+                results.push(result)
+            line_num = line_num + 1
+        page_idx = page_idx + 1
+    results
+
+fn highlight_match(content: text, query: text) -> text:
+    """Surround all occurrences of query in content with ANSI bold markers."""
+    if query == "":
+        return content
+    val lower_content = content.to_lower()
+    val lower_query = query.to_lower()
+    var result = ""
+    var pos = 0
+    while pos < content.len():
+        val match_pos = _find_substring_from(lower_content, lower_query, pos)
+        if match_pos < 0:
+            result = result + content[pos:]
+            break
+        # Append text before match
+        if match_pos > pos:
+            result = result + content[pos:match_pos]
+        # Wrap match in ANSI bold
+        val matched_text = content[match_pos:match_pos + query.len()]
+        result = result + "\x1b[1m" + matched_text + "\x1b[0m"
+        pos = match_pos + query.len()
+    result
+
+fn _find_substring(haystack: text, needle: text) -> i64:
+    """Find first occurrence of needle in haystack. Returns -1 if not found."""
+    _find_substring_from(haystack, needle, 0)
+
+fn _find_substring_from(haystack: text, needle: text, start: i64) -> i64:
+    """Find first occurrence of needle in haystack starting from position start."""
+    if needle == "":
+        return start
+    if needle.len() > haystack.len():
+        return -1
+    var i = start
+    while i + needle.len() <= haystack.len():
+        if haystack[i:i + needle.len()] == needle:
+            return i
+        i = i + 1
+    -1
+
+fn _build_context(line: text, match_pos: i64, match_len: i64, context_width: i64) -> text:
+    """Build a context snippet around the match position."""
+    val half_ctx = (context_width - match_len) / 2
+    var ctx_start = match_pos - half_ctx
+    var ctx_end = match_pos + match_len + half_ctx
+    if ctx_start < 0:
+        ctx_start = 0
+    if ctx_end > line.len():
+        ctx_end = line.len()
+    var prefix = ""
+    var suffix = ""
+    if ctx_start > 0:
+        prefix = "..."
+    if ctx_end < line.len():
+        suffix = "..."
+    prefix + line[ctx_start:ctx_end].trim() + suffix

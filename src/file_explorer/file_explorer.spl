@@ -1,0 +1,189 @@
+# File Explorer — main module
+#
+# Directory listing, recursive tree building, filtering, and sorting for
+# the Simple IDE sidebar.  All shared types (FileEntry, TreeNode) live here
+# so that tree_view.spl and watcher.spl can import without circular deps.
+
+use std.nogc_sync_mut.io.file_ops.{file_size, file_modified_time}
+use std.nogc_sync_mut.io.dir_ops.{dir_list, is_dir}
+
+# ============================================================================
+# Shared Types
+# ============================================================================
+
+struct FileEntry:
+    name: text
+    path: text
+    is_dir: bool
+    size: i64
+    modified: i64
+
+struct TreeNode:
+    entry: FileEntry
+    children: [TreeNode]
+    expanded: bool
+    indent_level: i64
+
+# ============================================================================
+# Directory Listing
+# ============================================================================
+
+fn list_dir(path: text) -> [FileEntry]:
+    # List immediate children of *path*, returning a FileEntry per item.
+    # Directories come first (alphabetical), then files (alphabetical).
+    val names = dir_list(path)
+    var dirs: [FileEntry] = []
+    var files: [FileEntry] = []
+    for name in names:
+        val child_path = path + "/" + name
+        val child_is_dir = is_dir(child_path)
+        val sz = if child_is_dir { 0 } else { file_size(child_path) }
+        val entry = FileEntry(
+            name: name,
+            path: child_path,
+            is_dir: child_is_dir,
+            size: sz,
+            modified: file_modified_time(child_path)
+        )
+        if child_is_dir:
+            dirs.push(entry)
+        else:
+            files.push(entry)
+    # Sort each group alphabetically by name
+    dirs = sort_by_name(dirs)
+    files = sort_by_name(files)
+    dirs + files
+
+# ============================================================================
+# Recursive Tree Builder
+# ============================================================================
+
+fn build_tree(root: text, depth: i64) -> [TreeNode]:
+    # Build a tree of TreeNodes starting at *root* down to *depth* levels.
+    # depth == 0 means list only *root*'s immediate children (no recurse).
+    build_tree_at(root, depth, 0)
+
+fn build_tree_at(path: text, depth: i64, level: i64) -> [TreeNode]:
+    val entries = list_dir(path)
+    var nodes: [TreeNode] = []
+    for entry in entries:
+        var children: [TreeNode] = []
+        val expand = entry.is_dir and depth > 0
+        if expand:
+            children = build_tree_at(entry.path, depth - 1, level + 1)
+        val node = TreeNode(
+            entry: entry,
+            children: children,
+            expanded: expand,
+            indent_level: level
+        )
+        nodes.push(node)
+    nodes
+
+# ============================================================================
+# Filtering
+# ============================================================================
+
+fn filter_entries(entries: [FileEntry], pattern: text) -> [FileEntry]:
+    # Simple glob-style filter.  Supports:
+    #   "*X"  — entries whose name ends with X
+    #   "X*"  — entries whose name starts with X
+    #   "*X*" — entries whose name contains X
+    #   "X"   — exact match
+    # Directories always pass through so the tree stays navigable.
+    var result: [FileEntry] = []
+    for entry in entries:
+        if entry.is_dir or matches_glob(entry.name, pattern):
+            result.push(entry)
+    result
+
+fn matches_glob(name: text, pattern: text) -> bool:
+    if pattern == "*":
+        return true
+    val starts = pattern.starts_with("*")
+    val ends = pattern.ends_with("*")
+    if starts and ends and pattern.len() > 2:
+        # *X* — contains
+        val inner = pattern.slice(1, pattern.len() - 1)
+        return name.contains(inner)
+    if starts:
+        # *X — ends with
+        val suffix = pattern.slice(1, pattern.len())
+        return name.ends_with(suffix)
+    if ends:
+        # X* — starts with
+        val prefix = pattern.slice(0, pattern.len() - 1)
+        return name.starts_with(prefix)
+    # Exact match
+    name == pattern
+
+# ============================================================================
+# Sorting
+# ============================================================================
+
+fn sort_entries(entries: [FileEntry], by: text) -> [FileEntry]:
+    # Sort entries with directories first, then files, ordered within each
+    # group by the chosen field: "name" (default), "size", or "modified".
+    var dirs: [FileEntry] = []
+    var files: [FileEntry] = []
+    for entry in entries:
+        if entry.is_dir:
+            dirs.push(entry)
+        else:
+            files.push(entry)
+    if by == "size":
+        dirs = sort_by_name(dirs)
+        files = sort_by_size(files)
+    elif by == "modified":
+        dirs = sort_by_modified(dirs)
+        files = sort_by_modified(files)
+    else:
+        dirs = sort_by_name(dirs)
+        files = sort_by_name(files)
+    dirs + files
+
+# --- insertion-sort helpers (arrays are value types) -----------------------
+
+fn sort_by_name(entries: [FileEntry]) -> [FileEntry]:
+    var arr = entries
+    var i = 1
+    while i < arr.len():
+        val key = arr[i]
+        var j = i - 1
+        var key_lower = key.name.lower()
+        while j >= 0:
+            var j_lower = arr[j].name.lower()
+            if j_lower > key_lower:
+                arr[j + 1] = arr[j]
+                j = j - 1
+            else:
+                break
+        arr[j + 1] = key
+        i = i + 1
+    arr
+
+fn sort_by_size(entries: [FileEntry]) -> [FileEntry]:
+    var arr = entries
+    var i = 1
+    while i < arr.len():
+        val key = arr[i]
+        var j = i - 1
+        while j >= 0 and arr[j].size > key.size:
+            arr[j + 1] = arr[j]
+            j = j - 1
+        arr[j + 1] = key
+        i = i + 1
+    arr
+
+fn sort_by_modified(entries: [FileEntry]) -> [FileEntry]:
+    var arr = entries
+    var i = 1
+    while i < arr.len():
+        val key = arr[i]
+        var j = i - 1
+        while j >= 0 and arr[j].modified > key.modified:
+            arr[j + 1] = arr[j]
+            j = j - 1
+        arr[j + 1] = key
+        i = i + 1
+    arr

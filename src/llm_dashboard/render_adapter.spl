@@ -20,8 +20,8 @@ use app.llm_dashboard.tui.agent_panel.{render_agent_tree}
 use app.llm_dashboard.tui.activity_feed.{FeedState, render_feed}
 use app.llm_dashboard.tui.status_bar.{render_status_bar}
 use app.llm_dashboard.gui.html_views.{generate_agents_html}
-use app.lib.ui.render.ansi.{RESET, BOLD, DIM, CYAN}
-use app.lib.ui.render.types.{RenderConfig, RenderRequest, RenderResult}
+use app.ui.render.ansi.{RESET, BOLD, DIM, CYAN}
+use app.ui.render.types.{RenderConfig, RenderRequest, RenderResult}
 
 # =========================================================================
 # Render Adapter Entry Point

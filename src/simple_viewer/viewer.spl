@@ -1,0 +1,138 @@
+# Read-Only File Viewer
+#
+# Loads a .spl file and renders a scrollable, syntax-highlighted
+# view with line numbers and current-line highlight.
+
+use std.nogc_sync_mut.io.file_ops.{file_exists, file_read}
+use app.simple_viewer.syntax_highlight.{colorize_line}
+
+# ---------------------------------------------------------------------------
+# ANSI helpers
+# ---------------------------------------------------------------------------
+
+val ANSI_RESET     = "\x1b[0m"
+val ANSI_DIM       = "\x1b[2m"
+val ANSI_REVERSE   = "\x1b[7m"
+
+# ---------------------------------------------------------------------------
+# ViewerState
+# ---------------------------------------------------------------------------
+
+struct ViewerState:
+    path:        text
+    lines:       [text]
+    scroll_top:  i64
+    cursor_line: i64
+    total_lines: i64
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+
+fn viewer_open(path: text) -> ViewerState:
+    if not file_exists(path):
+        return ViewerState(
+            path: path, lines: ["(file not found)"],
+            scroll_top: 0, cursor_line: 0, total_lines: 1
+        )
+    val content = file_read(path)
+    val split_lines = content.split("\n")
+    ViewerState(
+        path: path,
+        lines: split_lines,
+        scroll_top: 0,
+        cursor_line: 0,
+        total_lines: split_lines.len()
+    )
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+fn viewer_render(state: ViewerState, width: i64, height: i64) -> text:
+    val visible_h = if height > 2 then height - 2 else: 1
+    val gutter_w = _gutter_width(state.total_lines)
+    var output = ""
+
+    # Title bar
+    val title = " " + state.path + " (" + state.total_lines.to_text() + " lines)"
+    output = output + ANSI_REVERSE + _pad_right(title, width) + ANSI_RESET + "\n"
+
+    # Visible lines
+    var row = 0
+    while row < visible_h:
+        val line_idx = state.scroll_top + row
+        if line_idx < state.total_lines:
+            val line_num = (line_idx + 1).to_text()
+            val padded_num = _pad_left(line_num, gutter_w)
+            val gutter = ANSI_DIM + padded_num + " " + ANSI_RESET
+
+            val raw_line = state.lines[line_idx]
+            val colored = colorize_line(raw_line)
+
+            if line_idx == state.cursor_line:
+                output = output + gutter + ANSI_REVERSE + colored + ANSI_RESET + "\n"
+            else:
+                output = output + gutter + colored + "\n"
+        else:
+            output = output + ANSI_DIM + "~" + ANSI_RESET + "\n"
+        row = row + 1
+
+    # Status bar
+    val cursor_display = (state.cursor_line + 1).to_text()
+    val total_display = state.total_lines.to_text()
+    val status = " Ln " + cursor_display + "/" + total_display
+    output = output + ANSI_REVERSE + _pad_right(status, width) + ANSI_RESET
+    output
+
+# ---------------------------------------------------------------------------
+# Navigation
+# ---------------------------------------------------------------------------
+
+fn viewer_scroll(state: ViewerState, delta: i64) -> ViewerState:
+    var new_top = state.scroll_top + delta
+    if new_top < 0:
+        new_top = 0
+    if new_top >= state.total_lines:
+        new_top = state.total_lines - 1
+    ViewerState(
+        path: state.path, lines: state.lines,
+        scroll_top: new_top, cursor_line: state.cursor_line,
+        total_lines: state.total_lines
+    )
+
+fn viewer_goto(state: ViewerState, line: i64) -> ViewerState:
+    var target = line
+    if target < 0:
+        target = 0
+    if target >= state.total_lines:
+        target = state.total_lines - 1
+    ViewerState(
+        path: state.path, lines: state.lines,
+        scroll_top: target, cursor_line: target,
+        total_lines: state.total_lines
+    )
+
+# ---------------------------------------------------------------------------
+# String padding utilities
+# ---------------------------------------------------------------------------
+
+fn _gutter_width(total: i64) -> i64:
+    var digits = 1
+    var n = total
+    while n >= 10:
+        n = n / 10
+        digits = digits + 1
+    digits
+
+fn _pad_left(s: text, width: i64) -> text:
+    var result = s
+    while result.len() < width:
+        result = " " + result
+    result
+
+fn _pad_right(s: text, width: i64) -> text:
+    var result = s
+    while result.len() < width:
+        result = result + " "
+    result

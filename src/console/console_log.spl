@@ -1,0 +1,131 @@
+# Console Log Buffer
+#
+# Ring-buffer log storage for the IDE console panel.
+# Entries are kept in logical order (oldest first); when the buffer
+# reaches max_size the oldest entry is dropped on each push.
+
+# ============================================================================
+# Data Types
+# ============================================================================
+
+struct LogEntry:
+    timestamp: i64
+    level: text
+    source: text
+    message: text
+
+struct LogBuffer:
+    entries: [LogEntry]
+    max_size: i64
+    write_pos: i64
+
+# ============================================================================
+# Constructor
+# ============================================================================
+
+fn log_buffer_new(max_size: i64) -> LogBuffer:
+    """Create an empty log buffer with the given capacity."""
+    val capped = if max_size < 1 then 1 else: max_size
+    LogBuffer(
+        entries: [],
+        max_size: capped,
+        write_pos: 0
+    )
+
+# ============================================================================
+# Mutation
+# ============================================================================
+
+fn log_buffer_push(buf: LogBuffer, entry: LogEntry) -> LogBuffer:
+    """
+    Append an entry. When the buffer is full the oldest entry (index 0)
+    is dropped so readers always see entries in chronological order.
+    """
+    var new_entries = buf.entries
+    new_entries.push(entry)
+
+    # Drop oldest when over capacity
+    if new_entries.len() > buf.max_size:
+        var trimmed: [LogEntry] = []
+        var i = 1
+        while i < new_entries.len():
+            trimmed.push(new_entries[i])
+            i = i + 1
+        new_entries = trimmed
+
+    LogBuffer(
+        entries: new_entries,
+        max_size: buf.max_size,
+        write_pos: buf.write_pos + 1
+    )
+
+fn log_buffer_clear(buf: LogBuffer) -> LogBuffer:
+    """Remove all entries, keep capacity."""
+    LogBuffer(
+        entries: [],
+        max_size: buf.max_size,
+        write_pos: 0
+    )
+
+# ============================================================================
+# Queries
+# ============================================================================
+
+fn log_buffer_filter(buf: LogBuffer, level: text) -> [LogEntry]:
+    """Return entries matching the given level (info/warn/error/debug)."""
+    var result: [LogEntry] = []
+    var i = 0
+    while i < buf.entries.len():
+        val e = buf.entries[i]
+        if e.level == level:
+            result.push(e)
+        i = i + 1
+    result
+
+fn log_buffer_search(buf: LogBuffer, query: text) -> [LogEntry]:
+    """Return entries whose message or source contains the query string."""
+    if query == "":
+        return buf.entries
+
+    var result: [LogEntry] = []
+    var i = 0
+    while i < buf.entries.len():
+        val e = buf.entries[i]
+        if e.message.contains(query) or e.source.contains(query):
+            result.push(e)
+        i = i + 1
+    result
+
+fn log_buffer_tail(buf: LogBuffer, n: i64) -> [LogEntry]:
+    """Return the last N entries in chronological order."""
+    val total = buf.entries.len()
+    if n <= 0:
+        return []
+    if n >= total:
+        return buf.entries
+
+    var result: [LogEntry] = []
+    val start = total - n
+    var i = start
+    while i < total:
+        result.push(buf.entries[i])
+        i = i + 1
+    result
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn log_entry_new(timestamp: i64, level: text, source: text, message: text) -> LogEntry:
+    """Convenience constructor with validation on level."""
+    val safe_level = if level == "info" or level == "warn" or level == "error" or level == "debug" then level else: "info"
+    LogEntry(
+        timestamp: timestamp,
+        level: safe_level,
+        source: source,
+        message: message
+    )
+
+fn log_buffer_len(buf: LogBuffer) -> i64:
+    """Current number of entries in the buffer."""
+    buf.entries.len()

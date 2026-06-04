@@ -1,0 +1,184 @@
+# Syntax Highlighting for Simple Language
+#
+# Tokenizes .spl source lines into classified tokens and wraps each
+# token in ANSI color escape sequences for terminal rendering.
+
+# ---------------------------------------------------------------------------
+# ANSI color codes
+# ---------------------------------------------------------------------------
+
+val COLOR_RESET     = "\x1b[0m"
+val COLOR_KEYWORD   = "\x1b[35m"
+val COLOR_TYPE      = "\x1b[36m"
+val COLOR_STRING    = "\x1b[32m"
+val COLOR_NUMBER    = "\x1b[33m"
+val COLOR_COMMENT   = "\x1b[2m"
+val COLOR_OPERATOR  = "\x1b[37m"
+val COLOR_IDENT     = "\x1b[0m"
+val COLOR_PUNCT     = "\x1b[0m"
+
+# ---------------------------------------------------------------------------
+# Token
+# ---------------------------------------------------------------------------
+
+struct Token:
+    kind:  text
+    value: text
+    start: i64
+    end:   i64
+
+# ---------------------------------------------------------------------------
+# Keyword / type tables
+# ---------------------------------------------------------------------------
+
+fn _spl_keywords() -> [text]:
+    ["fn", "val", "var", "if", "else", "elif", "for", "while", "match",
+     "case", "return", "use", "import", "struct", "trait", "class",
+     "extern", "and", "or", "not", "true", "false", "nil"]
+
+fn _spl_types() -> [text]:
+    ["text", "bool", "i64", "i32", "f64", "f32",
+     "Int", "String", "Bool", "Dict", "Result", "Option"]
+
+# ---------------------------------------------------------------------------
+# Character classification helpers
+# ---------------------------------------------------------------------------
+
+fn _is_digit(ch: text) -> bool:
+    ch == "0" or ch == "1" or ch == "2" or ch == "3" or ch == "4" or ch == "5" or ch == "6" or ch == "7" or ch == "8" or ch == "9"
+
+fn _is_alpha(ch: text) -> bool:
+    val c = ch.char_at(0)
+    if c >= "a" and c <= "z":
+        return true
+    if c >= "A" and c <= "Z":
+        return true
+    c == "_"
+
+fn _is_alnum(ch: text) -> bool:
+    _is_alpha(ch) or _is_digit(ch)
+
+fn _is_operator_char(ch: text) -> bool:
+    (ch == "+" or ch == "-" or ch == "*" or ch == "/" or ch == "=" or
+     ch == "<" or ch == ">" or ch == "!" or ch == "%" or ch == "&" or
+     ch == "|" or ch == "^" or ch == "~" or ch == "?")
+
+fn _is_punct_char(ch: text) -> bool:
+    (ch == "(" or ch == ")" or ch == "[" or ch == "]" or ch == "{" or
+     ch == "}" or ch == ":" or ch == "," or ch == "." or ch == ";")
+
+# ---------------------------------------------------------------------------
+# Tokenizer
+# ---------------------------------------------------------------------------
+
+fn tokenize_line(line: text) -> [Token]:
+    var tokens: [Token] = []
+    var i = 0
+    val length = line.len()
+
+    while i < length:
+        val ch = line.char_at(i)
+
+        # Skip whitespace — not a token
+        if ch == " " or ch == "\t":
+            i = i + 1
+            continue
+
+        # Line comment
+        if ch == "#":
+            tokens.push(Token(kind: "comment", value: line.slice(i, length), start: i, end: length))
+            return tokens
+
+        # String literal (double-quoted)
+        if ch == "\"":
+            val start_pos = i
+            i = i + 1
+            while i < length:
+                val sc = line.char_at(i)
+                if sc == "\\" and i + 1 < length:
+                    i = i + 2
+                    continue
+                if sc == "\"":
+                    i = i + 1
+                    break
+                i = i + 1
+            tokens.push(Token(kind: "string", value: line.slice(start_pos, i), start: start_pos, end: i))
+            continue
+
+        # Number literal
+        if _is_digit(ch):
+            val start_pos = i
+            while i < length and (_is_digit(line.char_at(i)) or line.char_at(i) == "." or line.char_at(i) == "_"):
+                i = i + 1
+            tokens.push(Token(kind: "number", value: line.slice(start_pos, i), start: start_pos, end: i))
+            continue
+
+        # Identifier or keyword
+        if _is_alpha(ch):
+            val start_pos = i
+            while i < length and _is_alnum(line.char_at(i)):
+                i = i + 1
+            val word = line.slice(start_pos, i)
+            val keywords = _spl_keywords()
+            val types = _spl_types()
+            var kind = "identifier"
+            if keywords.contains(word):
+                kind = "keyword"
+            elif types.contains(word):
+                kind = "type"
+            tokens.push(Token(kind: kind, value: word, start: start_pos, end: i))
+            continue
+
+        # Operators (multi-char like ==, ->, !=, <=, >=)
+        if _is_operator_char(ch):
+            val start_pos = i
+            while i < length and _is_operator_char(line.char_at(i)):
+                i = i + 1
+            tokens.push(Token(kind: "operator", value: line.slice(start_pos, i), start: start_pos, end: i))
+            continue
+
+        # Punctuation
+        if _is_punct_char(ch):
+            tokens.push(Token(kind: "punctuation", value: ch, start: i, end: i + 1))
+            i = i + 1
+            continue
+
+        # Fallback — unknown character treated as identifier
+        tokens.push(Token(kind: "identifier", value: ch, start: i, end: i + 1))
+        i = i + 1
+
+    tokens
+
+# ---------------------------------------------------------------------------
+# Colorizer
+# ---------------------------------------------------------------------------
+
+fn colorize_token(tok: Token) -> text:
+    val color = _color_for_kind(tok.kind)
+    color + tok.value + COLOR_RESET
+
+fn _color_for_kind(kind: text) -> text:
+    match kind:
+        "keyword":      return COLOR_KEYWORD
+        "type":         return COLOR_TYPE
+        "string":       return COLOR_STRING
+        "number":       return COLOR_NUMBER
+        "comment":      return COLOR_COMMENT
+        "operator":     return COLOR_OPERATOR
+        "punctuation":  return COLOR_PUNCT
+        _:              return COLOR_IDENT
+
+fn colorize_line(line: text) -> text:
+    val tokens = tokenize_line(line)
+    var result = ""
+    var prev_end = 0
+    for tok in tokens:
+        # Preserve whitespace between tokens
+        if tok.start > prev_end:
+            result = result + line.slice(prev_end, tok.start)
+        result = result + colorize_token(tok)
+        prev_end = tok.end
+    # Trailing whitespace
+    if prev_end < line.len():
+        result = result + line.slice(prev_end, line.len())
+    result

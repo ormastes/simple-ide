@@ -1,0 +1,106 @@
+# Tree View — rendering and interaction
+#
+# Renders a [TreeNode] tree with Unicode box-drawing characters and handles
+# expand/collapse toggling for the IDE sidebar.
+
+use app.file_explorer.file_explorer.{FileEntry, TreeNode}
+
+# ============================================================================
+# Tree Rendering
+# ============================================================================
+
+fn render_tree(nodes: [TreeNode], width: i64) -> text:
+    # Render a flat text representation of the tree.
+    # Each line is padded/truncated to *width* columns.
+    var lines: [text] = []
+    var i = 0
+    while i < nodes.len():
+        val node = nodes[i]
+        val is_last = (i == nodes.len() - 1)
+        val node_lines = render_node(node, "", is_last, width)
+        for ln in node_lines:
+            lines.push(ln)
+        i = i + 1
+    join_lines(lines)
+
+fn render_node(node: TreeNode, prefix: text, is_last: bool, width: i64) -> [text]:
+    # Render a single node plus its children recursively.
+    val connector = if is_last { "└── " } else { "├── " }
+    val icon = entry_icon(node.entry)
+    val label = icon + node.entry.name
+    val raw_line = prefix + connector + label
+    val line = fit_line(raw_line, width)
+
+    var result: [text] = []
+    result.push(line)
+
+    if node.expanded and node.children.len() > 0:
+        val child_prefix = prefix + if is_last { "    " } else { "│   " }
+        var ci = 0
+        while ci < node.children.len():
+            val child = node.children[ci]
+            val child_is_last = (ci == node.children.len() - 1)
+            val child_lines = render_node(child, child_prefix, child_is_last, width)
+            for cl in child_lines:
+                result.push(cl)
+            ci = ci + 1
+    result
+
+fn entry_icon(entry: FileEntry) -> text:
+    # Directories get "/", .spl files get "*", others nothing.
+    if entry.is_dir:
+        return "/ "
+    if entry.name.ends_with(".spl"):
+        return "* "
+    ""
+
+fn fit_line(line: text, width: i64) -> text:
+    # Truncate or pad *line* to exactly *width* characters.
+    if width <= 0:
+        return line
+    if line.len() > width:
+        return line.slice(0, width)
+    var padded = line
+    while padded.len() < width:
+        padded = padded + " "
+    padded
+
+fn join_lines(lines: [text]) -> text:
+    # Join an array of lines into a single newline-separated string.
+    var out = ""
+    var i = 0
+    while i < lines.len():
+        if i > 0:
+            out = out + "\n"
+        out = out + lines[i]
+        i = i + 1
+    out
+
+# ============================================================================
+# Toggle Expand / Collapse
+# ============================================================================
+
+fn toggle_expand(nodes: [TreeNode], path: text) -> [TreeNode]:
+    # Return a new tree with the node at *path* toggled between expanded
+    # and collapsed.  Other nodes are unchanged.
+    var result: [TreeNode] = []
+    for node in nodes:
+        if node.entry.path == path:
+            val toggled = TreeNode(
+                entry: node.entry,
+                children: node.children,
+                expanded: not node.expanded,
+                indent_level: node.indent_level
+            )
+            result.push(toggled)
+        else:
+            # Recurse into children in case the target is deeper.
+            val new_children = toggle_expand(node.children, path)
+            val updated = TreeNode(
+                entry: node.entry,
+                children: new_children,
+                expanded: node.expanded,
+                indent_level: node.indent_level
+            )
+            result.push(updated)
+    result

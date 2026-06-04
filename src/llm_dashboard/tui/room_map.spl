@@ -11,8 +11,8 @@
 #   │        ═══         │ │     ═══       ═══   │ │         ═══        │
 #   ╰────────────────────╯ ╰─────────────────────╯ ╰────────────────────╯
 
-use app.lib.ui.tui.screen.{Screen}
-use app.lib.ui.render.ansi.{RESET, BOLD, DIM, FG_BLUE, FG_WHITE, FG_CYAN, FG_YELLOW, FG_GREEN}
+use app.ui.tui.screen.{Screen}
+use app.ui.render.ansi.{RESET, BOLD, DIM, FG_BLUE, FG_WHITE, FG_CYAN, FG_YELLOW, FG_GREEN}
 use app.llm_dashboard.data.types.{RoomKind, AgentNode, LLMProvider, AgentActivity,
     room_name, activity_label}
 use app.llm_dashboard.data.agent_position.{AgentPos, pos_agents_in_room, pos_update_from_nodes}

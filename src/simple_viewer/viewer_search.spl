@@ -1,0 +1,85 @@
+# Viewer Search
+#
+# Text search within the viewer: find all matches, cycle through them,
+# and highlight occurrences in rendered lines.
+
+use app.simple_viewer.viewer.{ViewerState, viewer_goto}
+
+# ---------------------------------------------------------------------------
+# ANSI helpers
+# ---------------------------------------------------------------------------
+
+val ANSI_RESET     = "\x1b[0m"
+val ANSI_SEARCH_BG = "\x1b[43m\x1b[30m"
+
+# ---------------------------------------------------------------------------
+# SearchMatch
+# ---------------------------------------------------------------------------
+
+struct SearchMatch:
+    line: i64
+    col:  i64
+    context: text
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+
+fn viewer_search(state: ViewerState, query: text) -> [SearchMatch]:
+    var matches: [SearchMatch] = []
+    if query == "":
+        return matches
+    var line_idx = 0
+    while line_idx < state.total_lines:
+        val line = state.lines[line_idx]
+        var col = 0
+        while col <= line.len() - query.len():
+            val segment = line.slice(col, col + query.len())
+            if segment == query:
+                val ctx_start = if col > 20 then col - 20 else: 0
+                val ctx_end = if col + query.len() + 20 < line.len() then col + query.len() + 20 else: line.len()
+                matches.push(SearchMatch(
+                    line: line_idx,
+                    col: col,
+                    context: line.slice(ctx_start, ctx_end)
+                ))
+                col = col + query.len()
+                continue
+            col = col + 1
+        line_idx = line_idx + 1
+    matches
+
+# ---------------------------------------------------------------------------
+# Navigation
+# ---------------------------------------------------------------------------
+
+fn viewer_next_match(state: ViewerState, matches: [SearchMatch], current: i64) -> (ViewerState, i64):
+    if matches.len() == 0:
+        return (state, 0 - 1)
+    var next_idx = current + 1
+    if next_idx >= matches.len():
+        next_idx = 0
+    val m = matches[next_idx]
+    val new_state = viewer_goto(state, m.line)
+    (new_state, next_idx)
+
+# ---------------------------------------------------------------------------
+# Highlight
+# ---------------------------------------------------------------------------
+
+fn highlight_search(line: text, query: text) -> text:
+    if query == "" or line.len() == 0:
+        return line
+    var result = ""
+    var i = 0
+    val qlen = query.len()
+    while i < line.len():
+        if i + qlen <= line.len():
+            val segment = line.slice(i, i + qlen)
+            if segment == query:
+                result = result + ANSI_SEARCH_BG + query + ANSI_RESET
+                i = i + qlen
+                continue
+        result = result + line.char_at(i)
+        i = i + 1
+    result

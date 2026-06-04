@@ -1,0 +1,135 @@
+# PDF Render — TUI/Text Rendering
+#
+# Renders PDF page content for text-mode display. Handles word wrapping,
+# page outlines, and status bar formatting.
+
+use app.pdf_viewer.pdf_document.{PdfDocument, PdfPage, pdf_get_page}
+
+fn render_pdf_page(doc: PdfDocument, page_num: i64, width: i64, height: i64) -> text:
+    """Render a single page's text content fitted within the given bounds."""
+    val page = pdf_get_page(doc, page_num)
+    if page.number == 0:
+        return _center_text("(No page {page_num})", width)
+    if page.text_content.trim() == "":
+        return _center_text("(Page {page_num} has no extractable text)", width)
+    val wrapped = _word_wrap(page.text_content, width)
+    val lines = wrapped.split("\n")
+    var result = ""
+    var line_count = 0
+    for line in lines:
+        if line_count >= height:
+            break
+        result = result + _pad_or_trim(line, width) + "\n"
+        line_count = line_count + 1
+    # Fill remaining height with empty lines
+    while line_count < height:
+        result = result + _pad_or_trim("", width) + "\n"
+        line_count = line_count + 1
+    result
+
+fn render_pdf_outline(doc: PdfDocument, width: i64) -> text:
+    """Render a table of contents / page list sidebar."""
+    var result = _pad_or_trim("=== Document Outline ===", width) + "\n"
+    val title_display = if doc.metadata.title != "": doc.metadata.title else: _path_basename(doc.path)
+    result = result + _pad_or_trim(title_display, width) + "\n"
+    result = result + _pad_or_trim("", width) + "\n"
+    var i = 1
+    while i <= doc.page_count:
+        val page = pdf_get_page(doc, i)
+        val preview = _first_line_preview(page.text_content, width - 12)
+        val entry = "  p.{i}  {preview}"
+        result = result + _pad_or_trim(entry, width) + "\n"
+        i = i + 1
+    result
+
+fn render_pdf_status(doc: PdfDocument, current_page: i64) -> text:
+    """Render a status bar: 'Page 3/42 -- Title'."""
+    val title_display = if doc.metadata.title != "": doc.metadata.title else: _path_basename(doc.path)
+    "Page {current_page}/{doc.page_count} -- {title_display}"
+
+fn _word_wrap(content: text, width: i64) -> text:
+    """Wrap text content to fit within the given width."""
+    if width <= 0:
+        return content
+    var result = ""
+    val input_lines = content.split("\n")
+    var first_line = true
+    for line in input_lines:
+        if not first_line:
+            result = result + "\n"
+        first_line = false
+        if line.len() <= width:
+            result = result + line
+        else:
+            result = result + _wrap_long_line(line, width)
+    result
+
+fn _wrap_long_line(line: text, width: i64) -> text:
+    """Break a single long line into multiple lines at word boundaries."""
+    var result = ""
+    var pos = 0
+    while pos < line.len():
+        val remaining = line.len() - pos
+        if remaining <= width:
+            if pos > 0:
+                result = result + "\n"
+            result = result + line[pos:]
+            break
+        # Find last space within width
+        var break_at = pos + width
+        var search = break_at
+        while search > pos:
+            if line[search:search + 1] == " ":
+                break_at = search
+                break
+            search = search - 1
+        if search == pos:
+            break_at = pos + width
+        if pos > 0:
+            result = result + "\n"
+        result = result + line[pos:break_at]
+        pos = break_at
+        # Skip the space at the break point
+        if pos < line.len() and line[pos:pos + 1] == " ":
+            pos = pos + 1
+    result
+
+fn _pad_or_trim(line: text, width: i64) -> text:
+    """Pad line with spaces or trim to exactly width characters."""
+    if line.len() >= width:
+        return line[0:width]
+    var padded = line
+    var i = padded.len()
+    while i < width:
+        padded = padded + " "
+        i = i + 1
+    padded
+
+fn _center_text(msg: text, width: i64) -> text:
+    """Center a short message within the given width."""
+    if msg.len() >= width:
+        return msg[0:width]
+    val pad_left = (width - msg.len()) / 2
+    var result = ""
+    var i = 0
+    while i < pad_left:
+        result = result + " "
+        i = i + 1
+    result + msg
+
+fn _first_line_preview(content: text, max_len: i64) -> text:
+    """Extract the first non-empty line as a preview, trimmed to max_len."""
+    for line in content.split("\n"):
+        val trimmed = line.trim()
+        if trimmed != "":
+            if trimmed.len() > max_len:
+                return trimmed[0:max_len - 3] + "..."
+            return trimmed
+    "(empty)"
+
+fn _path_basename(path: text) -> text:
+    """Extract the filename from a path."""
+    if path.contains("/"):
+        val last_slash = path.last_index_of("/") ?? -1
+        return path[last_slash + 1:]
+    path

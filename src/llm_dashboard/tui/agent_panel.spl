@@ -8,7 +8,7 @@ use app.llm_dashboard.data.types.{AgentNode, LLMProvider, AgentActivity,
 use app.llm_dashboard.data.agent_tree.{AgentTree}
 use app.llm_dashboard.tui.colors.{provider_color, activity_color}
 use app.llm_dashboard.tui.agent_sprites.{agent_tree_label, agent_indicator}
-use app.lib.ui.render.ansi.{RESET, BOLD, DIM}
+use app.ui.render.ansi.{RESET, BOLD, DIM}
 
 # =========================================================================
 # Tree Rendering

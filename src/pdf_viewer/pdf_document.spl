@@ -1,0 +1,133 @@
+# PDF Document Model
+#
+# Core data structures and extraction functions for PDF documents.
+# Uses poppler-utils (pdftotext, pdfinfo) via shell for parsing.
+
+use std.nogc_sync_mut.io.file_ops.{file_exists, file_read}
+use std.nogc_sync_mut.io.process_ops.{shell_output_trimmed, shell_output, shell_int}
+
+struct PdfMetadata:
+    title: text
+    author: text
+    creator: text
+    page_count: i64
+
+struct PdfPage:
+    number: i64
+    width: i64
+    height: i64
+    text_content: text
+
+struct PdfDocument:
+    path: text
+    page_count: i64
+    pages: [PdfPage]
+    metadata: PdfMetadata
+
+fn pdf_open(path: text) -> PdfDocument:
+    """Open a PDF file, extract metadata and text for all pages."""
+    if not file_exists(path):
+        return PdfDocument(
+            path: path,
+            page_count: 0,
+            pages: [],
+            metadata: PdfMetadata(title: "", author: "", creator: "", page_count: 0)
+        )
+    val meta = pdf_metadata(path)
+    val total = meta.page_count
+    var pages: [PdfPage] = []
+    var i = 1
+    while i <= total:
+        val content = pdf_extract_text(path, i)
+        val page = PdfPage(
+            number: i,
+            width: 612,
+            height: 792,
+            text_content: content
+        )
+        pages.push(page)
+        i = i + 1
+    PdfDocument(
+        path: path,
+        page_count: total,
+        pages: pages,
+        metadata: meta
+    )
+
+fn pdf_extract_text(path: text, page: i64) -> text:
+    """Extract text content from a single page using pdftotext."""
+    val cmd = "pdftotext -f {page} -l {page} -layout \"{path}\" -"
+    val output = shell_output_trimmed(cmd, "")
+    output
+
+fn pdf_page_count(path: text) -> i64:
+    """Get the total number of pages in a PDF using pdfinfo."""
+    val cmd = "pdfinfo \"{path}\" 2>/dev/null | grep -i '^Pages:' | awk '{print $2}'"
+    val output = shell_output_trimmed(cmd, "")
+    if output.trim() == "":
+        return 0
+    _parse_int(output.trim())
+
+fn pdf_metadata(path: text) -> PdfMetadata:
+    """Parse pdfinfo output to extract document metadata."""
+    val cmd = "pdfinfo \"{path}\" 2>/dev/null"
+    val output = shell_output_trimmed(cmd, "")
+    var title = ""
+    var author = ""
+    var creator = ""
+    var pages = 0
+    for line in output.split("\n"):
+        val trimmed = line.trim()
+        if trimmed.starts_with("Title:"):
+            title = _extract_info_value(trimmed, "Title:")
+        if trimmed.starts_with("Author:"):
+            author = _extract_info_value(trimmed, "Author:")
+        if trimmed.starts_with("Creator:"):
+            creator = _extract_info_value(trimmed, "Creator:")
+        if trimmed.starts_with("Pages:"):
+            val pages_str = _extract_info_value(trimmed, "Pages:")
+            pages = _parse_int(pages_str)
+    PdfMetadata(
+        title: title,
+        author: author,
+        creator: creator,
+        page_count: pages
+    )
+
+fn _extract_info_value(line: text, prefix: text) -> text:
+    """Extract the value portion after a pdfinfo field prefix."""
+    if line.len() <= prefix.len():
+        return ""
+    val raw = line[prefix.len():]
+    raw.trim()
+
+fn _parse_int(s: text) -> i64:
+    """Parse a text string to i64, returning 0 on failure."""
+    var result: i64 = 0
+    var i = 0
+    while i < s.len():
+        val ch = s[i:i + 1]
+        if ch >= "0" and ch <= "9":
+            result = result * 10 + _digit_value(ch)
+        i = i + 1
+    result
+
+fn _digit_value(ch: text) -> i64:
+    """Convert a single digit character to its numeric value."""
+    if ch == "0": return 0
+    if ch == "1": return 1
+    if ch == "2": return 2
+    if ch == "3": return 3
+    if ch == "4": return 4
+    if ch == "5": return 5
+    if ch == "6": return 6
+    if ch == "7": return 7
+    if ch == "8": return 8
+    if ch == "9": return 9
+    0
+
+fn pdf_get_page(doc: PdfDocument, page_num: i64) -> PdfPage:
+    """Get a specific page from the document (1-indexed)."""
+    if page_num < 1 or page_num > doc.page_count:
+        return PdfPage(number: 0, width: 0, height: 0, text_content: "")
+    doc.pages[page_num - 1]

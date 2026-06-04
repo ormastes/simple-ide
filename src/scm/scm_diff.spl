@@ -1,0 +1,215 @@
+# SCM Diff — Diff viewing and parsing
+# Parses unified diff format from git/jj into structured hunks
+
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+
+# ============================================================================
+# Data Structs
+# ============================================================================
+
+struct DiffLine:
+    kind: text
+    content: text
+    line_no: i64
+
+struct DiffHunk:
+    old_start: i64
+    old_count: i64
+    new_start: i64
+    new_count: i64
+    lines: [DiffLine]
+
+# ============================================================================
+# Shell helpers
+# ============================================================================
+
+fn _diff_shell(command: text) -> (text, text, i64):
+    rt_process_run("/bin/sh", ["-c", command])
+
+# ============================================================================
+# Diff Retrieval
+# ============================================================================
+
+fn get_diff(root: text, file_path: text) -> [DiffHunk]:
+    """Get diff hunks for a file. Tries jj first, falls back to git."""
+    val (jj_out, jj_err, jj_code) = _diff_shell("test -d '{root}/.jj'")
+    var diff_text = ""
+
+    if jj_code == 0:
+        val (out, err, code) = _diff_shell("cd '{root}' && jj diff '{file_path}' 2>/dev/null")
+        if code == 0:
+            diff_text = out
+    else:
+        # Try staged first, then unstaged
+        val (out, err, code) = _diff_shell("cd '{root}' && git diff --cached -- '{file_path}' 2>/dev/null")
+        if code == 0 and out.trim().len() > 0:
+            diff_text = out
+        else:
+            val (out2, err2, code2) = _diff_shell("cd '{root}' && git diff -- '{file_path}' 2>/dev/null")
+            if code2 == 0:
+                diff_text = out2
+
+    parse_unified_diff(diff_text)
+
+# ============================================================================
+# Unified Diff Parser
+# ============================================================================
+
+fn _parse_hunk_header(line: text) -> (i64, i64, i64, i64):
+    """Parse @@ -old_start,old_count +new_start,new_count @@ header.
+    Returns (old_start, old_count, new_start, new_count)."""
+    # Find range between first @@ and second @@
+    var inner = line
+    if inner.starts_with("@@ "):
+        inner = inner.slice(3, inner.len())
+    # Find closing @@
+    val close_idx = inner.index_of(" @@")
+    if close_idx >= 0:
+        inner = inner.slice(0, close_idx)
+
+    # Split into old and new parts: "-1,5 +1,7"
+    val parts = inner.trim().split(" ")
+    var old_start: i64 = 1
+    var old_count: i64 = 0
+    var new_start: i64 = 1
+    var new_count: i64 = 0
+
+    var p = 0
+    while p < parts.len():
+        val part = parts[p].trim()
+        if part.starts_with("-"):
+            val nums = part.slice(1, part.len())
+            val comma_idx = nums.index_of(",")
+            if comma_idx >= 0:
+                old_start = int(nums.slice(0, comma_idx))
+                old_count = int(nums.slice(comma_idx + 1, nums.len()))
+            else:
+                old_start = int(nums)
+                old_count = 1
+        else if part.starts_with("+"):
+            val nums = part.slice(1, part.len())
+            val comma_idx = nums.index_of(",")
+            if comma_idx >= 0:
+                new_start = int(nums.slice(0, comma_idx))
+                new_count = int(nums.slice(comma_idx + 1, nums.len()))
+            else:
+                new_start = int(nums)
+                new_count = 1
+        p = p + 1
+
+    (old_start, old_count, new_start, new_count)
+
+fn parse_unified_diff(diff_text: text) -> [DiffHunk]:
+    """Parse unified diff text into structured DiffHunk list."""
+    var hunks: [DiffHunk] = []
+    val trimmed = diff_text.trim()
+    if trimmed.len() == 0:
+        return hunks
+
+    val lines = trimmed.split("\n")
+    var current_lines: [DiffLine] = []
+    var cur_old_start: i64 = 0
+    var cur_old_count: i64 = 0
+    var cur_new_start: i64 = 0
+    var cur_new_count: i64 = 0
+    var in_hunk = false
+    var new_line_no: i64 = 0
+
+    var i = 0
+    while i < lines.len():
+        val line = lines[i]
+
+        if line.starts_with("@@"):
+            # Flush previous hunk
+            if in_hunk and current_lines.len() > 0:
+                hunks.push(DiffHunk(
+                    old_start: cur_old_start,
+                    old_count: cur_old_count,
+                    new_start: cur_new_start,
+                    new_count: cur_new_count,
+                    lines: current_lines
+                ))
+            # Parse new hunk header
+            val (os, oc, ns, nc) = _parse_hunk_header(line)
+            cur_old_start = os
+            cur_old_count = oc
+            cur_new_start = ns
+            cur_new_count = nc
+            new_line_no = ns
+            current_lines = []
+            in_hunk = true
+        else if in_hunk:
+            if line.starts_with("+"):
+                current_lines.push(DiffLine(kind: "add", content: line.slice(1, line.len()), line_no: new_line_no))
+                new_line_no = new_line_no + 1
+            else if line.starts_with("-"):
+                current_lines.push(DiffLine(kind: "remove", content: line.slice(1, line.len()), line_no: 0))
+            else:
+                # Context line (starts with space or is empty)
+                val ctx_content = if line.len() > 0: line.slice(1, line.len()) else: ""
+                current_lines.push(DiffLine(kind: "context", content: ctx_content, line_no: new_line_no))
+                new_line_no = new_line_no + 1
+        # Skip diff headers (---, +++, diff --git, index lines)
+        i = i + 1
+
+    # Flush last hunk
+    if in_hunk and current_lines.len() > 0:
+        hunks.push(DiffHunk(
+            old_start: cur_old_start,
+            old_count: cur_old_count,
+            new_start: cur_new_start,
+            new_count: cur_new_count,
+            lines: current_lines
+        ))
+
+    hunks
+
+# ============================================================================
+# Diff Rendering
+# ============================================================================
+
+fn render_diff(hunks: [DiffHunk], width: i64) -> text:
+    """Render diff hunks as colored text with +/- markers.
+    Uses ANSI escape codes: green for add, red for remove, dim for context."""
+    var result = ""
+    val green = "\x1b[32m"
+    val red = "\x1b[31m"
+    val dim = "\x1b[2m"
+    val reset = "\x1b[0m"
+
+    var h = 0
+    while h < hunks.len():
+        val hunk = hunks[h]
+        result = result + "{dim}@@ -{hunk.old_start},{hunk.old_count} +{hunk.new_start},{hunk.new_count} @@{reset}\n"
+
+        var li = 0
+        while li < hunk.lines.len():
+            val dl = hunk.lines[li]
+            val prefix_line_no = if dl.line_no > 0: "{dl.line_no}" else: " "
+            # Pad line number to 4 chars
+            var pad = prefix_line_no
+            while pad.len() < 4:
+                pad = " " + pad
+
+            if dl.kind == "add":
+                val truncated = _truncate(dl.content, width - 7)
+                result = result + "{green}{pad} + {truncated}{reset}\n"
+            else if dl.kind == "remove":
+                val truncated = _truncate(dl.content, width - 7)
+                result = result + "{red}{pad} - {truncated}{reset}\n"
+            else:
+                val truncated = _truncate(dl.content, width - 7)
+                result = result + "{dim}{pad}   {truncated}{reset}\n"
+            li = li + 1
+        h = h + 1
+
+    result
+
+fn _truncate(s: text, max_len: i64) -> text:
+    """Truncate text to max_len, appending ellipsis if needed."""
+    if max_len <= 0:
+        return s
+    if s.len() <= max_len:
+        s
+    else:
+        s.slice(0, max_len - 1) + "~"

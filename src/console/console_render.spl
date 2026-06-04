@@ -1,0 +1,148 @@
+# Console Panel Rendering
+#
+# Renders the visible portion of the log buffer as ANSI-colored text
+# suitable for TUI display. Each log line shows timestamp, level badge,
+# and message truncated to the available width.
+
+use app.console.console_log.*
+
+# ============================================================================
+# Constants — ANSI escape helpers
+# ============================================================================
+
+val RESET = "\x1b[0m"
+val BOLD = "\x1b[1m"
+val DIM = "\x1b[2m"
+val FG_RED = "\x1b[31m"
+val FG_YELLOW = "\x1b[33m"
+val FG_CYAN = "\x1b[36m"
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+fn render_console(buf: LogBuffer, width: i64, height: i64, scroll_offset: i64) -> text:
+    """
+    Render the visible slice of the log buffer.
+
+    Returns a multi-line string (height lines). Empty lines are padded
+    when there are fewer entries than the viewport height.
+    """
+    val total = buf.entries.len()
+    if height <= 0 or width <= 0:
+        return ""
+
+    # Clamp scroll offset
+    val max_scroll = if total > height then total - height else: 0
+    var offset = scroll_offset
+    if offset < 0:
+        offset = 0
+    if offset > max_scroll:
+        offset = max_scroll
+
+    var lines: [text] = []
+    var row = 0
+    while row < height:
+        val idx = offset + row
+        if idx < total:
+            val entry = buf.entries[idx]
+            lines.push(format_log_entry(entry, width))
+        else:
+            lines.push("")
+        row = row + 1
+
+    lines.join("\n")
+
+fn format_log_entry(entry: LogEntry, width: i64) -> text:
+    """
+    Format a single log entry as:  HH:MM:SS [LEVEL] source: message
+
+    Level badge is colored: info=cyan, warn=yellow, error=red, debug=dim.
+    The line is truncated to width (ANSI codes excluded from count).
+    """
+    val ts = _format_timestamp(entry.timestamp)
+    val badge = _level_badge(entry.level)
+
+    var line = ts + " " + badge + " "
+    if entry.source != "":
+        line = line + entry.source + ": "
+    line = line + entry.message
+
+    # Truncate visible content to width
+    _truncate_visible(line, width)
+
+# ============================================================================
+# Timestamp formatting
+# ============================================================================
+
+fn _format_timestamp(micros: i64) -> text:
+    """
+    Convert a Unix-microsecond timestamp to HH:MM:SS.
+    Uses modular arithmetic for time-of-day extraction.
+    """
+    val total_seconds = micros / 1_000_000
+    val secs_in_day = total_seconds % 86400
+    val hh = secs_in_day / 3600
+    val mm = (secs_in_day % 3600) / 60
+    val ss = secs_in_day % 60
+
+    val hh_str = if hh < 10 then "0{hh}" else: "{hh}"
+    val mm_str = if mm < 10 then "0{mm}" else: "{mm}"
+    val ss_str = if ss < 10 then "0{ss}" else: "{ss}"
+
+    DIM + hh_str + ":" + mm_str + ":" + ss_str + RESET
+
+fn _level_badge(level: text) -> text:
+    """Return a colored [LEVEL] badge string."""
+    if level == "error":
+        return FG_RED + BOLD + "[ERR]" + RESET
+    if level == "warn":
+        return FG_YELLOW + "[WRN]" + RESET
+    if level == "info":
+        return FG_CYAN + "[INF]" + RESET
+    if level == "debug":
+        return DIM + "[DBG]" + RESET
+    "[???]"
+
+# ============================================================================
+# Visible-width truncation
+# ============================================================================
+
+fn _truncate_visible(line: text, max_width: i64) -> text:
+    """
+    Truncate a line to max_width visible characters.
+    ANSI escape sequences are not counted toward visible width.
+
+    Uses for-ch-in iteration with a state machine to detect ESC sequences.
+    State 0 = normal, 1 = saw ESC, 2 = inside CSI params.
+    """
+    var result = ""
+    var visible = 0
+    var state = 0
+
+    for ch in line:
+        if visible >= max_width and state == 0:
+            break
+
+        if state == 0:
+            if ch == "\x1b":
+                result = result + ch
+                state = 1
+            else:
+                result = result + ch
+                visible = visible + 1
+        elif state == 1:
+            result = result + ch
+            if ch == "[":
+                state = 2
+            else:
+                # Not CSI, count as visible
+                visible = visible + 1
+                state = 0
+        elif state == 2:
+            result = result + ch
+            if (ch >= "A" and ch <= "Z") or (ch >= "a" and ch <= "z"):
+                state = 0
+
+    # Always close with reset to avoid style leaking
+    result + RESET

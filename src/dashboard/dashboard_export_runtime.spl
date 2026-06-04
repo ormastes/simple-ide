@@ -2,7 +2,7 @@ use std.cli.cli_parser.{cli_spec, cli_spec_flag, cli_spec_option, parse_cli_args
 use std.nogc_sync_mut.io.file_ops.{file_exists, file_read, file_write, file_remove}
 use std.nogc_sync_mut.io.dir_ops.{dir_create_all}
 use std.text.{to_int_or, escape_json}
-use app.lib.ui.detect.{has_tauri_shell}
+use app.ui.detect.{has_tauri_shell}
 use app.llm_dashboard.main.{run_llm_dashboard}
 use app.dashboard.main.{
     DASHBOARD_CACHE_PATH, DASHBOARD_HISTORY_DIR, DASHBOARD_TABLE_DIR,

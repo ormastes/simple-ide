@@ -4,7 +4,7 @@
 # Each character cell = 2×4 dot grid = 8 possible dots.
 # Used for token usage trends, latency, and other time-series in the dashboard.
 
-use app.lib.ui.render.ansi.{RESET, FG_GREEN, FG_YELLOW, FG_RED, FG_CYAN, DIM}
+use app.ui.render.ansi.{RESET, FG_GREEN, FG_YELLOW, FG_RED, FG_CYAN, DIM}
 
 # =========================================================================
 # Bar Sparkline (simpler: uses block characters ▁▂▃▄▅▆▇█)

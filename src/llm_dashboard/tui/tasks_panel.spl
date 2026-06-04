@@ -3,7 +3,7 @@
 # Renders managed tasks (loops, schedules, daemons, jobs, remote sessions)
 # as TUI lines. Follows the same pattern as stats_panel.spl.
 
-use app.lib.ui.render.ansi.{RESET, BOLD, DIM, FG_GREEN, FG_YELLOW, FG_RED, FG_CYAN}
+use app.ui.render.ansi.{RESET, BOLD, DIM, FG_GREEN, FG_YELLOW, FG_RED, FG_CYAN}
 use app.llm_dashboard.data.types.{
     ManagedTask, TaskKind, TaskState,
     task_kind_name, task_state_name

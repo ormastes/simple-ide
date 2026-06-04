@@ -1,0 +1,170 @@
+# SCM Operations — Commit, stage, revert, log
+# Dispatches to git or jj based on detected backend
+
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+
+# ============================================================================
+# Data Structs
+# ============================================================================
+
+struct ScmLogEntry:
+    id: text
+    message: text
+    author: text
+    timestamp: text
+
+# ============================================================================
+# Shell helpers
+# ============================================================================
+
+fn _ops_shell(command: text) -> (text, text, i64):
+    rt_process_run("/bin/sh", ["-c", command])
+
+fn _ops_detect(root: text) -> text:
+    """Detect backend: 'jj', 'git', or 'none'."""
+    val (out, err, code) = _ops_shell("test -d '{root}/.jj'")
+    if code == 0:
+        return "jj"
+    val (out2, err2, code2) = _ops_shell("test -d '{root}/.git' -o -f '{root}/.git'")
+    if code2 == 0:
+        return "git"
+    "none"
+
+# ============================================================================
+# Commit
+# ============================================================================
+
+fn scm_commit(root: text, message: text) -> text:
+    """Commit current changes. Returns commit id or error message."""
+    val backend = _ops_detect(root)
+
+    if backend == "jj":
+        val (out, err, code) = _ops_shell("cd '{root}' && jj commit -m '{message}' 2>&1")
+        if code == 0:
+            return out.trim()
+        return "error: {err.trim()}"
+
+    if backend == "git":
+        val (out, err, code) = _ops_shell("cd '{root}' && git commit -m '{message}' 2>&1")
+        if code == 0:
+            return out.trim()
+        return "error: {err.trim()}"
+
+    "error: no scm backend detected"
+
+# ============================================================================
+# Stage / Unstage
+# ============================================================================
+
+fn scm_stage(root: text, path: text) -> bool:
+    """Stage a file. For jj this is a no-op (auto-tracked)."""
+    val backend = _ops_detect(root)
+
+    if backend == "jj":
+        # jj auto-tracks everything, but we can explicitly track
+        val (out, err, code) = _ops_shell("cd '{root}' && jj file track '{path}' 2>/dev/null")
+        return true
+
+    if backend == "git":
+        val (out, err, code) = _ops_shell("cd '{root}' && git add -- '{path}' 2>/dev/null")
+        return code == 0
+
+    false
+
+fn scm_unstage(root: text, path: text) -> bool:
+    """Unstage a file. For jj this untrack the file."""
+    val backend = _ops_detect(root)
+
+    if backend == "jj":
+        val (out, err, code) = _ops_shell("cd '{root}' && jj file untrack '{path}' 2>/dev/null")
+        return code == 0
+
+    if backend == "git":
+        val (out, err, code) = _ops_shell("cd '{root}' && git reset HEAD -- '{path}' 2>/dev/null")
+        return code == 0
+
+    false
+
+# ============================================================================
+# Revert
+# ============================================================================
+
+fn scm_revert(root: text, path: text) -> bool:
+    """Revert a file to its last committed state."""
+    val backend = _ops_detect(root)
+
+    if backend == "jj":
+        val (out, err, code) = _ops_shell("cd '{root}' && jj restore '{path}' 2>/dev/null")
+        return code == 0
+
+    if backend == "git":
+        val (out, err, code) = _ops_shell("cd '{root}' && git checkout -- '{path}' 2>/dev/null")
+        return code == 0
+
+    false
+
+# ============================================================================
+# Log
+# ============================================================================
+
+fn scm_log(root: text, count: i64) -> [ScmLogEntry]:
+    """Get recent commit log entries."""
+    val backend = _ops_detect(root)
+
+    if backend == "jj":
+        return _jj_log(root, count)
+
+    if backend == "git":
+        return _git_log(root, count)
+
+    []
+
+fn _git_log(root: text, count: i64) -> [ScmLogEntry]:
+    """Parse git log with a delimiter-separated format."""
+    val sep = "<<<SEP>>>"
+    val fmt = "%H{sep}%s{sep}%an{sep}%aI"
+    val (out, err, code) = _ops_shell("cd '{root}' && git log --format='{fmt}' -n {count} 2>/dev/null")
+    if code != 0 or out.trim().len() == 0:
+        return []
+
+    var entries: [ScmLogEntry] = []
+    val lines = out.trim().split("\n")
+    var i = 0
+    while i < lines.len():
+        val line = lines[i].trim()
+        if line.len() > 0:
+            val parts = line.split(sep)
+            if parts.len() >= 4:
+                entries.push(ScmLogEntry(
+                    id: parts[0].trim(),
+                    message: parts[1].trim(),
+                    author: parts[2].trim(),
+                    timestamp: parts[3].trim()
+                ))
+        i = i + 1
+    entries
+
+fn _jj_log(root: text, count: i64) -> [ScmLogEntry]:
+    """Parse jj log with template-based format."""
+    val sep = "<<<SEP>>>"
+    val tmpl = "change_id.short() ++ \"{sep}\" ++ description.first_line() ++ \"{sep}\" ++ author.name() ++ \"{sep}\" ++ author.timestamp()"
+    val (out, err, code) = _ops_shell("cd '{root}' && jj log --no-graph -T '{tmpl}' -n {count} 2>/dev/null")
+    if code != 0 or out.trim().len() == 0:
+        return []
+
+    var entries: [ScmLogEntry] = []
+    val lines = out.trim().split("\n")
+    var i = 0
+    while i < lines.len():
+        val line = lines[i].trim()
+        if line.len() > 0:
+            val parts = line.split(sep)
+            if parts.len() >= 4:
+                entries.push(ScmLogEntry(
+                    id: parts[0].trim(),
+                    message: parts[1].trim(),
+                    author: parts[2].trim(),
+                    timestamp: parts[3].trim()
+                ))
+        i = i + 1
+    entries

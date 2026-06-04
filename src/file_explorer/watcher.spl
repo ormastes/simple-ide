@@ -1,0 +1,74 @@
+# Watcher — file-system change detection
+#
+# Polling-based change detector: compares a fresh directory scan against the
+# previous snapshot and returns added / removed / modified entries.
+
+use app.file_explorer.file_explorer.{FileEntry, list_dir}
+
+# ============================================================================
+# Types
+# ============================================================================
+
+struct FileChange:
+    path: text
+    kind: text   # "added", "removed", or "modified"
+
+struct WatchState:
+    path: text
+    last_scan: [FileEntry]
+    scan_time: i64
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+fn watch_init(path: text) -> WatchState:
+    # Create an initial watch state by scanning *path* now.
+    val entries = list_dir(path)
+    WatchState(path: path, last_scan: entries, scan_time: 0)
+
+fn scan_changes(state: WatchState) -> (WatchState, [FileChange]):
+    # Scan *state.path* again and diff against the previous snapshot.
+    # Returns the updated state and a list of changes.
+    val current = list_dir(state.path)
+    val changes = diff_entries(state.last_scan, current)
+    val new_state = WatchState(
+        path: state.path,
+        last_scan: current,
+        scan_time: state.scan_time + 1
+    )
+    (new_state, changes)
+
+# ============================================================================
+# Diff Engine
+# ============================================================================
+
+fn diff_entries(old: [FileEntry], current: [FileEntry]) -> [FileChange]:
+    var changes: [FileChange] = []
+
+    # Detect added and modified entries
+    for entry in current:
+        val prev = find_entry(old, entry.path)
+        if prev.path == "":
+            # Not found in old — added
+            changes.push(FileChange(path: entry.path, kind: "added"))
+        elif not entry.is_dir:
+            # Exists — check for modification (size or mtime change)
+            if entry.size != prev.size or entry.modified != prev.modified:
+                changes.push(FileChange(path: entry.path, kind: "modified"))
+
+    # Detect removed entries
+    for entry in old:
+        val still = find_entry(current, entry.path)
+        if still.path == "":
+            changes.push(FileChange(path: entry.path, kind: "removed"))
+
+    changes
+
+fn find_entry(entries: [FileEntry], path: text) -> FileEntry:
+    # Linear search for an entry by path.  Returns a sentinel with path ""
+    # when not found.
+    for entry in entries:
+        if entry.path == path:
+            return entry
+    FileEntry(name: "", path: "", is_dir: false, size: 0, modified: 0)

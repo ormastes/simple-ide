@@ -6,13 +6,13 @@
 #
 # Uses shared components: html_card, html_table, html_badge, html_kv_table
 
-use app.lib.ui.render.types.{RenderConfig, RenderResult}
-use app.lib.ui.render.html.{html_page, html_escape, html_card, html_table,
+use app.ui.render.types.{RenderConfig, RenderResult}
+use app.ui.render.html.{html_page, html_escape, html_card, html_table,
     html_badge, html_kv_table, html_section, html_grid,
     html_metric_card, html_status_dot,
     css_dark_theme, css_light_theme, css_color_var}
-use app.lib.ui.render.css.{card_css, grid_css, badge_css, table_css}
-use app.lib.ui.render.fmt.{fmt_count, fmt_number, separator}
+use app.ui.render.css.{card_css, grid_css, badge_css, table_css}
+use app.ui.render.fmt.{fmt_count, fmt_number, separator}
 
 # =========================================================================
 # Main Entry Point
