@@ -1,0 +1,188 @@
+# JSONL Watcher
+#
+# Watches ~/.claude/projects/ for JSONL transcript file changes.
+# Uses polling with byte-offset tracking to efficiently read new content.
+
+use std.io_runtime.{file_exists, file_size, is_dir, file_read}
+extern fn rt_env_get(key: text) -> text
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+
+fn home_dir() -> text:
+    rt_env_get("HOME")
+
+fn dir_list(path: text) -> [text]:
+    val (out, err, code) = rt_process_run("/bin/sh", ["-c", "ls -1 '{path}' 2>/dev/null"])
+    if code == 0:
+        var trimmed = out.trim()
+        if trimmed.len() > 0:
+            return trimmed.split("\n")
+    return []
+use app.llm_dashboard.data.jsonl_parser.{JsonlParser, DashboardEvent, parse_line}
+
+# =========================================================================
+# Watch State
+# =========================================================================
+
+class WatchedFile:
+    path: text
+    last_offset: i64
+    session_id: text
+    parser: JsonlParser
+
+    static fn new(path: text, session_id: text) -> WatchedFile:
+        return WatchedFile.new_with_offset(path, session_id, 0)
+
+    static fn new_with_offset(path: text, session_id: text, start_offset: i64) -> WatchedFile:
+        return WatchedFile(
+            path: path,
+            last_offset: start_offset,
+            session_id: session_id,
+            parser: JsonlParser.new(session_id)
+        )
+
+class JsonlWatcher:
+    claude_dir: text
+    watched_files: [WatchedFile]
+    last_scan_time: i64
+
+    static fn new() -> JsonlWatcher:
+        val home = home_dir()
+        val claude_dir = "{home}/.claude/projects"
+        return JsonlWatcher(
+            claude_dir: claude_dir,
+            watched_files: [],
+            last_scan_time: 0
+        )
+
+    static fn with_dir(dir: text) -> JsonlWatcher:
+        return JsonlWatcher(
+            claude_dir: dir,
+            watched_files: [],
+            last_scan_time: 0
+        )
+
+# =========================================================================
+# Watcher Methods
+# =========================================================================
+
+impl JsonlWatcher:
+
+    fn is_available() -> bool:
+        """Check if the Claude projects directory exists."""
+        return file_exists(self.claude_dir)
+
+    me scan_for_new_files():
+        """Scan for new JSONL transcript files not yet being watched."""
+        if not file_exists(self.claude_dir):
+            return
+
+        val project_dirs = dir_list(self.claude_dir)
+        for proj_dir in project_dirs:
+            val proj_path = "{self.claude_dir}/{proj_dir}"
+            if not is_dir(proj_path):
+                continue
+            val files = dir_list(proj_path)
+            for fname in files:
+                if fname.ends_with(".jsonl"):
+                    val full_path = "{proj_path}/{fname}"
+                    if not self._is_watched(full_path):
+                        val session_id = derive_session_id(proj_dir, fname)
+                        # New files should tail from EOF so touching or discovering
+                        # an existing large transcript does not replay the backlog.
+                        val start_offset = file_size(full_path)
+                        self.watched_files.push(WatchedFile.new_with_offset(full_path, session_id, start_offset))
+
+    me poll() -> [DashboardEvent]:
+        """Poll all watched files for new content. Returns new events."""
+        var all_events: [DashboardEvent] = []
+
+        # Scan for new files periodically
+        self.scan_for_new_files()
+
+        var i = 0
+        while i < self.watched_files.len():
+            var wf = self.watched_files[i]
+            val events = poll_file(wf)
+            self.watched_files[i] = wf
+            for event in events:
+                all_events.push(event)
+            i = i + 1
+
+        return all_events
+
+    fn _is_watched(path: text) -> bool:
+        """Check if a file path is already being watched."""
+        for wf in self.watched_files:
+            if wf.path == path:
+                return true
+        return false
+
+    fn watched_count() -> i32:
+        """Number of files being watched."""
+        return self.watched_files.len()
+
+    fn active_sessions() -> [text]:
+        """Return session IDs of all watched files."""
+        var sessions: [text] = []
+        for wf in self.watched_files:
+            sessions.push(wf.session_id)
+        return sessions
+
+# =========================================================================
+# File Polling
+# =========================================================================
+
+fn poll_file(wf: WatchedFile) -> [DashboardEvent]:
+    """Read new lines from a watched file since last offset."""
+    if not file_exists(wf.path):
+        return []
+
+    val current_size = file_size(wf.path)
+    if current_size < wf.last_offset:
+        # File was truncated or rotated. Reset so the replacement file can be
+        # read from the start instead of leaving the watcher stuck forever.
+        wf.last_offset = 0
+        wf.parser = JsonlParser.new(wf.session_id)
+    elif current_size == wf.last_offset:
+        return []
+
+    # Read entire file and skip to offset
+    # (Simple doesn't have seek; read full and slice by lines)
+    val content = file_read(wf.path)
+    val all_lines = content.split("\n")
+
+    # Track byte position through lines to find new ones
+    var byte_pos: i64 = 0
+    var new_lines: [text] = []
+    for line in all_lines:
+        val line_size = line.len() + 1  # +1 for newline
+        if byte_pos >= wf.last_offset:
+            if line.trim() != "":
+                new_lines.push(line)
+        byte_pos = byte_pos + line_size
+
+    # Update offset
+    wf.last_offset = current_size
+
+    # Parse new lines
+    var events: [DashboardEvent] = []
+    for line in new_lines:
+        val event = parse_line(wf.parser, line)
+        match event:
+            DashboardEvent.Unknown: pass_dn
+            _: events.push(event)
+    return events
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn derive_session_id(project_dir: text, filename: text) -> text:
+    """Derive a session ID from the project directory and filename.
+    Format: short project hash + filename stem."""
+    var stem = filename
+    if stem.ends_with(".jsonl"):
+        stem = stem.slice(0, stem.len() - 6)
+    # Use first 8 chars of project dir hash + stem
+    val short_proj = if project_dir.len() > 8: project_dir.slice(0, 8) else: project_dir
+    return "{short_proj}/{stem}"

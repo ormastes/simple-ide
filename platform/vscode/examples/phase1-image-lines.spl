@@ -1,0 +1,7 @@
+# Phase 1 rich editor image-line sample
+
+fn main()
+    val intro = "normal text before image"
+    val hero = img{"phase1-image-lines.svg"}
+    val outro = "normal text after image"
+    return intro

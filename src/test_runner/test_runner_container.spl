@@ -1,0 +1,169 @@
+# Test Runner Container Backend
+#
+# Container-based test execution using Docker or Podman.
+# Provides isolation and resource limits via container runtime.
+
+use std.io.{shell, shell_bool, shell_output_trimmed, ProcessResult}
+use std.io.{file_exists}
+
+# =========================================================================
+# Container Detection
+# =========================================================================
+
+fn container_detect_runtime() -> text:
+    """
+    Detect available container runtime (docker or podman).
+
+    Returns: "docker", "podman", or "none"
+    """
+    val docker_check = shell_bool("docker --version")
+    if docker_check:
+        return "docker"
+
+    val podman_check = shell_bool("podman --version")
+    if podman_check:
+        return "podman"
+
+    "none"
+
+fn container_check_image(image: text, runtime: text) -> bool:
+    """
+    Check if a container image exists locally.
+
+    Args:
+        image: Image name (e.g., "simple-test-runner:latest")
+        runtime: Container runtime ("docker" or "podman")
+
+    Returns: true if image exists, false otherwise
+    """
+    if runtime == "docker":
+        return shell_bool("docker images -q {image} | grep -q .")
+    elif runtime == "podman":
+        return shell_bool("podman images -q {image} | grep -q .")
+    else:
+        return false
+
+# =========================================================================
+# Container Execution
+# =========================================================================
+
+fn container_run_test(
+    test_file: text,
+    runtime: text,
+    image: text,
+    memory_mb: i64,
+    cpu_count: f64,
+    network: text,
+    readonly: bool,
+    workspace: text
+) -> (text, text, i64, i64):
+    """
+    Run a test file inside a container.
+
+    Args:
+        test_file: Path to test file (relative to workspace)
+        runtime: Container runtime ("docker" or "podman")
+        image: Container image name
+        memory_mb: Memory limit in MB
+        cpu_count: CPU limit (fractional allowed)
+        network: Network mode ("none", "bridge", "host")
+        readonly: Mount workspace as read-only
+        workspace: Workspace directory (usually current directory)
+
+    Returns: (stdout, stderr, exit_code, duration_ms)
+    """
+
+    if runtime != "docker" and runtime != "podman":
+        val error = "Container runtime '{runtime}' not supported. Use 'docker' or 'podman'."
+        return ("", error, 1, 0)
+
+    val mount_flag = if readonly: "ro" else: "rw"
+
+    var cmd = "{runtime} run --rm "
+    cmd = cmd + "--memory={memory_mb}m "
+    cmd = cmd + "--cpus={cpu_count} "
+    cmd = cmd + "--network={network} "
+    cmd = cmd + "-v {workspace}:/workspace:{mount_flag} "
+    cmd = cmd + "-w /workspace "
+    cmd = cmd + "{image} "
+    cmd = cmd + "test {test_file}"
+
+    val start_time = time_now_ms()
+    val result = shell(cmd)
+    val end_time = time_now_ms()
+    val duration = end_time - start_time
+
+    (result.stdout, result.stderr, result.exit_code, duration)
+
+fn container_build_test_image(runtime: text, dockerfile_path: text, image_name: text) -> bool:
+    """
+    Build container test image from Dockerfile.
+
+    Args:
+        runtime: Container runtime ("docker" or "podman")
+        dockerfile_path: Path to Dockerfile
+        image_name: Name for the built image
+
+    Returns: true on success, false on failure
+    """
+    if not file_exists(dockerfile_path):
+        print "ERROR: Dockerfile not found: {dockerfile_path}"
+        return false
+
+    val build_cmd = "{runtime} build -f {dockerfile_path} -t {image_name} ."
+    print "Building container image: {image_name}"
+
+    val result = shell(build_cmd)
+    if result.exit_code == 0:
+        print "Successfully built image: {image_name}"
+        return true
+    else:
+        print "Failed to build image: {result.stderr}"
+        return false
+
+# =========================================================================
+# Helper Functions
+# =========================================================================
+
+fn time_now_ms() -> i64:
+    """Get current time in milliseconds (stub for runtime compatibility)"""
+    # In real implementation, would use rt_time_now_unix_micros() / 1000
+    # For now, return 0 as placeholder
+    0
+
+fn container_get_version(runtime: text) -> text:
+    """
+    Get container runtime version.
+
+    Args:
+        runtime: Container runtime ("docker" or "podman")
+
+    Returns: Version string or empty string on error
+    """
+    if runtime == "docker":
+        return shell_output_trimmed("docker --version", "")
+    elif runtime == "podman":
+        return shell_output_trimmed("podman --version", "")
+    else:
+        return ""
+
+fn container_cleanup_volumes(runtime: text) -> bool:
+    """
+    Clean up unused container volumes.
+
+    Args:
+        runtime: Container runtime ("docker" or "podman")
+
+    Returns: true on success, false on failure
+    """
+    if runtime == "docker":
+        return shell_bool("docker volume prune -f")
+    elif runtime == "podman":
+        return shell_bool("podman volume prune -f")
+    else:
+        return false
+
+# =========================================================================
+# Exports
+# =========================================================================
+

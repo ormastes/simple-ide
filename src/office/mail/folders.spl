@@ -1,0 +1,54 @@
+# Mail Folders
+#
+# Default folder list and folder sidebar builder.
+
+use common.ui.widget.{WidgetNode}
+use common.ui.builder.{scroll, label, panel}
+use app.office.mail.message.{MailFolder, folder_name}
+
+# =========================================================================
+# Default Folders
+# =========================================================================
+
+fn default_folders() -> [MailFolder]:
+    """Return the standard set of mail folders."""
+    return [
+        MailFolder.Inbox,
+        MailFolder.Sent,
+        MailFolder.Drafts,
+        MailFolder.Trash
+    ]
+
+# =========================================================================
+# Folder List Widget
+# =========================================================================
+
+fn build_folder_list(folders: [MailFolder], active: MailFolder, unread_counts: Dict<text, i32>) -> WidgetNode:
+    """Build a scrollable folder sidebar with unread counts."""
+    var items: [WidgetNode] = []
+    var idx: i32 = 0
+    val active_name = folder_name(active)
+    for folder in folders:
+        val name = folder_name(folder)
+        val count = _dict_get_int(unread_counts, name)
+        val display = if count > 0: "{name} ({count})" else: name
+        var item = label("folder_{idx}", display)
+        if name == active_name:
+            item = item.set_prop("selected", "true")
+        item = item.set_prop("action", "select_folder_{idx}")
+        items = items.push(item)
+        idx = idx + 1
+    return panel("folder_panel", "Folders", [
+        scroll("folder_scroll", 300, items)
+    ])
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _dict_get_int(d: Dict<text, i32>, key: text) -> i32:
+    """Get an integer from a dict, returning 0 if not found."""
+    val result = d.get(key)
+    if result != nil:
+        return result
+    return 0

@@ -1,0 +1,30 @@
+# Phase 2 IDE surfaces sample
+
+use math.render
+
+fn helper(value: i32) -> i32:
+    value + 1
+
+fn compute_total(items: [i32]) -> i32:
+    var total = 0
+    for item in items:
+        total = total + item
+    total
+
+class Invoice:
+    total: i32
+
+describe "invoice math":
+    context "with helper":
+        it "computes a rich total":
+            val eq = m{frac(1, 1 + exp(-x))}
+            expect(helper(1)).to_equal(2)
+
+        it "keeps malformed math visible":
+            val broken = m{frac(1, sqrt(x)}
+            expect(true).to_equal(true)
+
+        it "shows loss and nograd blocks":
+            val ce = loss{-frac(1, n) * sum(y[i] * log(p[i]), i=1..n)}
+            val frozen = nograd{sqrt(frac(6, fan_in + fan_out))}
+            expect(true).to_equal(true)

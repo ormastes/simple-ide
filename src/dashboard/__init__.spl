@@ -1,0 +1,5 @@
+# Re-exported from main.spl
+export DASHBOARD_CACHE_PATH, DASHBOARD_CACHE_TTL_SECS, cache_is_fresh, load_cache_summary, write_cache
+export load_table, load_table_named, header_index, get_field, count_eq, sum_int, count_nonempty, write_table
+export today_date, itos, DASHBOARD_TABLE_DIR
+export run_assistant_dashboard, render_assistant_dashboard_text, render_assistant_dashboard_html

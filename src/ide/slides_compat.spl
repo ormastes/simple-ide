@@ -1,0 +1,53 @@
+# IDE slide/PPT compatibility probe.
+#
+# Reuses the office slide model, render helpers, outline helpers, and design
+# metadata helpers. The IDE layer only reports capability evidence.
+
+use app.office.slides.slide.{Presentation, empty_presentation, content_slide, slide_count}
+use app.office.slides.render.{render_slide_thumbnail, render_slide_canvas}
+use app.office.slides.outline.{slide_outline_style, presentation_outline_text}
+use app.office.slides.design.{presentation_designs, presentation_design_css}
+
+struct IdeSlideCompatProbe:
+    owner_module: text
+    slide_count: i32
+    thumbnail: text
+    canvas_widget_count: i64
+    outline_line_count: i64
+    design_count: i64
+    has_css_like_design: bool
+    has_outline_transform: bool
+
+fn ide_slide_sample_presentation() -> Presentation:
+    val base = empty_presentation("IDE Deck")
+    val detail = content_slide("slide_1", "Roadmap", "Markdown, slides, sheets, dashboard, and DB admin")
+    var slides = base.slides
+    slides.push(detail)
+    Presentation(
+        title: base.title,
+        slides: slides,
+        active_slide: 1,
+        theme_name: base.theme_name
+    )
+
+fn ide_slide_compat_probe() -> IdeSlideCompatProbe:
+    val pres = ide_slide_sample_presentation()
+    val slide = pres.slides[1]
+    val style = slide_outline_style(".ide-slide-outline .item", "#0F766E", "700", "uppercase", "#F59E0B")
+    val outline_lines = presentation_outline_text(pres, style)
+    val designs = presentation_designs(pres, "#F59E0B", "uppercase")
+    val css = presentation_design_css(pres, "#F59E0B", "uppercase")
+    IdeSlideCompatProbe(
+        owner_module: "app.office.slides",
+        slide_count: slide_count(pres),
+        thumbnail: render_slide_thumbnail(slide, 1),
+        canvas_widget_count: render_slide_canvas(slide).len(),
+        outline_line_count: outline_lines.len(),
+        design_count: designs.len(),
+        has_css_like_design: css.contains(".slide-page-1") and css.contains("text-transform: uppercase"),
+        has_outline_transform: outline_lines.join("\n").contains("IDE DECK")
+    )
+
+fn ide_slide_compat_summary() -> text:
+    val probe = ide_slide_compat_probe()
+    "slides: {probe.owner_module} count={probe.slide_count} thumb={probe.thumbnail} canvas={probe.canvas_widget_count} outline={probe.outline_line_count} designs={probe.design_count} css={probe.has_css_like_design} transform={probe.has_outline_transform}"

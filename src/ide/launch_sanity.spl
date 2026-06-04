@@ -1,0 +1,30 @@
+# IDE launch sanity checks.
+#
+# Thin product-level probes over the shared editor launch parser. Runtime and
+# renderer startup remain in the existing editor/IDE entrypoints.
+
+use std.editor.core.launch.{editor_launch_parse}
+
+struct IdeLaunchSanity:
+    tui_mode: text
+    gui_mode: text
+    sdl_mode: text
+    file_count: i64
+    unknown_option: text
+
+fn ide_launch_sanity() -> IdeLaunchSanity:
+    val tui = editor_launch_parse(["--tui", "notes.md", "deck.spres"])
+    val gui = editor_launch_parse(["--gui", "sheet.scsv"])
+    val sdl = editor_launch_parse(["--gui-sdl"])
+    val bad = editor_launch_parse(["--bad-mode"])
+    IdeLaunchSanity(
+        tui_mode: tui.mode,
+        gui_mode: gui.mode,
+        sdl_mode: sdl.mode,
+        file_count: tui.files.len() + gui.files.len(),
+        unknown_option: bad.unknown_option
+    )
+
+fn ide_launch_sanity_summary() -> text:
+    val sanity = ide_launch_sanity()
+    "launch: tui={sanity.tui_mode} gui={sanity.gui_mode} sdl={sanity.sdl_mode} files={sanity.file_count} unknown={sanity.unknown_option}"

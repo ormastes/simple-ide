@@ -1,0 +1,276 @@
+# Process Tracker - Child Process and Container Lifecycle Manager
+#
+# Tracks all spawned child processes and containers to ensure proper cleanup
+# when test runner exits (normal shutdown, signal, or crash).
+#
+# Design:
+# - Module-level collections track active PIDs and container IDs
+# - Registration happens when spawning children
+# - Cleanup happens on shutdown (SIGTERM/SIGINT handlers)
+# - Heartbeat monitoring detects orphaned children
+
+use std.io.{process_kill, process_is_running, shell_bool, shell_lines, shell_output}
+
+# ============================================================================
+# Module State - Active Tracking
+# ============================================================================
+
+# NOTE: In compiled mode, these would be module-level mutable vars.
+# In runtime interpreter mode, module var exports are broken, so we use
+# singleton pattern with getter functions for now.
+
+var _tracked_pids: [i64] = []
+var _protected_pids: [i64] = []
+var _tracked_containers: [text] = []
+var _heartbeat_enabled = false
+var _last_heartbeat_ms = 0
+
+# ============================================================================
+# PID Tracking
+# ============================================================================
+
+fn tracker_register_pid(pid: i64):
+    """
+    Register a child process PID for tracking.
+
+    Call this immediately after process_spawn_async() to ensure cleanup.
+
+    Args:
+        pid: Process ID to track
+
+    Example:
+        val pid = process_spawn_async("sleep", ["10"])
+        tracker_register_pid(pid)
+    """
+    if pid > 0:
+        _tracked_pids.push(pid)
+
+fn tracker_get_pids() -> [i64]:
+    """Get list of all tracked PIDs"""
+    _tracked_pids
+
+fn tracker_unregister_pid(pid: i64):
+    """Remove PID from tracking (after successful wait)"""
+    var filtered: [i64] = []
+    for p in _tracked_pids:
+        if p != pid:
+            filtered.push(p)
+    _tracked_pids = filtered
+
+fn tracker_protect_pid(pid: i64):
+    """Mark a PID as protected — tracker_kill_all_children will skip it."""
+    if pid > 0:
+        _protected_pids.push(pid)
+
+fn tracker_unprotect_pid(pid: i64):
+    """Remove protection from a PID."""
+    var filtered: [i64] = []
+    for p in _protected_pids:
+        if p != pid:
+            filtered.push(p)
+    _protected_pids = filtered
+
+fn _is_protected(pid: i64) -> bool:
+    for p in _protected_pids:
+        if p == pid:
+            return true
+    false
+
+fn tracker_clear():
+    """Clear all tracked PIDs (for testing)"""
+    _tracked_pids = []
+    _tracked_containers = []
+
+# ============================================================================
+# Container Tracking
+# ============================================================================
+
+fn tracker_register_container(container_id: text):
+    """
+    Register a container ID for tracking.
+
+    Call this after container_run_test() or docker run.
+
+    Args:
+        container_id: Container ID or name
+    """
+    if container_id != "" and container_id != nil:
+        _tracked_containers.push(container_id)
+
+fn tracker_get_containers() -> [text]:
+    """Get list of all tracked container IDs"""
+    _tracked_containers
+
+fn tracker_unregister_container(container_id: text):
+    """Remove container from tracking (after stop)"""
+    var filtered: [text] = []
+    for c in _tracked_containers:
+        if c != container_id:
+            filtered.push(c)
+    _tracked_containers = filtered
+
+# ============================================================================
+# Cleanup Operations
+# ============================================================================
+
+fn tracker_kill_all_children() -> i64:
+    """
+    Kill all tracked child processes, skipping protected PIDs.
+
+    Uses SIGTERM first, then SIGKILL after 2s grace period.
+
+    Returns: Number of processes successfully killed
+    """
+    var killed = 0
+    var surviving: [i64] = []
+
+    for pid in _tracked_pids:
+        if _is_protected(pid):
+            surviving.push(pid)
+            continue
+        if process_is_running(pid):
+            if process_kill(pid):
+                killed = killed + 1
+
+    _tracked_pids = surviving
+
+    killed
+
+fn tracker_stop_all_containers() -> i64:
+    """
+    Stop all tracked Docker/Podman containers.
+
+    Uses 'docker stop' with 10s timeout, then 'docker rm -f' if still running.
+
+    Returns: Number of containers successfully stopped
+    """
+    var stopped = 0
+
+    val runtime = if is_docker_available(): "docker" else: "podman"
+
+    for container_id in _tracked_containers:
+        # Try graceful stop (10s timeout)
+        val stop_ok = shell_bool("{runtime} stop -t 10 {container_id}")
+        if stop_ok:
+            stopped = stopped + 1
+        else:
+            # Force remove if stop failed
+            val force_ok = shell_bool("{runtime} rm -f {container_id}")
+            if force_ok:
+                stopped = stopped + 1
+
+    # Clear tracking list
+    _tracked_containers = []
+
+    stopped
+
+# ============================================================================
+# Container Utilities
+# ============================================================================
+
+fn is_docker_available() -> bool:
+    """Check if Docker runtime is available"""
+    shell_bool("docker --version")
+
+fn get_running_containers() -> [text]:
+    """
+    Get list of all running containers (not just tracked ones).
+
+    Useful for orphan detection and cleanup.
+
+    Returns: Array of container IDs
+    """
+    val runtime = if is_docker_available(): "docker" else: "podman"
+
+    # Get container IDs: docker ps -q
+    val output = shell_output("{runtime} ps -q", "")
+    if output == "" or output == nil:
+        return []
+
+    # Split by newlines and filter empty
+    val lines = output.split("\n")
+    var ids: [text] = []
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed != "":
+            ids.push(trimmed)
+
+    ids
+
+# ============================================================================
+# Heartbeat Monitoring (Optional - for future use)
+# ============================================================================
+
+fn tracker_enable_heartbeat():
+    """
+    Enable heartbeat monitoring.
+
+    When enabled, tracks timestamp of last successful ping.
+    Useful for detecting runner crashes from child perspective.
+    """
+    _heartbeat_enabled = true
+    # In real implementation: _last_heartbeat_ms = rt_time_now_unix_micros() / 1000
+
+fn tracker_send_heartbeat():
+    """
+    Record heartbeat timestamp.
+
+    Should be called periodically by runner main loop (every 5-10s).
+    """
+    if _heartbeat_enabled:
+        # In real implementation: _last_heartbeat_ms = rt_time_now_unix_micros() / 1000
+        _last_heartbeat_ms = 0
+
+fn tracker_check_heartbeat_alive(timeout_ms: i64) -> bool:
+    """
+    Check if parent is still alive based on heartbeat.
+
+    Args:
+        timeout_ms: Heartbeat timeout in milliseconds
+
+    Returns: true if parent is alive, false if timeout exceeded
+
+    NOTE: Requires compiled mode for accurate timestamps
+    """
+    if not _heartbeat_enabled:
+        return true  # Assume alive if heartbeat disabled
+
+    # In real implementation:
+    # val now = rt_time_now_unix_micros() / 1000
+    # val elapsed = now - _last_heartbeat_ms
+    # return elapsed < timeout_ms
+
+    true  # Stub for runtime compatibility
+
+# ============================================================================
+# Signal Handlers (Future Enhancement)
+# ============================================================================
+#
+# To make this truly robust, we need signal handlers:
+#
+# fn install_cleanup_handlers():
+#     """Install SIGTERM/SIGINT/SIGHUP handlers for automatic cleanup"""
+#     extern fn rt_signal_handler_set(signal: i64, handler: fn())
+#     rt_signal_handler_set(15, cleanup_on_sigterm)  # SIGTERM
+#     rt_signal_handler_set(2, cleanup_on_sigint)    # SIGINT
+#
+# fn cleanup_on_sigterm():
+#     tracker_kill_all_children()
+#     tracker_stop_all_containers()
+#     exit(143)  # 128 + 15
+#
+# fn cleanup_on_sigint():
+#     tracker_kill_all_children()
+#     tracker_stop_all_containers()
+#     exit(130)  # 128 + 2
+#
+# NOTE: Signal handling requires SFFI additions to runtime
+
+# ============================================================================
+# Exports
+# ============================================================================
+
+
+
+
+

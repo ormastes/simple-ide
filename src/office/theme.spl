@@ -1,0 +1,10 @@
+# Office App Themes
+# Per-app accent colors building on the iOS base theme.
+
+use app.ui.theme.ios.{ios_light, ios_dark, UITheme, ThemeColors}
+
+fn office_theme(app_name: text, dark: bool) -> UITheme:
+    if dark:
+        ios_dark()
+    else:
+        ios_light()

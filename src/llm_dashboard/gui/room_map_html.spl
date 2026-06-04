@@ -1,0 +1,425 @@
+# Room Map — HTML/CSS Renderer
+#
+# Renders a virtual office map for the web dashboard with
+# CSS-positioned agent sprites that animate between rooms.
+
+use app.llm_dashboard.data.types.{RoomKind, AgentNode, LLMProvider, AgentActivity,
+    room_name, activity_label, provider_name}
+use app.llm_dashboard.data.agent_position.{AgentPos, pos_agents_in_room, pos_update_from_nodes}
+use app.llm_dashboard.tui.agent_sprites.{provider_head}
+
+# =========================================================================
+# Room Map HTML
+# =========================================================================
+
+fn generate_room_map_html(agents: [AgentNode]) -> text:
+    """Generate the virtual office room map with positioned agent characters."""
+    pos_update_from_nodes(agents)
+
+    var parts: [text] = []
+    parts.push("<div class=\"office-map\">")
+
+    val rooms = [RoomKind.Research, RoomKind.Code, RoomKind.Skills,
+                 RoomKind.Server, RoomKind.Chat, RoomKind.TestLab]
+
+    for room in rooms:
+        parts.push(render_room_html(room, agents))
+
+    parts.push("</div>")
+    parts.join("")
+
+fn render_room_html(room: RoomKind, agents: [AgentNode]) -> text:
+    """Render a single room card with positioned agent sprites."""
+    val name = room_name(room)
+    val agents_in = pos_agents_in_room(room)
+    val count = agents_in.len()
+    val room_class = room_css_class(room)
+
+    var parts: [text] = []
+    parts.push("<div class=\"office-room ")
+    parts.push(room_class)
+    parts.push("\">")
+
+    # Header
+    parts.push("<div class=\"room-header\">")
+    parts.push("<span class=\"room-title\">")
+    parts.push(name)
+    parts.push("</span>")
+    if count > 0:
+        parts.push("<span class=\"room-badge\">")
+        parts.push(count.to_text())
+        parts.push("</span>")
+    parts.push("</div>")
+
+    # Room decoration (furniture on wall)
+    parts.push("<div class=\"room-decor\">")
+    parts.push(room_decoration_html(room))
+    parts.push("</div>")
+
+    # Agent floor area with desks
+    parts.push("<div class=\"room-floor\">")
+    for pos in agents_in:
+        val agent = find_agent(agents, pos.agent_id)
+        if agent.id.len() > 0:
+            parts.push(render_agent_at_desk_html(agent, pos))
+    # Empty desks for unoccupied slots
+    val empty_desks = 3 - count
+    var ed = 0
+    while ed < empty_desks and ed < 3:
+        parts.push(render_empty_desk_html())
+        ed = ed + 1
+    if count == 0 and empty_desks <= 0:
+        parts.push("<div class=\"room-empty\">empty</div>")
+    parts.push("</div>")
+
+    parts.push("</div>")
+    parts.join("")
+
+fn render_agent_sprite_html(agent: AgentNode, pos: AgentPos) -> text:
+    """Render a single agent sprite with bubble and animation."""
+    val prov_name = provider_name(agent.provider)
+    val head = provider_head(agent.provider)
+    val prov_class = provider_css_class(agent.provider)
+    val activity_class = activity_css_class(agent.activity)
+    val label = activity_label(agent.activity)
+
+    var parts: [text] = []
+    parts.push("<div class=\"agent-char ")
+    parts.push(prov_class)
+    parts.push(" ")
+    parts.push(activity_class)
+    parts.push("\" title=\"")
+    parts.push(prov_name)
+    parts.push(" — ")
+    parts.push(label)
+    parts.push("\">")
+
+    # Activity bubble
+    if pos.activity_label.len() > 0:
+        parts.push("<div class=\"char-bubble\">")
+        parts.push(pos.activity_label)
+        parts.push("</div>")
+
+    # Head
+    parts.push("<div class=\"char-head\">")
+    parts.push(head)
+    parts.push("</div>")
+
+    # Body
+    parts.push("<div class=\"char-body\">/|\\</div>")
+    parts.push("<div class=\"char-legs\">/ \\</div>")
+
+    # Name tag
+    parts.push("<div class=\"char-name\">")
+    parts.push(prov_name)
+    parts.push("</div>")
+
+    parts.push("</div>")
+    parts.join("")
+
+fn render_agent_at_desk_html(agent: AgentNode, pos: AgentPos) -> text:
+    """Render agent sitting at a desk with monitor."""
+    val prov_name = provider_name(agent.provider)
+    val head = provider_head(agent.provider)
+    val prov_class = provider_css_class(agent.provider)
+    val activity_class = activity_css_class(agent.activity)
+    val label = activity_label(agent.activity)
+
+    var parts: [text] = []
+    parts.push("<div class=\"desk-station ")
+    parts.push(prov_class)
+    parts.push(" ")
+    parts.push(activity_class)
+    parts.push("\" title=\"")
+    parts.push(prov_name)
+    parts.push(" — ")
+    parts.push(label)
+    parts.push("\">")
+
+    # Activity bubble
+    if pos.activity_label.len() > 0:
+        parts.push("<div class=\"char-bubble\">")
+        parts.push(pos.activity_label)
+        parts.push("</div>")
+
+    # Agent character
+    parts.push("<div class=\"desk-agent\">")
+    parts.push("<div class=\"char-head\">")
+    parts.push(head)
+    parts.push("</div>")
+    parts.push("<div class=\"char-body\">/|\\</div>")
+    parts.push("</div>")
+
+    # Desk with monitor
+    parts.push("<div class=\"desk-surface\">")
+    parts.push("<div class=\"desk-monitor\">┌─┐</div>")
+    parts.push("<div class=\"desk-stand\">└┬┘</div>")
+    parts.push("<div class=\"desk-top\">═══</div>")
+    parts.push("</div>")
+
+    # Name plate
+    parts.push("<div class=\"desk-nameplate\">")
+    parts.push(prov_name)
+    parts.push("</div>")
+
+    parts.push("</div>")
+    parts.join("")
+
+fn render_empty_desk_html() -> text:
+    """Render an empty desk (no agent)."""
+    var parts: [text] = []
+    parts.push("<div class=\"desk-station desk-empty\">")
+    parts.push("<div class=\"desk-agent desk-vacant\"></div>")
+    parts.push("<div class=\"desk-surface\">")
+    parts.push("<div class=\"desk-monitor\">┌─┐</div>")
+    parts.push("<div class=\"desk-stand\">└┬┘</div>")
+    parts.push("<div class=\"desk-top\">═══</div>")
+    parts.push("</div>")
+    parts.push("</div>")
+    parts.join("")
+
+fn room_decoration_html(room: RoomKind) -> text:
+    """Room-specific wall decoration."""
+    match room:
+        RoomKind.Research:
+            "<span class=\"decor-item\" title=\"Bookshelf\">📚</span><span class=\"decor-item\" title=\"Globe\">🌍</span>"
+        RoomKind.Code:
+            "<span class=\"decor-item\" title=\"Terminal\">🖥️</span><span class=\"decor-item\" title=\"Git\">📂</span>"
+        RoomKind.Skills:
+            "<span class=\"decor-item\" title=\"Whiteboard\">📋</span><span class=\"decor-item\" title=\"Lightning\">⚡</span>"
+        RoomKind.Server:
+            "<span class=\"decor-item\" title=\"Server Rack\">🗄️</span><span class=\"decor-item\" title=\"Network\">🔌</span>"
+        RoomKind.Chat:
+            "<span class=\"decor-item\" title=\"Whiteboard\">📋</span><span class=\"decor-item\" title=\"Coffee\">☕</span>"
+        RoomKind.TestLab:
+            "<span class=\"decor-item\" title=\"Test Tube\">🧪</span><span class=\"decor-item\" title=\"Microscope\">🔬</span>"
+
+# =========================================================================
+# CSS
+# =========================================================================
+
+fn generate_room_map_css() -> text:
+    """CSS for the virtual office room map."""
+    """
+/* Virtual Office Map */
+.office-map {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    margin-bottom: 12px;
+}
+.office-room {
+    background: #0d1117;
+    border: 2px solid #30363d;
+    border-radius: 8px;
+    min-height: 140px;
+    overflow: hidden;
+    transition: border-color 0.3s;
+}
+.office-room:hover { border-color: #58a6ff; }
+.room-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 10px;
+    border-bottom: 1px solid #21262d;
+    background: #161b22;
+}
+.room-title { font-size: 13px; font-weight: 600; color: #8b949e; }
+.room-badge {
+    background: #58a6ff;
+    color: #fff;
+    font-size: 11px;
+    padding: 1px 7px;
+    border-radius: 10px;
+    font-weight: 600;
+}
+.room-floor {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 10px;
+    min-height: 90px;
+    align-items: flex-end;
+}
+.room-empty {
+    color: #30363d;
+    font-size: 12px;
+    font-style: italic;
+    margin: auto;
+}
+.room-decor {
+    display: flex;
+    gap: 6px;
+    padding: 4px 10px 0;
+    border-bottom: 1px dashed #21262d;
+    min-height: 28px;
+}
+.decor-item { font-size: 18px; opacity: 0.6; }
+
+/* Room accent colors */
+.room-research { border-left: 3px solid #58a6ff; }
+.room-code { border-left: 3px solid #3fb950; }
+.room-skills { border-left: 3px solid #f0883e; }
+.room-server { border-left: 3px solid #a371f7; }
+.room-chat { border-left: 3px solid #d29922; }
+.room-testlab { border-left: 3px solid #f778ba; }
+
+/* Desk Station (agent + desk composite) */
+.desk-station {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    font-family: 'Courier New', monospace;
+    min-width: 56px;
+    position: relative;
+    transition: transform 0.5s ease;
+}
+.desk-agent {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    margin-bottom: 2px;
+}
+.desk-surface {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    font-size: 12px;
+    line-height: 1;
+    color: #8b949e;
+}
+.desk-monitor { color: #58a6ff; }
+.desk-stand { color: #484f58; }
+.desk-top { color: #d29922; font-weight: 600; letter-spacing: 1px; }
+.desk-nameplate {
+    font-size: 9px;
+    color: #484f58;
+    margin-top: 3px;
+    background: #161b22;
+    padding: 1px 6px;
+    border-radius: 3px;
+    border: 1px solid #21262d;
+}
+.desk-empty { opacity: 0.3; }
+.desk-vacant { min-height: 36px; }
+
+.act-thinking .desk-monitor { animation: pulse 1s ease-in-out infinite; color: #3fb950; }
+.act-writing .desk-monitor { color: #f0883e; }
+.act-reading .desk-monitor { color: #58a6ff; }
+.act-error .desk-monitor { color: #f85149; }
+
+/* Agent Character */
+.agent-char {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    line-height: 1.1;
+    position: relative;
+    min-width: 48px;
+    cursor: default;
+    transition: transform 0.5s ease;
+}
+.char-bubble {
+    font-size: 10px;
+    color: #8b949e;
+    background: #21262d;
+    padding: 2px 6px;
+    border-radius: 8px;
+    margin-bottom: 2px;
+    white-space: nowrap;
+    max-width: 80px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.char-head {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 800;
+    font-size: 14px;
+    color: #fff;
+}
+.char-body, .char-legs {
+    font-size: 12px;
+    color: #8b949e;
+    text-align: center;
+    line-height: 1;
+}
+.char-name {
+    font-size: 9px;
+    color: #484f58;
+    margin-top: 2px;
+}
+
+/* Provider head colors */
+.prov-claude .char-head { background: #e67e22; }
+.prov-codex .char-head { background: #27ae60; }
+.prov-gemini .char-head { background: #3498db; }
+.prov-unknown .char-head { background: #95a5a6; }
+
+/* Activity animations */
+.act-thinking .char-head { animation: pulse 1s ease-in-out infinite; }
+.act-reading .char-body { animation: bob 0.8s ease-in-out infinite; }
+.act-writing .char-body { animation: sway 0.6s ease-in-out infinite; }
+.act-searching .agent-char { animation: scan 1.2s ease-in-out infinite; }
+.act-error .char-head { animation: shake 0.3s ease-in-out infinite; background: #e74c3c !important; }
+.act-idle { opacity: 0.5; }
+.act-finished { opacity: 0.4; }
+
+@keyframes pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.15); } }
+@keyframes bob { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
+@keyframes sway { 0%,100% { transform: rotate(0deg); } 50% { transform: rotate(3deg); } }
+@keyframes scan { 0%,100% { transform: translateX(0); } 50% { transform: translateX(4px); } }
+@keyframes shake { 0%,100% { transform: translateX(0); } 25% { transform: translateX(-2px); } 75% { transform: translateX(2px); } }
+
+@media (max-width: 900px) {
+    .office-map { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 600px) {
+    .office-map { grid-template-columns: 1fr; }
+}
+"""
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn room_css_class(room: RoomKind) -> text:
+    match room:
+        RoomKind.Research: "room-research"
+        RoomKind.Code: "room-code"
+        RoomKind.Skills: "room-skills"
+        RoomKind.Server: "room-server"
+        RoomKind.Chat: "room-chat"
+        RoomKind.TestLab: "room-testlab"
+
+fn provider_css_class(provider: LLMProvider) -> text:
+    match provider:
+        LLMProvider.Claude: "prov-claude"
+        LLMProvider.Codex: "prov-codex"
+        LLMProvider.Gemini: "prov-gemini"
+        LLMProvider.Unknown(_): "prov-unknown"
+
+fn activity_css_class(activity: AgentActivity) -> text:
+    match activity:
+        AgentActivity.Idle: "act-idle"
+        AgentActivity.Thinking: "act-thinking"
+        AgentActivity.Reading(_): "act-reading"
+        AgentActivity.Writing(_): "act-writing"
+        AgentActivity.Searching(_): "act-searching"
+        AgentActivity.WebFetch(_): "act-searching"
+        AgentActivity.Error(_): "act-error"
+        AgentActivity.Finished: "act-finished"
+        _: ""
+
+fn find_agent(agents: [AgentNode], id: text) -> AgentNode:
+    for agent in agents:
+        if agent.id == id:
+            return agent
+    AgentNode.new("", LLMProvider.Unknown(name: ""), "")

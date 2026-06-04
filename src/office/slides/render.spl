@@ -1,0 +1,89 @@
+# Slide Rendering
+#
+# Functions to render slides as text labels and positioned widget nodes.
+
+use common.ui.widget.{WidgetNode}
+use app.office.slides.slide.{Slide, SlideLayout, SlideElement, SlideElementKind}
+
+# =========================================================================
+# Thumbnail Rendering
+# =========================================================================
+
+fn render_slide_thumbnail(slide: Slide, index: i32) -> text:
+    """Return a short text label for a slide thumbnail, e.g. 'Slide 1: Title'."""
+    val num = index + 1
+    val layout_label = _layout_short_name(slide.layout)
+    val hint = _first_text_content(slide)
+    if hint != "":
+        val preview = _truncate(hint, 24)
+        return "Slide {num}: {preview}"
+    return "Slide {num}: ({layout_label})"
+
+fn _layout_short_name(layout: SlideLayout) -> text:
+    """Short display name for a slide layout."""
+    match layout:
+        SlideLayout.TitleSlide:
+            return "Title"
+        SlideLayout.TitleContent:
+            return "Content"
+        SlideLayout.TwoColumn:
+            return "Two Column"
+        SlideLayout.Blank:
+            return "Blank"
+        SlideLayout.SectionHeader:
+            return "Section"
+
+fn _first_text_content(slide: Slide) -> text:
+    """Return the content of the first TextBox element, or empty string."""
+    for el in slide.elements:
+        match el.kind:
+            SlideElementKind.TextBox(content):
+                if content != "":
+                    return content
+            _:
+                pass_do_nothing("non-text slide elements do not provide thumbnail text")
+    return ""
+
+fn _truncate(s: text, max_len: i32) -> text:
+    """Truncate a string to max_len characters, appending ... if truncated."""
+    if s.len() <= max_len:
+        return s
+    return "{s.substring(0, max_len)}..."
+
+# =========================================================================
+# Canvas Rendering
+# =========================================================================
+
+fn render_slide_canvas(slide: Slide) -> [WidgetNode]:
+    """Render all elements of a slide as a list of positioned widget nodes."""
+    var widgets: [WidgetNode] = []
+    for el in slide.elements:
+        val widget = render_element(el)
+        widgets.push(widget)
+    return widgets
+
+fn render_element(element: SlideElement) -> WidgetNode:
+    """Render a single slide element as a positioned widget node."""
+    return WidgetNode(id: element.id)
+
+fn _element_display_text(element: SlideElement) -> text:
+    """Return display text for a slide element based on its kind."""
+    match element.kind:
+        SlideElementKind.TextBox(content):
+            return content
+        SlideElementKind.ImageEl(src: src, alt: alt):
+            if alt != "":
+                return "[Image: {alt}]"
+            return "[Image: {src}]"
+        SlideElementKind.ShapeEl(shape_type: shape_type, fill_color: fill_color):
+            return "[{shape_type}]"
+
+fn _element_kind_tag(kind: SlideElementKind) -> text:
+    """Return a short tag name for the element kind."""
+    match kind:
+        SlideElementKind.TextBox(content):
+            return "textbox"
+        SlideElementKind.ImageEl(src: src, alt: alt):
+            return "image"
+        SlideElementKind.ShapeEl(shape_type: shape_type, fill_color: fill_color):
+            return "shape"

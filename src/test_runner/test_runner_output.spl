@@ -1,0 +1,93 @@
+# Test Runner Output Formatting
+#
+# Result printing and summary output functions.
+
+use std.test_runner.test_runner_types.{OutputFormat, TestFileResult, TestRunResult}
+use std.io.{path_basename}
+
+# =========================================================================
+# Result Printing
+# =========================================================================
+
+fn print_result_default(result: TestFileResult):
+    if result.timed_out:
+        print "  TOUT  {result.path} ({result.duration_ms}ms)"
+        print "        Error: {result.error}"
+    elif result.is_ok():
+        var msg = "  PASS  {result.path} ({result.passed} passed"
+        if result.skipped > 0:
+            msg = msg + ", {result.skipped} skipped"
+        if result.pending > 0:
+            msg = msg + ", {result.pending} pending"
+        msg = msg + ", {result.duration_ms}ms)"
+        if result.setup_ms > 0:
+            msg = msg + " [setup: {result.setup_ms}ms]"
+        if result.cached:
+            msg = msg + " [cached]"
+        print msg
+    else:
+        var msg = "  FAIL  {result.path} ({result.passed} passed, {result.failed} failed"
+        if result.skipped > 0:
+            msg = msg + ", {result.skipped} skipped"
+        if result.pending > 0:
+            msg = msg + ", {result.pending} pending"
+        msg = msg + ", {result.duration_ms}ms)"
+        if result.setup_ms > 0:
+            msg = msg + " [setup: {result.setup_ms}ms]"
+        print msg
+        if result.error != "":
+            print "        Error: {result.error}"
+
+fn print_result_doc(result: TestFileResult):
+    val name = path_basename(result.path)
+    if result.timed_out:
+        print "  {name}"
+        print "    TIMEOUT ({result.duration_ms}ms)"
+    elif result.is_ok():
+        print "  {name}"
+        print "    {result.passed} examples, 0 failures ({result.duration_ms}ms)"
+    else:
+        print "  {name}"
+        print "    {result.passed + result.failed} examples, {result.failed} failures ({result.duration_ms}ms)"
+
+fn print_result(result: TestFileResult, format: OutputFormat):
+    match format:
+        case OutputFormat.Default:
+            print_result_default(result)
+        case OutputFormat.Doc:
+            print_result_doc(result)
+
+fn print_summary(result: TestRunResult, format: OutputFormat):
+    print ""
+    print "========================================="
+    val total = result.total_passed + result.total_failed
+    var summary = "Results: {total} total, {result.total_passed} passed, {result.total_failed} failed"
+    if result.total_skipped > 0:
+        summary = summary + ", {result.total_skipped} skipped"
+    if result.total_pending > 0:
+        summary = summary + ", {result.total_pending} pending"
+    if result.total_timed_out > 0:
+        summary = summary + ", {result.total_timed_out} timed out"
+    if result.total_cached > 0:
+        summary = summary + ", {result.total_cached} cached"
+    print summary
+    if result.total_setup_ms > 0:
+        print "Time:    {result.total_duration_ms}ms (setup: {result.total_setup_ms}ms)"
+    else:
+        print "Time:    {result.total_duration_ms}ms"
+    print "========================================="
+    if result.is_ok():
+        print "All tests passed!"
+    else:
+        print "Some tests failed."
+
+# =========================================================================
+# Test DB Writing (doc/08_tracking/test/test_db.sdn)
+# =========================================================================
+
+# Atomic database write using file locking
+
+# =========================================================================
+# Exports
+# =========================================================================
+

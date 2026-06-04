@@ -1,0 +1,351 @@
+# Dashboard App Framework Policy
+#
+# Shared worker-launch and supervision helpers used by dashboard and LLM
+# dashboard entrypoints. Keeps crash/resource defaults in one place and
+# ensures heavy dashboard work runs in isolated child processes.
+
+use std.nogc_sync_mut.io.process_ops.{
+    process_run_with_limits, eprint
+}
+use std.nogc_sync_mut.io.thread.{thread_sleep_ms}
+use std.nogc_sync_mut.io.time_ops.{time_now_unix_micros}
+use std.process_limits.{ResourceProfile}
+use std.nogc_sync_mut.io.process_limit_enforcer.{build_ulimit_command}
+use os.crash_policy.{
+    AppClass, AppWorkloadProfile, RuntimeBudget, SupervisorPolicy,
+    classify_exit_code, crash_reason_text, default_runtime_budget,
+    default_supervisor_policy
+}
+
+extern fn eprint_raw(s: text) -> i64
+extern fn print_raw(s: text) -> i64
+extern fn rt_env_get(name: text) -> text
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_platform_name() -> text
+
+val FRAMEWORK_WORKER_FLAG = "--__framework-worker"
+val FRAMEWORK_PROFILE_PREFIX = "--__framework-profile="
+
+struct WorkerLaunch:
+    name: text
+    workload: AppWorkloadProfile
+    budget: RuntimeBudget
+    supervisor_policy: SupervisorPolicy
+    long_running: bool
+
+fn shell_quote(arg: text) -> text:
+    val escaped = arg.replace("'", "'\\''")
+    "'{escaped}'"
+
+fn is_framework_worker(args: [text]) -> bool:
+    args.contains(FRAMEWORK_WORKER_FLAG)
+
+fn framework_profile_override(args: [text]) -> text:
+    for arg in args:
+        if arg.starts_with(FRAMEWORK_PROFILE_PREFIX):
+            return arg[FRAMEWORK_PROFILE_PREFIX.len():]
+    ""
+
+fn strip_framework_flags(args: [text]) -> [text]:
+    var cleaned: [text] = []
+    for arg in args:
+        if arg == FRAMEWORK_WORKER_FLAG:
+            continue
+        if arg.starts_with(FRAMEWORK_PROFILE_PREFIX):
+            continue
+        cleaned.push(arg)
+    cleaned
+
+fn args_request_gui(args: [text]) -> bool:
+    for arg in args:
+        if arg == "--gui" or arg == "--web":
+            return true
+    false
+
+fn dashboard_command_launch(cmd: text, args: [text]) -> WorkerLaunch:
+    if cmd == "serve":
+        val budget: RuntimeBudget = default_runtime_budget(AppWorkloadProfile.DashboardSession)
+        val base_policy: SupervisorPolicy = default_supervisor_policy(AppClass.SystemService)
+        return WorkerLaunch(
+            name: "dashboard-serve",
+            workload: AppWorkloadProfile.DashboardSession,
+            budget: RuntimeBudget(
+                profile: budget.profile,
+                memory_limit_mb: budget.memory_limit_mb,
+                cpu_time_limit_ms: budget.cpu_time_limit_ms,
+                wall_timeout_ms: 0,
+                max_fds: budget.max_fds,
+                max_procs: budget.max_procs,
+                max_threads: budget.max_threads,
+                recycle_jobs: budget.recycle_jobs,
+                recycle_after_micros: budget.recycle_after_micros,
+                quarantine_millis: budget.quarantine_millis
+            ),
+            supervisor_policy: SupervisorPolicy(
+                strategy: base_policy.strategy,
+                max_restarts: 3,
+                restart_window_micros: 60_000_000,
+                backoff_millis: 250,
+                quarantine_on_limit: true
+            ),
+            long_running: true
+        )
+
+    if cmd == "gui":
+        val budget: RuntimeBudget = default_runtime_budget(AppWorkloadProfile.DashboardSession)
+        val base_policy: SupervisorPolicy = default_supervisor_policy(AppClass.SystemService)
+        return WorkerLaunch(
+            name: "dashboard-gui-server",
+            workload: AppWorkloadProfile.DashboardSession,
+            budget: RuntimeBudget(
+                profile: budget.profile,
+                memory_limit_mb: budget.memory_limit_mb,
+                cpu_time_limit_ms: budget.cpu_time_limit_ms,
+                wall_timeout_ms: 0,
+                max_fds: budget.max_fds,
+                max_procs: budget.max_procs,
+                max_threads: budget.max_threads,
+                recycle_jobs: budget.recycle_jobs,
+                recycle_after_micros: budget.recycle_after_micros,
+                quarantine_millis: budget.quarantine_millis
+            ),
+            supervisor_policy: SupervisorPolicy(
+                strategy: base_policy.strategy,
+                max_restarts: 3,
+                restart_window_micros: 60_000_000,
+                backoff_millis: 250,
+                quarantine_on_limit: true
+            ),
+            long_running: true
+        )
+
+    if cmd == "agents" and args_request_gui(args):
+        val budget: RuntimeBudget = default_runtime_budget(AppWorkloadProfile.LlmWorker)
+        val base_policy: SupervisorPolicy = default_supervisor_policy(AppClass.SystemService)
+        return WorkerLaunch(
+            name: "dashboard-agents-gui",
+            workload: AppWorkloadProfile.LlmWorker,
+            budget: RuntimeBudget(
+                profile: budget.profile,
+                memory_limit_mb: budget.memory_limit_mb,
+                cpu_time_limit_ms: budget.cpu_time_limit_ms,
+                wall_timeout_ms: 0,
+                max_fds: budget.max_fds,
+                max_procs: budget.max_procs,
+                max_threads: budget.max_threads,
+                recycle_jobs: budget.recycle_jobs,
+                recycle_after_micros: budget.recycle_after_micros,
+                quarantine_millis: budget.quarantine_millis
+            ),
+            supervisor_policy: SupervisorPolicy(
+                strategy: base_policy.strategy,
+                max_restarts: 3,
+                restart_window_micros: 60_000_000,
+                backoff_millis: 250,
+                quarantine_on_limit: true
+            ),
+            long_running: true
+        )
+
+    val budget: RuntimeBudget = default_runtime_budget(AppWorkloadProfile.DashboardSession)
+    WorkerLaunch(
+        name: "dashboard-{cmd}",
+        workload: AppWorkloadProfile.DashboardSession,
+        budget: budget,
+        supervisor_policy: default_supervisor_policy(AppClass.UserApp),
+        long_running: false
+    )
+
+fn should_isolate_dashboard_command(cmd: text, args: [text]) -> bool:
+    if cmd == "collect" or cmd == "export" or cmd == "query" or cmd == "compare":
+        return true
+    if cmd == "serve" or cmd == "gui":
+        return true
+    if cmd == "agents" and args_request_gui(args):
+        return true
+    false
+
+fn workload_name(profile: AppWorkloadProfile) -> text:
+    match profile:
+        case AppWorkloadProfile.InteractiveDefault:
+            "interactive_default"
+        case AppWorkloadProfile.DashboardSession:
+            "dashboard_session"
+        case AppWorkloadProfile.LlmWorker:
+            "llm_worker"
+        case AppWorkloadProfile.CompilerHeavy:
+            "compiler_heavy"
+        case AppWorkloadProfile.TestRunnerHeavy:
+            "test_runner_heavy"
+        case AppWorkloadProfile.BatchIndexerHeavy:
+            "batch_indexer_heavy"
+        case AppWorkloadProfile.BaremetalDomain:
+            "baremetal_domain"
+
+fn budget_as_resource_profile(budget: RuntimeBudget) -> ResourceProfile:
+    ResourceProfile(
+        name: workload_name(budget.profile),
+        cpu_ms: budget.cpu_time_limit_ms,
+        mem_mb: budget.memory_limit_mb,
+        timeout_ms: budget.wall_timeout_ms,
+        max_fds: budget.max_fds,
+        max_procs: budget.max_procs
+    )
+
+fn resolve_framework_binary() -> text:
+    val env_bin = rt_env_get("SIMPLE_BINARY") ?? ""
+    if env_bin != "":
+        return env_bin
+
+    val is_win = rt_platform_name() == "windows"
+    val ext = if is_win: ".exe" else: ""
+
+    if rt_file_exists("bin/simple{ext}"):
+        return "bin/simple{ext}"
+    if not is_win:
+        if rt_file_exists("bin/release/aarch64-apple-darwin-macho/simple"):
+            return "bin/release/aarch64-apple-darwin-macho/simple"
+        if rt_file_exists("bin/release/macos-arm64/simple"):
+            return "bin/release/macos-arm64/simple"
+        if rt_file_exists("bin/release/darwin-aarch64/simple"):
+            return "bin/release/darwin-aarch64/simple"
+        if rt_file_exists("bin/release/macos-x86_64/simple"):
+            return "bin/release/macos-x86_64/simple"
+        if rt_file_exists("bin/release/linux-x86_64/simple"):
+            return "bin/release/linux-x86_64/simple"
+    else:
+        if rt_file_exists("bin/release/x86_64-pc-windows-msvc/simple.exe"):
+            return "bin/release/x86_64-pc-windows-msvc/simple.exe"
+        if rt_file_exists("bin/release/x86_64-pc-windows-gnu/simple.exe"):
+            return "bin/release/x86_64-pc-windows-gnu/simple.exe"
+
+    "bin/simple{ext}"
+
+fn build_worker_shell_command(simple_args: [text], launch: WorkerLaunch) -> text:
+    var command_parts: [text] = []
+    val thread_budget = if launch.budget.max_threads <= 0: 1 else: launch.budget.max_threads
+    val simple_bin = resolve_framework_binary()
+
+    command_parts.push("export SIMPLE_APP_PROFILE=" + shell_quote(workload_name(launch.workload)) + "; ")
+    if launch.budget.memory_limit_mb > 0:
+        command_parts.push("export SIMPLE_MEMORY_LIMIT_MB=" + shell_quote("{launch.budget.memory_limit_mb}") + "; ")
+    if launch.budget.wall_timeout_ms > 0:
+        val timeout_seconds = launch.budget.wall_timeout_ms / 1000
+        if timeout_seconds > 0:
+            command_parts.push("export SIMPLE_TIMEOUT_SECONDS=" + shell_quote("{timeout_seconds}") + "; ")
+    command_parts.push("export SIMPLE_BINARY=" + shell_quote(simple_bin) + "; ")
+    command_parts.push("export SIMPLE_THREAD_BUDGET=" + shell_quote("{thread_budget}") + "; ")
+    command_parts.push("export RAYON_NUM_THREADS=" + shell_quote("{thread_budget}") + "; ")
+    command_parts.push("export TOKIO_WORKER_THREADS=" + shell_quote("{thread_budget}") + "; ")
+
+    val ulimit_cmd = build_ulimit_command(budget_as_resource_profile(launch.budget))
+    if ulimit_cmd != "":
+        command_parts.push(ulimit_cmd)
+
+    var quoted_args: [text] = []
+    quoted_args.push(shell_quote(simple_bin))
+    for arg in simple_args:
+        quoted_args.push(shell_quote(arg))
+
+    command_parts.push("exec " + quoted_args.join(" "))
+    command_parts.join("")
+
+fn classify_worker_exit(exit_code: i64, limit_exceeded: bool, limit_type: text) -> text:
+    if limit_exceeded:
+        if limit_type != "":
+            return limit_type
+        return "resource_limit"
+    crash_reason_text(classify_exit_code(exit_code as i32))
+
+fn write_child_output(stdout: text, stderr: text):
+    if stdout != "":
+        print_raw(stdout)
+    if stderr != "":
+        val _ = eprint_raw(stderr)
+
+fn run_one_shot_worker(simple_args: [text], launch: WorkerLaunch) -> i64:
+    val profile = budget_as_resource_profile(launch.budget)
+    val shell_cmd = build_worker_shell_command(simple_args, launch)
+    val result = process_run_with_limits(
+        "/bin/sh",
+        ["-c", shell_cmd],
+        profile.timeout_ms,
+        profile.mem_mb * 1024 * 1024,
+        profile.cpu_ms / 1000,
+        profile.max_fds,
+        profile.max_procs
+    )
+
+    write_child_output(result.stdout, result.stderr)
+
+    if result.exit_code != 0:
+        val classification = classify_worker_exit(result.exit_code, result.limit_exceeded, result.limit_type)
+        eprint("[{launch.name}] worker exited with {classification} (code={result.exit_code})")
+
+    result.exit_code
+
+fn _trim_restart_history(restarts: [i64], now_micros: i64, window_micros: i64) -> [i64]:
+    var kept: [i64] = []
+    for timestamp in restarts:
+        if now_micros - timestamp <= window_micros:
+            kept.push(timestamp)
+    kept
+
+fn _restart_backoff_millis(attempt: i64) -> i64:
+    if attempt <= 1:
+        return 250
+    if attempt == 2:
+        return 1000
+    5000
+
+fn run_supervised_worker(simple_args: [text], launch: WorkerLaunch) -> i64:
+    var restart_history: [i64] = []
+
+    loop:
+        val profile = budget_as_resource_profile(launch.budget)
+        val shell_cmd = build_worker_shell_command(simple_args, launch)
+        val result = process_run_with_limits(
+            "/bin/sh",
+            ["-c", shell_cmd],
+            profile.timeout_ms,
+            profile.mem_mb * 1024 * 1024,
+            profile.cpu_ms / 1000,
+            profile.max_fds,
+            profile.max_procs
+        )
+        write_child_output(result.stdout, result.stderr)
+        val exit_code = result.exit_code
+        if exit_code == 0:
+            return 0
+
+        val now = time_now_unix_micros()
+        restart_history = _trim_restart_history(
+            restart_history,
+            now,
+            launch.supervisor_policy.restart_window_micros
+        )
+
+        if restart_history.len() >= launch.supervisor_policy.max_restarts:
+            val classification = classify_worker_exit(exit_code, result.limit_exceeded, result.limit_type)
+            eprint(
+                "[{launch.name}] quarantine after {restart_history.len()} crashes in " +
+                "{launch.supervisor_policy.restart_window_micros / 1_000_000}s; " +
+                "last={classification}; retry after {launch.budget.quarantine_millis}ms"
+            )
+            return exit_code
+
+        restart_history.push(now)
+        val attempt = restart_history.len()
+        val reason = classify_worker_exit(exit_code, result.limit_exceeded, result.limit_type)
+        eprint(
+            "[{launch.name}] worker crashed with {reason} (code={exit_code}); " +
+            "restart {attempt}/{launch.supervisor_policy.max_restarts}"
+        )
+        thread_sleep_ms(_restart_backoff_millis(attempt))
+
+fn build_dashboard_worker_args(cmd: text, args: [text], launch: WorkerLaunch) -> [text]:
+    var child_args = ["dashboard", cmd]
+    child_args.merge(args)
+    child_args.push(FRAMEWORK_WORKER_FLAG)
+    child_args.push(FRAMEWORK_PROFILE_PREFIX + workload_name(launch.workload))
+    child_args

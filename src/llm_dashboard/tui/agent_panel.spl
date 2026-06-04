@@ -1,0 +1,117 @@
+# Agent Panel
+#
+# Renders the agent hierarchy tree panel showing parent-child
+# relationships, states, and resource usage.
+
+use app.llm_dashboard.data.types.{AgentNode, LLMProvider, AgentActivity,
+    provider_name, activity_label, format_tokens, shorten_path, total_tokens, cache_efficiency_pct}
+use app.llm_dashboard.data.agent_tree.{AgentTree}
+use app.llm_dashboard.tui.colors.{provider_color, activity_color}
+use app.llm_dashboard.tui.agent_sprites.{agent_tree_label, agent_indicator}
+use app.ui.render.ansi.{RESET, BOLD, DIM}
+
+# =========================================================================
+# Tree Rendering
+# =========================================================================
+
+fn render_agent_tree(tree: AgentTree, max_lines: i32) -> [text]:
+    """Render the full agent tree as indented text lines."""
+    var lines: [text] = []
+    val roots = tree.root_agents()
+
+    if roots.len() == 0:
+        lines.push("{DIM} No agents detected{RESET}")
+        lines.push("{DIM} Waiting for JSONL transcripts...{RESET}")
+        return lines
+
+    for root in roots:
+        render_agent_subtree(tree, agent: root, depth: 0, lines: lines, max_lines: max_lines)
+
+    return lines
+
+fn render_agent_subtree(tree: AgentTree, agent: AgentNode, depth: i32,
+                        lines: [text], max_lines: i32):
+    """Recursively render an agent and its children."""
+    if lines.len() >= max_lines:
+        return
+
+    # Build indentation
+    var indent = ""
+    var d = 0
+    while d < depth:
+        indent = "{indent}  "
+        d = d + 1
+
+    # Tree connector
+    val connector = if depth == 0: ">" else: "|-"
+
+    # Agent label
+    val label = agent_tree_label(agent.provider, agent.model, agent.activity, agent.id)
+    val indicator = agent_indicator(agent.provider, agent.activity)
+
+    # Resource summary with token breakdown
+    val tok_total = total_tokens(agent)
+    val in_tok = format_tokens(agent.input_tokens)
+    val out_tok = format_tokens(agent.output_tokens)
+    val cache_pct = cache_efficiency_pct(agent)
+    val files_r = agent.files_read.len()
+    val files_w = agent.files_written.len()
+    var resource_str = ""
+    if tok_total > 0 or files_r > 0 or files_w > 0:
+        var tok_str = ""
+        if tok_total > 0:
+            if cache_pct > 0:
+                tok_str = "In:{in_tok} Out:{out_tok} C:{cache_pct}%"
+            else:
+                tok_str = "In:{in_tok} Out:{out_tok}"
+        resource_str = " {DIM}{tok_str} {files_r}R/{files_w}W{RESET}"
+
+    lines.push("{indent}{connector} {indicator} {label}{resource_str}")
+
+    # File details (expandable)
+    if files_r > 0 or files_w > 0:
+        val file_indent = "{indent}    "
+        # Show last 3 files
+        var shown = 0
+        var i = agent.files_read.len() - 1
+        while i >= 0 and shown < 2:
+            val path = agent.files_read[i]
+            val short = shorten_path(path, 35)
+            lines.push("{file_indent}{DIM}R {short}{RESET}")
+            shown = shown + 1
+            i = i - 1
+        shown = 0
+        i = agent.files_written.len() - 1
+        while i >= 0 and shown < 2:
+            val path = agent.files_written[i]
+            val short = shorten_path(path, 35)
+            lines.push("{file_indent}{DIM}W {short}{RESET}")
+            shown = shown + 1
+            i = i - 1
+
+    # Recurse into children
+    val children = tree.children_of(agent.id)
+    for child in children:
+        render_agent_subtree(tree, agent: child, depth: depth + 1, lines: lines, max_lines: max_lines)
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+# shorten_path imported from data.types
+
+fn render_agent_summary(tree: AgentTree) -> text:
+    """One-line summary of all agents."""
+    val agents = tree.all_agents()
+    if agents.len() == 0:
+        return "{DIM}No agents{RESET}"
+
+    var parts: [text] = []
+    for agent in agents:
+        val ind = agent_indicator(agent.provider, agent.activity)
+        parts.push(ind)
+
+    var summary = ""
+    for p in parts:
+        summary = "{summary}{p}"
+    return "Agents: {summary} ({agents.len()} total)"

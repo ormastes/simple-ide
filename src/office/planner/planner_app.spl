@@ -1,0 +1,192 @@
+# Simple Planner Application
+#
+# Task and project management with kanban, list, calendar, and timeline views.
+
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.builder.{column, row, panel, label, button, statusbar, build_tree_with_title, with_flex}
+use common.ui.theme_registry.{ThemeId, theme_id_key}
+use common.ui.ios.builder.{navigation_bar, segmented_control, search_bar}
+use app.office.planner.task.{Task, TaskStatus, TaskPriority, new_task, status_name}
+use app.office.planner.board.{Project, Board, empty_project, tasks_in_column, move_task, add_task_to_project}
+use app.office.planner.kanban.{build_kanban_view}
+use app.office.planner.list_view.{build_list_view}
+use app.office.planner.calendar_view.{build_calendar_view}
+use app.office.planner.timeline.{build_timeline_view}
+
+# =========================================================================
+# Application Class
+# =========================================================================
+
+class PlannerApp:
+    project: Project
+    active_view: text
+    selected_task: text
+    calendar_year: i32
+    calendar_month: i32
+    search_query: text
+    modified: bool
+    file_path: text
+
+impl PlannerApp:
+
+    static fn new() -> PlannerApp:
+        """Create a new Planner app with an empty project and kanban view."""
+        return PlannerApp(
+            project: empty_project("My Project"),
+            active_view: "kanban",
+            selected_task: "",
+            calendar_year: 2026,
+            calendar_month: 1,
+            search_query: "",
+            modified: false,
+            file_path: ""
+        )
+
+    me build_ui() -> UITree:
+        """Build the full Planner UI with toolbar, active view, and status bar."""
+        # Navigation bar
+        val add_task_btn = button("btn_add_task", "+ Task", "add_task")
+        val nav = navigation_bar("nav", "Simple Planner", [], [add_task_btn])
+
+        # Toolbar: view switcher + search
+        val view_index = _view_to_index(me.active_view)
+        val view_control = segmented_control("view_control",
+            ["Board", "List", "Calendar", "Timeline"],
+            view_index
+        )
+        val search = search_bar("search", "Search tasks...", me.search_query)
+        val toolbar = row("toolbar", [view_control, search])
+
+        # Active view content
+        val filtered_project = me._filtered_project()
+        val content = match me.active_view:
+            "kanban":
+                build_kanban_view(filtered_project)
+            "list":
+                build_list_view(filtered_project)
+            "calendar":
+                build_calendar_view(filtered_project, me.calendar_year, me.calendar_month)
+            "timeline":
+                build_timeline_view(filtered_project)
+            _:
+                build_kanban_view(filtered_project)
+
+        # Task counts for status bar
+        val total = _count_tasks(me.project.tasks)
+        val in_progress = _count_tasks(tasks_in_column(me.project, "In Progress"))
+        val done = _count_tasks(tasks_in_column(me.project, "Done"))
+
+        val status = statusbar("statusbar",
+            "{total} tasks | {in_progress} in progress | {done} done",
+            if me.modified: "Modified" else: "Saved"
+        )
+
+        val root = column("root", [nav, toolbar, content, status])
+        return build_tree_with_title(root, "Simple Planner", theme_id_key(ThemeId.IOSLight))
+
+    me handle_event(event: UIEvent):
+        """Handle UI events for the Planner app."""
+        match event:
+            UIEvent.Action(name):
+                match name:
+                    "add_task":
+                        me.add_task("New Task")
+                    "save":
+                        me.modified = false
+                    _:
+                        if name.starts_with("select_task_"):
+                            me.selected_task = name.substring(12)
+                        elif name.starts_with("move_task_"):
+                            val rest = name.substring(10)
+                            val parts = rest.split("_to_")
+                            if parts.len() == 2:
+                                me.move_task(parts[0], parts[1])
+                        elif name.starts_with("switch_view_"):
+                            val view = name.substring(12)
+                            me.switch_view(view)
+                        elif name == "prev_month":
+                            me._prev_month()
+                        elif name == "next_month":
+                            me._next_month()
+            _:
+                pass_do_nothing("non-action UI events do not affect the planner app")
+
+    me switch_view(view: text):
+        """Switch the active view to kanban, list, calendar, or timeline."""
+        match view:
+            "kanban":
+                me.active_view = "kanban"
+            "list":
+                me.active_view = "list"
+            "calendar":
+                me.active_view = "calendar"
+            "timeline":
+                me.active_view = "timeline"
+            _:
+                pass_do_nothing("unknown planner views leave the active view unchanged")
+
+    me add_task(title: text):
+        """Add a new task with the given title to the project."""
+        val task_id = "task_{_count_tasks(me.project.tasks)}"
+        val task = new_task(task_id, title)
+        me.project = add_task_to_project(me.project, task)
+        me.modified = true
+
+    me move_task(task_id: text, to_column: text):
+        """Move a task to a different column on the board."""
+        me.project = move_task(me.project, task_id, to_column)
+        me.modified = true
+
+    me _filtered_project() -> Project:
+        """Return a project with tasks filtered by search query."""
+        if me.search_query == "":
+            return me.project
+        val q = me.search_query.lower()
+        var filtered_tasks: [Task] = []
+        for task in me.project.tasks:
+            val matches = (task.title.lower().contains(q) or
+                task.description.lower().contains(q) or
+                task.assignee.lower().contains(q))
+            if matches:
+                filtered_tasks = filtered_tasks.push(task)
+        return Project(
+            title: me.project.title,
+            tasks: filtered_tasks,
+            board: me.project.board
+        )
+
+    me _prev_month():
+        """Navigate calendar to the previous month."""
+        if me.calendar_month == 1:
+            me.calendar_month = 12
+            me.calendar_year = me.calendar_year - 1
+        else:
+            me.calendar_month = me.calendar_month - 1
+
+    me _next_month():
+        """Navigate calendar to the next month."""
+        if me.calendar_month == 12:
+            me.calendar_month = 1
+            me.calendar_year = me.calendar_year + 1
+        else:
+            me.calendar_month = me.calendar_month + 1
+
+# =========================================================================
+# Module Helpers
+# =========================================================================
+
+fn _view_to_index(view: text) -> i32:
+    """Convert view name to segmented control index."""
+    match view:
+        "kanban": return 0
+        "list": return 1
+        "calendar": return 2
+        "timeline": return 3
+        _: return 0
+
+fn _count_tasks(tasks: [Task]) -> i32:
+    """Count items in a task list."""
+    var count: i32 = 0
+    for t in tasks:
+        count = count + 1
+    return count

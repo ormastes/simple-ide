@@ -1,0 +1,123 @@
+# Task Model
+#
+# Types for tasks, priorities, labels, and status tracking.
+
+# =========================================================================
+# Enums
+# =========================================================================
+
+enum TaskStatus:
+    Todo
+    InProgress
+    Done
+    Blocked
+
+enum TaskPriority:
+    Unset
+    Low
+    Medium
+    High
+    Urgent
+
+# =========================================================================
+# Structs
+# =========================================================================
+
+struct TaskLabel:
+    name: text
+    color: text
+
+struct Task:
+    id: text
+    title: text
+    description: text
+    status: TaskStatus
+    priority: TaskPriority
+    labels: [TaskLabel]
+    assignee: text
+    due_date: text
+    created_date: text
+    column: text
+
+struct BoardColumn:
+    name: text
+    task_ids: [text]
+    wip_limit: i32
+
+# =========================================================================
+# Task Constructors
+# =========================================================================
+
+fn new_task(id: text, title: text) -> Task:
+    """Create a new task with default values in the Todo column."""
+    return Task(
+        id: id,
+        title: title,
+        description: "",
+        status: TaskStatus.Todo,
+        priority: TaskPriority.Unset,
+        labels: [],
+        assignee: "",
+        due_date: "",
+        created_date: "",
+        column: "Todo"
+    )
+
+# =========================================================================
+# Display Helpers
+# =========================================================================
+
+fn status_name(status: TaskStatus) -> text:
+    """Return the display name of a task status."""
+    match status:
+        TaskStatus.Todo:
+            return "Todo"
+        TaskStatus.InProgress:
+            return "In Progress"
+        TaskStatus.Done:
+            return "Done"
+        TaskStatus.Blocked:
+            return "Blocked"
+
+fn priority_name(priority: TaskPriority) -> text:
+    """Return the display name of a priority level."""
+    match priority:
+        TaskPriority.Unset:
+            return "None"
+        TaskPriority.Low:
+            return "Low"
+        TaskPriority.Medium:
+            return "Medium"
+        TaskPriority.High:
+            return "High"
+        TaskPriority.Urgent:
+            return "Urgent"
+
+fn priority_icon(priority: TaskPriority) -> text:
+    """Return a unicode indicator for the priority level."""
+    match priority:
+        TaskPriority.Unset:
+            return "-"
+        TaskPriority.Low:
+            return "v"
+        TaskPriority.Medium:
+            return "="
+        TaskPriority.High:
+            return "^"
+        TaskPriority.Urgent:
+            return "!"
+
+fn is_overdue(task: Task, today: text) -> bool:
+    """Check if a task is overdue by comparing due_date with today (YYYY-MM-DD format).
+
+    Returns false if due_date is empty or task is already done.
+    """
+    if task.due_date == "":
+        return false
+    match task.status:
+        TaskStatus.Done:
+            return false
+        _:
+            pass_do_nothing("active tasks continue to date comparison")
+    # Simple lexicographic comparison works for YYYY-MM-DD format
+    return task.due_date < today

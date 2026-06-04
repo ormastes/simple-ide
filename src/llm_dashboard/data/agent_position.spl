@@ -1,0 +1,209 @@
+# Agent Position Tracking
+#
+# Tracks where each agent character is in the virtual office.
+# Agents move between rooms based on their current tool use.
+# Each room has desk slots where agents sit.
+
+use app.llm_dashboard.data.types.{RoomKind, AgentActivity, AgentNode, tool_to_room, room_name}
+
+# =========================================================================
+# Position Types
+# =========================================================================
+
+struct AgentPos:
+    agent_id: text
+    room: RoomKind
+    slot: i64               # desk slot within room (0-based)
+    activity_label: text    # short activity text for bubble
+
+fn new_agent_pos(agent_id: text) -> AgentPos:
+    AgentPos(
+        agent_id: agent_id,
+        room: RoomKind.Chat,
+        slot: 0,
+        activity_label: ""
+    )
+
+# Max agents per room before wrapping
+val MAX_SLOTS_PER_ROOM: i64 = 6
+
+# =========================================================================
+# Position Manager (Module State)
+# =========================================================================
+
+var POS_AGENT_IDS: list<text> = []
+var POS_AGENTS: list<AgentPos> = []
+
+fn pos_clear():
+    """Reset all positions."""
+    POS_AGENT_IDS = []
+    POS_AGENTS = []
+
+fn pos_update_from_nodes(nodes: list<AgentNode>):
+    """Update all agent positions from current node states."""
+    # Track which agents we've seen
+    var seen: list<text> = []
+
+    for node in nodes:
+        seen.push(node.id)
+        val room = activity_to_room(node.activity, node.tools_used)
+        val label = short_activity_bubble(node.activity)
+
+        # Find existing or create new
+        var found = false
+        var i = 0
+        while i < POS_AGENT_IDS.len():
+            if POS_AGENT_IDS[i] == node.id:
+                POS_AGENTS[i].room = room
+                POS_AGENTS[i].activity_label = label
+                found = true
+                break
+            i = i + 1
+
+        if not found:
+            var pos = new_agent_pos(node.id)
+            pos.room = room
+            pos.activity_label = label
+            pos.slot = assign_slot(room)
+            POS_AGENT_IDS.push(node.id)
+            POS_AGENTS.push(pos)
+
+    # Reassign slots per room (compact, no gaps)
+    reassign_all_slots()
+
+fn pos_get(agent_id: text) -> AgentPos:
+    """Get position for an agent."""
+    var i = 0
+    while i < POS_AGENT_IDS.len():
+        if POS_AGENT_IDS[i] == agent_id:
+            return POS_AGENTS[i]
+        i = i + 1
+    new_agent_pos(agent_id)
+
+fn pos_agents_in_room(room: RoomKind) -> list<AgentPos>:
+    """Get all agent positions in a room, sorted by slot."""
+    var result: list<AgentPos> = []
+    val room_str = room_name(room)
+    for pos in POS_AGENTS:
+        if room_name(pos.room) == room_str:
+            result.push(pos)
+    # Sort by slot
+    var k = 1
+    while k < result.len():
+        var j = k
+        while j > 0:
+            val current = result[j]
+            val previous = result[j - 1]
+            if current.slot >= previous.slot:
+                break
+            val tmp = current
+            result[j] = previous
+            result[j - 1] = tmp
+            j = j - 1
+        k = k + 1
+    result
+
+fn pos_agent_count_in_room(room: RoomKind) -> i64:
+    val room_str = room_name(room)
+    var count = 0
+    for pos in POS_AGENTS:
+        if room_name(pos.room) == room_str:
+            count = count + 1
+    count
+
+# =========================================================================
+# Room Assignment Logic
+# =========================================================================
+
+fn activity_to_room(activity: AgentActivity, tools_used: list<text>) -> RoomKind:
+    """Determine which room an agent should be in based on activity."""
+    match activity:
+        AgentActivity.Reading(_):
+            RoomKind.Code
+        AgentActivity.Writing(_):
+            RoomKind.Code
+        AgentActivity.Searching(_):
+            RoomKind.Research
+        AgentActivity.WebFetch(_):
+            RoomKind.Research
+        AgentActivity.ToolUse(tool):
+            tool_to_room(tool)
+        AgentActivity.SubAgentSpawn(_):
+            RoomKind.Chat
+        AgentActivity.Error(_):
+            RoomKind.Code
+        AgentActivity.Thinking:
+            # Use last tool to determine room, default to Code
+            if tools_used.len() > 0:
+                tool_to_room(tools_used[tools_used.len() - 1])
+            else:
+                RoomKind.Code
+        AgentActivity.Idle:
+            RoomKind.Chat
+        AgentActivity.Finished:
+            RoomKind.Chat
+        _:
+            RoomKind.Code
+
+fn short_activity_bubble(activity: AgentActivity) -> text:
+    """Short text for the speech/emote bubble above character."""
+    match activity:
+        AgentActivity.Idle:
+            ""
+        AgentActivity.Thinking:
+            "thinking..."
+        AgentActivity.Reading(p):
+            val short = last_path_component(p)
+            "reading {short}"
+        AgentActivity.Writing(p):
+            val short = last_path_component(p)
+            "writing {short}"
+        AgentActivity.Searching(q):
+            "searching"
+        AgentActivity.WebFetch(u):
+            "fetching"
+        AgentActivity.ToolUse(t):
+            t
+        AgentActivity.SubAgentSpawn(_):
+            "spawning"
+        AgentActivity.Error(_):
+            "ERROR!"
+        AgentActivity.Finished:
+            "done"
+
+# =========================================================================
+# Slot Assignment
+# =========================================================================
+
+fn assign_slot(room: RoomKind) -> i64:
+    """Assign next available slot in a room."""
+    val count = pos_agent_count_in_room(room)
+    count % MAX_SLOTS_PER_ROOM
+
+fn reassign_all_slots():
+    """Reassign slots per room so they're compact (no gaps)."""
+    val rooms = [RoomKind.Research, RoomKind.Code, RoomKind.Skills,
+                 RoomKind.Server, RoomKind.Chat, RoomKind.TestLab]
+    for room in rooms:
+        var slot = 0
+        val room_str = room_name(room)
+        var i = 0
+        while i < POS_AGENTS.len():
+            if room_name(POS_AGENTS[i].room) == room_str:
+                POS_AGENTS[i].slot = slot
+                slot = slot + 1
+            i = i + 1
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn last_path_component(path: text) -> text:
+    """Get last part of a file path."""
+    val parts = path.split("/")
+    if parts.len() > 0:
+        val last = parts[parts.len() - 1]
+        if last.len() > 16:
+            return last.slice(0, 16)
+        return last
+    path

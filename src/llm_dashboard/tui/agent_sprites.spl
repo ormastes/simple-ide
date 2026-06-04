@@ -1,0 +1,129 @@
+# Agent Sprites
+#
+# ASCII art character representations for LLM agents.
+# Each provider has distinct visual identity; each state has animation frames.
+
+use app.ui.render.ansi.{RESET, BOLD, DIM, BRIGHT_YELLOW, BRIGHT_CYAN, BRIGHT_GREEN,
+    BRIGHT_MAGENTA, BRIGHT_RED, BRIGHT_WHITE}
+use app.llm_dashboard.tui.colors.{provider_color, activity_color}
+use app.llm_dashboard.data.types.{truncate_text, provider_name}
+use app.llm_dashboard.data.types.{LLMProvider, AgentActivity, activity_label}
+
+# =========================================================================
+# Sprite Lines (3 lines tall, 6 chars wide)
+# =========================================================================
+
+fn agent_sprite(provider: LLMProvider, activity: AgentActivity) -> [text]:
+    """Get 3-line ASCII sprite for an agent."""
+    val color = provider_color(provider)
+    val state_color = activity_color(activity)
+    val head_char = provider_head(provider)
+
+    match activity:
+        AgentActivity.Thinking:
+            return [
+                "{color} {head_char}{RESET}{state_color}*{RESET}",
+                "{color} /|\\{RESET}",
+                "{color} / \\{RESET}"
+            ]
+        AgentActivity.Reading(_):
+            return [
+                "{color} {head_char}{RESET}",
+                "{color} /|{RESET}{state_color}]{RESET}",
+                "{color} / \\{RESET}"
+            ]
+        AgentActivity.Writing(_):
+            return [
+                "{color} {head_char}{RESET}",
+                "{color} /|{RESET}{state_color}>{RESET}",
+                "{color} / \\{RESET}"
+            ]
+        AgentActivity.Searching(_):
+            return [
+                "{color} {head_char}{RESET}{state_color}?{RESET}",
+                "{color} /|\\{RESET}",
+                "{color} / \\{RESET}"
+            ]
+        AgentActivity.WebFetch(_):
+            return [
+                "{color} {head_char}{RESET}{state_color}~{RESET}",
+                "{color} /|\\{RESET}",
+                "{color} / \\{RESET}"
+            ]
+        AgentActivity.Error(_):
+            return [
+                "{state_color} {head_char}!{RESET}",
+                "{state_color} /|\\{RESET}",
+                "{state_color} / \\{RESET}"
+            ]
+        AgentActivity.Finished:
+            return [
+                "{DIM} {head_char}{RESET}",
+                "{DIM} /|\\{RESET}",
+                "{DIM} / \\{RESET}"
+            ]
+        AgentActivity.Idle:
+            return [
+                "{DIM} {head_char}{RESET}",
+                "{DIM}  | {RESET}",
+                "{DIM} / \\{RESET}"
+            ]
+        _:
+            return [
+                "{color} {head_char}{RESET}",
+                "{color} /|\\{RESET}",
+                "{color} / \\{RESET}"
+            ]
+
+fn provider_head(provider: LLMProvider) -> text:
+    """Get the head character for a provider."""
+    match provider:
+        LLMProvider.Claude: "C"
+        LLMProvider.Codex: "X"
+        LLMProvider.Gemini: "G"
+        LLMProvider.Unknown(_): "?"
+
+# =========================================================================
+# Compact Indicators (single char)
+# =========================================================================
+
+fn agent_indicator(provider: LLMProvider, activity: AgentActivity) -> text:
+    """Single-character colored indicator for compact views."""
+    val color = provider_color(provider)
+    val state_char = match activity:
+        AgentActivity.Idle: "."
+        AgentActivity.Thinking: "*"
+        AgentActivity.Reading(_): "R"
+        AgentActivity.Writing(_): "W"
+        AgentActivity.Searching(_): "S"
+        AgentActivity.WebFetch(_): "~"
+        AgentActivity.ToolUse(_): "T"
+        AgentActivity.SubAgentSpawn(_): "+"
+        AgentActivity.Error(_): "!"
+        AgentActivity.Finished: "D"
+    val state_color = activity_color(activity)
+    return "{color}{state_char}{RESET}"
+
+# =========================================================================
+# Tree Node Label
+# =========================================================================
+
+fn agent_tree_label(provider: LLMProvider, model: text, activity: AgentActivity, id: text) -> text:
+    """Format an agent tree node label with color and state."""
+    val color = provider_color(provider)
+    val state_color = activity_color(activity)
+    val label = activity_label(activity)
+
+    val short_model = truncate_text(model, 20)
+    val pname = provider_name(provider)
+
+    if short_model != "":
+        return "{color}{pname}{RESET} ({DIM}{short_model}{RESET}) {state_color}[{label}]{RESET}"
+    return "{color}{pname}{RESET} {state_color}[{label}]{RESET}"
+
+# =========================================================================
+# Sprite Dimensions
+# =========================================================================
+
+val SPRITE_HEIGHT: i32 = 3
+val SPRITE_WIDTH: i32 = 6

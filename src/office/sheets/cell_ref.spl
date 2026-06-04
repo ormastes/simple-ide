@@ -1,0 +1,96 @@
+# Cell Reference Utilities
+#
+# A1-notation parsing, range expansion, and reference manipulation.
+
+use app.office.sheets.cell.{CellRef, col_to_letter, letter_to_col, cell_ref_to_string, parse_cell_ref}
+
+# =========================================================================
+# Range Types
+# =========================================================================
+
+struct CellRange:
+    start: CellRef
+    end_ref: CellRef
+
+# =========================================================================
+# Range Parsing
+# =========================================================================
+
+fn parse_range(range_str: text) -> CellRange?:
+    """Parse a range string like 'A1:C3' into a CellRange. Returns nil if invalid."""
+    val upper = range_str.upper()
+    if not upper.contains(":"):
+        return nil
+    val parts = upper.split(":")
+    if parts.len() != 2:
+        return nil
+    val start_ref = parse_cell_ref(parts[0])
+    if start_ref == nil:
+        return nil
+    val end_ref_val = parse_cell_ref(parts[1])
+    if end_ref_val == nil:
+        return nil
+    CellRange(start: start_ref, end_ref: end_ref_val)
+
+fn range_to_string(range: CellRange) -> text:
+    """Convert a CellRange back to A1-notation string like 'A1:C3'."""
+    val start_str = cell_ref_to_string(range.start)
+    val end_str = cell_ref_to_string(range.end_ref)
+    "{start_str}:{end_str}"
+
+# =========================================================================
+# Range Expansion
+# =========================================================================
+
+fn expand_range_refs(range: CellRange) -> [text]:
+    """Expand a range into a list of all cell reference strings within it.
+    Iterates columns then rows: A1, A2, A3, B1, B2, B3, ..."""
+    var refs: [text] = []
+    val min_col = _min_i32(range.start.col, range.end_ref.col)
+    val max_col = _max_i32(range.start.col, range.end_ref.col)
+    val min_row = _min_i32(range.start.row, range.end_ref.row)
+    val max_row = _max_i32(range.start.row, range.end_ref.row)
+
+    var c = min_col
+    while c <= max_col:
+        var r = min_row
+        while r <= max_row:
+            val ref_val = CellRef(col: c, row: r)
+            refs.push(cell_ref_to_string(ref_val))
+            r = r + 1
+        c = c + 1
+    refs
+
+# =========================================================================
+# Validation and Manipulation
+# =========================================================================
+
+fn is_valid_ref(ref_str: text) -> bool:
+    """Check if a string is a valid cell reference like 'A1', 'Z99', 'AA1'."""
+    val parsed = parse_cell_ref(ref_str)
+    parsed != nil
+
+fn offset_ref(ref_val: CellRef, d_col: i32, d_row: i32) -> CellRef:
+    """Return a new CellRef offset by the given column and row deltas.
+    Clamps to zero if the result would be negative."""
+    var new_col = ref_val.col + d_col
+    var new_row = ref_val.row + d_row
+    if new_col < 0:
+        new_col = 0
+    if new_row < 0:
+        new_row = 0
+    CellRef(col: new_col, row: new_row)
+
+# =========================================================================
+# Internal Helpers
+# =========================================================================
+
+fn _min_i32(a: i32, b: i32) -> i32:
+    if a < b:
+        return a
+    b
+
+fn _max_i32(a: i32, b: i32) -> i32:
+    if a > b:
+        return a
+    b

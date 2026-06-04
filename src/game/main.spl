@@ -1,0 +1,116 @@
+# bin/simple game — top-level dispatcher (AC-7)
+#
+# Routes `bin/simple game <subcmd>` to one of:
+#   new <name>    — scaffold a fresh project (src/app/game/new.spl)
+#   run [--scene] — boot a project (src/app/game/run.spl)
+#   test [--headless] — run game2d_*_spec.spl (src/app/game/test.spl)
+#   inspect <target>  — print info about assets etc. (src/app/game/inspect.spl)
+#
+# Exit codes: 0 success, 1 test failure, 2 missing/broken project.
+
+use std.cli.cli_util.{get_cli_args}
+use std.cli.log_modes.{parse_log_options, log_options_help, render_progress}
+use std.log.{error}
+use app.game.new.{cmd_new}
+use app.game.run.{cmd_run}
+use app.game.test.{cmd_test}
+use app.game.inspect.{cmd_inspect}
+
+
+fn print_help() -> i64:
+    print "Usage: simple game <subcommand> [args]"
+    print ""
+    print "Subcommands:"
+    print "  new <name>            Scaffold a new game2d project"
+    print "  run [--scene <name>]  Boot the project (windowed)"
+    print "  test [--headless]     Run the game2d system specs"
+    print "  inspect <target>      Print info (target=assets)"
+    print ""
+    print "Shared log options:"
+    for line in log_options_help():
+        print "  {line}"
+    0
+
+fn print_help_with_progress(progress_mode: text) -> i64:
+    val progress = render_progress(progress_mode, 0, 1, "usage")
+    if progress != "":
+        print progress
+    print_help()
+
+
+fn _has_flag(args: [text], flag: text) -> bool:
+    var i: i64 = 0
+    while i < (args.len() as i64):
+        if args[i as i32] == flag:
+            return true
+        i = i + 1
+    false
+
+
+fn _arg_after(args: [text], flag: text, fallback: text) -> text:
+    var i: i64 = 0
+    while i < (args.len() as i64) - 1:
+        if args[i as i32] == flag:
+            return args[(i + 1) as i32]
+        i = i + 1
+    fallback
+
+
+fn main() -> i64:
+    val raw_args = get_cli_args()
+    val log_opts = parse_log_options(raw_args)
+    if not log_opts.valid:
+        error("game", log_opts.error)
+        return 1
+    val args = game_clean_log_args(raw_args)
+    if args.len() < 1:
+        if log_opts.log_mode == "json":
+            print "{\"command\":\"game\",\"status\":\"usage\"}"
+            return 0
+        return print_help()
+    val sub = args[0]
+    if sub == "new":
+        if args.len() < 2:
+            print "error: simple game new <name> — missing <name>"
+            return 2
+        return cmd_new(args[1])
+    if sub == "run":
+        val scene = _arg_after(args, "--scene", "main")
+        return cmd_run(scene)
+    if sub == "test":
+        val headless = _has_flag(args, "--headless")
+        return cmd_test(headless)
+    if sub == "inspect":
+        if args.len() < 2:
+            print "error: simple game inspect <target>"
+            return 2
+        return cmd_inspect(args[1])
+    if sub == "--help" or sub == "-h" or sub == "help":
+        return print_help_with_progress(log_opts.progress)
+    if log_opts.log_mode == "json":
+        print "{\"command\":\"game\",\"status\":\"error\",\"error\":\"unknown subcommand\"}"
+        return 2
+    print "error: unknown subcommand: {sub}"
+    print_help()
+    2
+
+fn game_is_log_option(arg: text) -> bool:
+    arg == "--human" or arg == "--llm" or arg == "--json" or
+        arg == "--tui" or arg == "--stdout" or arg == "--quiet" or
+        arg == "--verbose" or arg == "--dots" or arg == "--count" or
+        arg == "--no-progress" or arg == "--log-mode" or arg == "--surface" or
+        arg == "--progress" or arg.starts_with("--log-mode=") or
+        arg.starts_with("--surface=") or arg.starts_with("--progress=")
+
+fn game_clean_log_args(args: [text]) -> [text]:
+    var cleaned: [text] = []
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+        if game_is_log_option(arg):
+            if arg == "--log-mode" or arg == "--surface" or arg == "--progress":
+                i = i + 1
+        else:
+            cleaned.push(arg)
+        i = i + 1
+    cleaned

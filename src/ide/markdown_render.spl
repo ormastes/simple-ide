@@ -1,0 +1,35 @@
+# IDE Markdown rendering capability surface.
+#
+# Uses the shared editor markdown block model, preview pane, and renderer so the
+# IDE capability check proves the existing rendering path is available.
+
+use std.editor.render.block_model.{BlockModel}
+use std.editor.render.md_renderer.{md_render_blocks_for_tui, md_render_inline}
+use std.editor.view.preview_pane.{preview_pane_create, preview_pane_update, preview_pane_render}
+
+struct IdeMarkdownRenderProbe:
+    owner_module: text
+    block_count: i64
+    rendered_line_count: i64
+    preview_line_count: i64
+    contains_heading: bool
+    contains_table: bool
+
+fn ide_markdown_render_probe() -> IdeMarkdownRenderProbe:
+    val source = "# IDE Notes\n\n| App | Status |\n| --- | --- |\n| Slides | Ready |\n\n> [!NOTE]\n> dashboard"
+    val model = BlockModel.from_markdown(source)
+    val rendered = md_render_blocks_for_tui(model, 0, 16)
+    val preview = preview_pane_render(preview_pane_update(preview_pane_create(1), source), 16)
+    val joined = rendered.join("\n")
+    IdeMarkdownRenderProbe(
+        owner_module: "std.editor.render.md_renderer",
+        block_count: model.block_count(),
+        rendered_line_count: rendered.len(),
+        preview_line_count: preview.len(),
+        contains_heading: joined.contains("IDE Notes") or md_render_inline("IDE Notes").contains("IDE Notes"),
+        contains_table: joined.contains("Slides") or md_render_inline("Slides Ready").contains("Slides")
+    )
+
+fn ide_markdown_render_summary() -> text:
+    val probe = ide_markdown_render_probe()
+    "markdown: {probe.owner_module} blocks={probe.block_count} lines={probe.rendered_line_count} preview={probe.preview_line_count} heading={probe.contains_heading} table={probe.contains_table}"

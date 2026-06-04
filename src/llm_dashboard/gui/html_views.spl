@@ -1,0 +1,242 @@
+# HTML Views
+#
+# Full HTML page generation for the LLM Agent Dashboard GUI.
+# Combines room grid, agent tree, activity feed, and status bar.
+
+use app.llm_dashboard.data.store.{AgentDashboardStore}
+use app.llm_dashboard.data.env_collector.{env_collect, detect_project_dir}
+use app.llm_dashboard.gui.css_sprites.{generate_agent_css, generate_room_css}
+use app.llm_dashboard.gui.room_layout_html.{generate_room_grid, generate_agent_tree_html,
+    generate_status_bar_html, generate_feed_html}
+use app.llm_dashboard.gui.env_panel_html.{generate_env_panel_html, generate_env_panel_css}
+use app.llm_dashboard.gui.room_map_html.{generate_room_map_html, generate_room_map_css}
+use app.llm_dashboard.gui.stats_panel_html.{generate_stats_panel_html, generate_stats_panel_css}
+use app.llm_dashboard.gui.cache_panel_html.{generate_cache_panel_html, generate_cache_panel_css}
+use app.llm_dashboard.gui.message_panel_html.{generate_message_panel_html, generate_message_panel_css}
+use app.llm_dashboard.gui.mcp_panel_html.{generate_mcp_panel_html, generate_mcp_panel_css}
+use app.llm_dashboard.gui.tasks_panel_html.{generate_tasks_panel_html, generate_tasks_panel_css}
+use app.llm_dashboard.data.project_stats.{collect_project_stats}
+use app.llm_dashboard.gui.ios_css.{ios_css_overrides}
+use app.llm_dashboard.gui.dashboard_glass_css.{generate_dashboard_glass_css}
+
+# =========================================================================
+# Full Page HTML
+# =========================================================================
+
+fn generate_agents_html(store: AgentDashboardStore) -> text:
+    """Generate the full HTML page for the agent dashboard (non-iOS).
+
+    Includes three tabs: Agents (room grid + tree + feed), Terminal, and Tmux.
+    Terminal and Tmux panels are ported from the former web_dashboard app.
+    """
+    return generate_agents_html_with_ios(store, false)
+
+fn generate_agents_html_with_ios(store: AgentDashboardStore, is_ios: bool) -> text:
+    """Generate the full HTML page for the agent dashboard.
+
+    When is_ios=true, appends iOS CSS overrides and adds apple-mobile-web-app
+    meta tags to the head section.
+    """
+    val css = generate_agents_css()
+    val room_grid = generate_room_grid(store)
+    val agent_tree = generate_agent_tree_html(store)
+    val feed = generate_feed_html(store, 50)
+    val status_bar = generate_status_bar_html(store)
+    val term_html = generate_terminal_panel_html()
+    val term_js = generate_terminal_js()
+    val env_data = env_collect(detect_project_dir())
+    val env_html = generate_env_panel_html(env_data)
+    val office_map = generate_room_map_html(store.tree.all_agents())
+    val proj_dir = detect_project_dir()
+    val proj_stats = collect_project_stats(proj_dir)
+    val stats_html = generate_stats_panel_html(proj_stats)
+    val cache_html = generate_cache_panel_html(store)
+    val msg_html = generate_message_panel_html(store)
+    val mcp_html = generate_mcp_panel_html(store)
+    val tasks_html = generate_tasks_panel_html(store)
+
+    val ios_meta = if is_ios:
+        "\n<meta name=\"apple-mobile-web-app-capable\" content=\"yes\">\n<meta name=\"apple-mobile-web-app-status-bar-style\" content=\"default\">"
+    else:
+        ""
+    val ios_extra_css = if is_ios:
+        ios_css_overrides()
+    else:
+        ""
+    val html_head = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">{ios_meta}\n<title>LLM Agent Dashboard</title>\n<style>"
+    val html_mid = """</style>
+</head>
+<body>
+<div class="dashboard-container">
+    <header class="dashboard-header">
+        <h1>LLM Agent Dashboard</h1>
+        <nav class="tab-bar">
+            <button class="tab-btn active" onclick="switchTab('agents', this)">Agents</button>
+            <button class="tab-btn" onclick="switchTab('office', this)">Office</button>
+            <button class="tab-btn" onclick="switchTab('dashboard', this)">Dashboard</button>
+            <button class="tab-btn" onclick="switchTab('environment', this)">Environment</button>
+            <button class="tab-btn" onclick="switchTab('observability', this)">Observability</button>
+            <button class="tab-btn" onclick="switchTab('tasks', this)">Tasks</button>
+            <button class="tab-btn" onclick="switchTab('terminal', this)">Terminal</button>
+        </nav>
+        <div id="refresh-status" class="refresh-status">Auto-refresh: 2s</div>
+    </header>
+
+    <div id="tab-agents" class="tab-content active">
+    <div class="main-content">
+        <div class="left-panel">
+"""
+    val html_right = """        </div>
+        <div class="right-panel">
+            <h3>Agent Hierarchy</h3>
+"""
+    val html_bottom = """        </div>
+    </div>
+
+    <div class="bottom-panel">
+        <h3>Activity Feed</h3>
+"""
+    val html_tail = """    </div>
+
+"""
+    val html_agents_close = """    </div>
+
+    <div id="tab-office" class="tab-content">
+"""
+    val html_office_close = """    </div>
+
+    <div id="tab-dashboard" class="tab-content">
+"""
+    val html_dashboard_close = """    </div>
+
+    <div id="tab-environment" class="tab-content">
+"""
+    val html_env_close = """    </div>
+
+    <div id="tab-observability" class="tab-content">
+      <div class="obs-layout">
+        <div class="obs-section">
+          <h3>Cache Monitoring</h3>
+"""
+    val html_obs_mid = """        </div>
+        <div class="obs-section">
+          <h3>Agent Messages</h3>
+"""
+    val html_obs_mid2 = """        </div>
+        <div class="obs-section">
+          <h3>MCP Server Stats</h3>
+"""
+    val html_obs_close = """        </div>
+      </div>
+    </div>
+
+    <div id="tab-tasks" class="tab-content">
+"""
+    val html_tasks_close = """    </div>
+
+    <div id="tab-terminal" class="tab-content">
+"""
+    val html_terminal_close = """    </div>
+"""
+
+    val html_script = """</div>
+
+<script>
+# Tab switching
+function switchTab(name, btn) {
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById('tab-' + name).classList.add('active');
+    if (btn) btn.classList.add('active');
+    if (name === 'terminal') loadTmuxSessions();
+}
+
+# Auto-refresh via WebSocket or polling
+(function() {
+    var ws = null;
+    var wsUrl = 'ws://' + window.location.host + '/ws/agents';
+
+    function connectWs() {
+        try {
+            ws = new WebSocket(wsUrl);
+            ws.onmessage = function(e) {
+                var data = JSON.parse(e.data);
+                if (data.type === 'refresh') {
+                    window.location.reload();
+                }
+            };
+            ws.onclose = function() {
+                setTimeout(connectWs, 3000);
+            };
+        } catch(e) {
+            # Fallback to polling
+            setTimeout(function() { window.location.reload(); }, 2000);
+        }
+    }
+
+    connectWs();
+
+    # Fallback polling
+    setTimeout(function() {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            setInterval(function() { window.location.reload(); }, 2000);
+        }
+    }, 5000);
+})();
+
+"""
+    val html_end = """</script>
+</body>
+</html>"""
+    return html_head + css + ios_extra_css + html_mid + room_grid + html_right + agent_tree + html_bottom + feed + html_tail + status_bar + html_agents_close + office_map + html_office_close + stats_html + html_dashboard_close + env_html + html_env_close + cache_html + html_obs_mid + msg_html + html_obs_mid2 + mcp_html + html_obs_close + tasks_html + html_tasks_close + term_html + html_terminal_close + html_script + term_js + html_end
+
+fn generate_agents_css() -> text:
+    """Generate combined CSS for the agent dashboard."""
+    val glass_css = generate_dashboard_glass_css()
+    val sprite_css = generate_agent_css()
+    val room_css = generate_room_css()
+    val env_css = generate_env_panel_css()
+    val map_css = generate_room_map_css()
+    val stats_css = generate_stats_panel_css()
+    val cache_css = generate_cache_panel_css()
+    val msg_css = generate_message_panel_css()
+    val mcp_css = generate_mcp_panel_css()
+    val tasks_css = generate_tasks_panel_css()
+    val obs_css = """
+.obs-layout { display: flex; flex-direction: column; gap: 0; }
+.obs-section { border-bottom: 1px solid var(--border, rgba(255,255,255,0.10)); }
+.obs-section h3 { padding: 12px 16px; font-size: 0.9rem; color: var(--accent, #0A84FF); border-bottom: 1px solid var(--border, rgba(255,255,255,0.10)); margin: 0; }
+"""
+    return glass_css + sprite_css + room_css + env_css + map_css + stats_css + cache_css + msg_css + mcp_css + tasks_css + obs_css
+
+fn generate_terminal_panel_html() -> text:
+    return """<section class="terminal-shell">
+  <h2>Terminal</h2>
+  <p class="terminal-note">Terminal and tmux panels are unavailable in this runtime mode.</p>
+  <p class="terminal-note">The reusable login flow and dashboard shell remain active.</p>
+</section>"""
+
+fn generate_terminal_css() -> text:
+    return """
+.terminal-shell {
+    padding: 20px;
+    color: #c9d1d9;
+}
+.terminal-shell h2 {
+    margin: 0 0 12px 0;
+    font-size: 1rem;
+    color: #58a6ff;
+}
+.terminal-note {
+    margin: 0 0 10px 0;
+    color: #8b949e;
+    line-height: 1.5;
+}
+"""
+
+fn generate_terminal_js() -> text:
+    return """
+function loadTmuxSessions() {
+    return;
+}
+"""

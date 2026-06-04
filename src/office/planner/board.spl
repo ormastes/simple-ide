@@ -1,0 +1,132 @@
+# Board and Project Model
+#
+# Kanban board structure with columns, and project container for tasks.
+
+use app.office.planner.task.{Task, TaskStatus, BoardColumn, new_task}
+
+# =========================================================================
+# Structs
+# =========================================================================
+
+struct Board:
+    name: text
+    columns: [BoardColumn]
+
+struct Project:
+    title: text
+    tasks: [Task]
+    board: Board
+
+# =========================================================================
+# Board Constructors
+# =========================================================================
+
+fn default_board() -> Board:
+    """Create a default kanban board with Todo, In Progress, and Done columns."""
+    return Board(
+        name: "Default Board",
+        columns: [
+            BoardColumn(name: "Todo", task_ids: [], wip_limit: 0),
+            BoardColumn(name: "In Progress", task_ids: [], wip_limit: 5),
+            BoardColumn(name: "Done", task_ids: [], wip_limit: 0)
+        ]
+    )
+
+fn empty_project(title: text) -> Project:
+    """Create an empty project with a default board."""
+    return Project(
+        title: title,
+        tasks: [],
+        board: default_board()
+    )
+
+# =========================================================================
+# Task Queries
+# =========================================================================
+
+fn tasks_in_column(project: Project, column_name: text) -> [Task]:
+    """Return all tasks assigned to the given column name."""
+    var result: [Task] = []
+    for task in project.tasks:
+        if task.column == column_name:
+            result = result.push(task)
+    return result
+
+# =========================================================================
+# Task Mutations (immutable — return new Project)
+# =========================================================================
+
+fn move_task(project: Project, task_id: text, to_column: text) -> Project:
+    """Move a task to a different column. Returns a new Project."""
+    # Update the task's column field
+    var new_tasks: [Task] = []
+    for task in project.tasks:
+        if task.id == task_id:
+            new_tasks = new_tasks.push(Task(
+                id: task.id,
+                title: task.title,
+                description: task.description,
+                status: _status_for_column(to_column),
+                priority: task.priority,
+                labels: task.labels,
+                assignee: task.assignee,
+                due_date: task.due_date,
+                created_date: task.created_date,
+                column: to_column
+            ))
+        else:
+            new_tasks = new_tasks.push(task)
+    # Rebuild board columns with updated task_ids
+    val new_board = _rebuild_board_columns(project.board, new_tasks)
+    return Project(
+        title: project.title,
+        tasks: new_tasks,
+        board: new_board
+    )
+
+fn add_task_to_project(project: Project, task: Task) -> Project:
+    """Add a task to the project in its designated column. Returns a new Project."""
+    var new_tasks: [Task] = []
+    for t in project.tasks:
+        new_tasks = new_tasks.push(t)
+    new_tasks = new_tasks.push(task)
+    val new_board = _rebuild_board_columns(project.board, new_tasks)
+    return Project(
+        title: project.title,
+        tasks: new_tasks,
+        board: new_board
+    )
+
+# =========================================================================
+# Internal Helpers
+# =========================================================================
+
+fn _status_for_column(column_name: text) -> TaskStatus:
+    """Infer task status from column name."""
+    match column_name:
+        "Todo":
+            return TaskStatus.Todo
+        "In Progress":
+            return TaskStatus.InProgress
+        "Done":
+            return TaskStatus.Done
+        _:
+            return TaskStatus.Todo
+
+fn _rebuild_board_columns(board: Board, tasks: [Task]) -> Board:
+    """Rebuild board column task_ids from the task list."""
+    var new_columns: [BoardColumn] = []
+    for col in board.columns:
+        var ids: [text] = []
+        for task in tasks:
+            if task.column == col.name:
+                ids = ids.push(task.id)
+        new_columns = new_columns.push(BoardColumn(
+            name: col.name,
+            task_ids: ids,
+            wip_limit: col.wip_limit
+        ))
+    return Board(
+        name: board.name,
+        columns: new_columns
+    )

@@ -1,0 +1,93 @@
+# Agent Dashboard Colors
+#
+# Agent-specific and room-specific color roles for the TUI dashboard.
+# Extends the existing dashboard color system.
+
+use app.ui.render.ansi.{RESET, BOLD, DIM, CYAN, WHITE, BLUE, YELLOW, GREEN, RED,
+    BRIGHT_WHITE, BRIGHT_CYAN, BRIGHT_BLUE, BRIGHT_GREEN, BRIGHT_YELLOW, BRIGHT_RED,
+    BRIGHT_MAGENTA, MAGENTA, BRIGHT_BLACK,
+    fg_256, bg_256}
+use app.llm_dashboard.data.types.{LLMProvider, AgentActivity, RoomKind}
+
+# =========================================================================
+# Provider Colors
+# =========================================================================
+
+fn provider_color(provider: LLMProvider) -> text:
+    """Get the ANSI color for an LLM provider."""
+    match provider:
+        LLMProvider.Claude: fg_256(208)    # orange
+        LLMProvider.Codex: fg_256(34)      # green
+        LLMProvider.Gemini: fg_256(33)     # blue
+        LLMProvider.Unknown(_): DIM
+
+fn provider_bg(provider: LLMProvider) -> text:
+    """Get background color for an LLM provider."""
+    match provider:
+        LLMProvider.Claude: bg_256(94)     # dark orange
+        LLMProvider.Codex: bg_256(22)      # dark green
+        LLMProvider.Gemini: bg_256(17)     # dark blue
+        LLMProvider.Unknown(_): bg_256(236)
+
+# =========================================================================
+# Activity State Colors
+# =========================================================================
+
+fn activity_color(activity: AgentActivity) -> text:
+    """Get the ANSI color for an agent activity state."""
+    match activity:
+        AgentActivity.Idle: DIM
+        AgentActivity.Thinking: BRIGHT_YELLOW
+        AgentActivity.Reading(_): BRIGHT_CYAN
+        AgentActivity.Writing(_): BRIGHT_GREEN
+        AgentActivity.Searching(_): BRIGHT_MAGENTA
+        AgentActivity.WebFetch(_): fg_256(141)   # purple
+        AgentActivity.ToolUse(_): BRIGHT_WHITE
+        AgentActivity.SubAgentSpawn(_): fg_256(220)  # gold
+        AgentActivity.Error(_): BRIGHT_RED
+        AgentActivity.Finished: DIM
+
+# =========================================================================
+# Room Colors
+# =========================================================================
+
+fn room_color(room: RoomKind) -> text:
+    """Get the ANSI color for a room border/title."""
+    match room:
+        RoomKind.Research: fg_256(141)     # purple
+        RoomKind.Code: fg_256(114)         # green
+        RoomKind.Skills: fg_256(220)       # gold
+        RoomKind.Server: fg_256(75)        # steel blue
+        RoomKind.Chat: fg_256(180)         # peach
+        RoomKind.TestLab: fg_256(168)      # pink
+
+fn room_bg(room: RoomKind) -> text:
+    """Get background tint for a room."""
+    match room:
+        RoomKind.Research: bg_256(53)
+        RoomKind.Code: bg_256(22)
+        RoomKind.Skills: bg_256(58)
+        RoomKind.Server: bg_256(17)
+        RoomKind.Chat: bg_256(52)
+        RoomKind.TestLab: bg_256(53)
+
+# =========================================================================
+# Connection Indicators
+# =========================================================================
+
+fn connection_dot(connected: bool) -> text:
+    """Colored dot indicating connection status."""
+    if connected:
+        return "{BRIGHT_GREEN}*{RESET}"
+    return "{DIM}o{RESET}"
+
+fn status_indicator(provider: LLMProvider, connected: bool) -> text:
+    """Provider name with connection dot."""
+    val color = provider_color(provider)
+    val dot = connection_dot(connected)
+    val name = match provider:
+        LLMProvider.Claude: "Claude"
+        LLMProvider.Codex: "Codex"
+        LLMProvider.Gemini: "Gemini"
+        LLMProvider.Unknown(n): n
+    return "{color}{name}{RESET}: {dot}"

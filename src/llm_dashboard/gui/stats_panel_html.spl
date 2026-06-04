@@ -1,0 +1,164 @@
+# Stats Panel — HTML/CSS
+#
+# Displays Simple compiler project stats in the web dashboard.
+# Card grid: build status, test results, TODOs, features.
+
+use app.llm_dashboard.data.project_stats.{
+    ProjectStats, test_pass_rate, feature_progress_pct
+}
+
+fn generate_stats_panel_html(stats: ProjectStats) -> text:
+    """Generate HTML for the project stats dashboard tab."""
+    var parts: [text] = []
+    parts.push("<div class=\"stats-panel\">")
+
+    # Stats card grid
+    parts.push("<div class=\"stats-grid\">")
+
+    # Build status card
+    val build_class = if stats.last_build_ok: "stats-card-ok" else: "stats-card-fail"
+    val build_icon = if stats.last_build_ok: "✓" else: "✗"
+    val build_label = if stats.last_build_ok: "Build Passing" else: "Build Failed"
+    parts.push(stats_card(build_icon, build_label, stats.last_build_time, build_class))
+
+    # Test results card
+    val pass_rate = test_pass_rate(stats)
+    val test_class = if pass_rate >= 90: "stats-card-ok"
+                     elif pass_rate >= 70: "stats-card-warn"
+                     else: "stats-card-fail"
+    parts.push(stats_card_with_bar(
+        stats.test_passed.to_text() + "/" + stats.test_count.to_text(),
+        "Tests Passed",
+        pass_rate,
+        test_class
+    ))
+
+    # Features card
+    val feat_pct = feature_progress_pct(stats)
+    val feat_class = if feat_pct >= 80: "stats-card-ok"
+                     elif feat_pct >= 50: "stats-card-warn"
+                     else: "stats-card-fail"
+    parts.push(stats_card_with_bar(
+        stats.feature_done.to_text() + "/" + stats.feature_count.to_text(),
+        "Features Done",
+        feat_pct,
+        feat_class
+    ))
+
+    # TODO card
+    val todo_total = stats.todo_count + stats.fixme_count
+    val todo_class = if todo_total == 0: "stats-card-ok"
+                     elif todo_total < 20: "stats-card-warn"
+                     else: "stats-card-fail"
+    val todo_detail = "TODO: " + stats.todo_count.to_text() + " · FIXME: " + stats.fixme_count.to_text()
+    parts.push(stats_card(todo_total.to_text(), "Open Items", todo_detail, todo_class))
+
+    parts.push("</div>")
+    parts.push("</div>")
+    parts.join("")
+
+# =========================================================================
+# Card Helpers
+# =========================================================================
+
+fn stats_card(value: text, label: text, detail: text, class_name: text) -> text:
+    var parts: [text] = []
+    parts.push("<div class=\"stats-card ")
+    parts.push(class_name)
+    parts.push("\">")
+    parts.push("<div class=\"stats-value\">")
+    parts.push(value)
+    parts.push("</div>")
+    parts.push("<div class=\"stats-label\">")
+    parts.push(label)
+    parts.push("</div>")
+    if detail.len() > 0:
+        parts.push("<div class=\"stats-detail\">")
+        parts.push(detail)
+        parts.push("</div>")
+    parts.push("</div>")
+    parts.join("")
+
+fn stats_card_with_bar(value: text, label: text, pct: i64, class_name: text) -> text:
+    val bar_color = if pct >= 80: "#3fb950"
+                    elif pct >= 50: "#d29922"
+                    else: "#f85149"
+    var parts: [text] = []
+    parts.push("<div class=\"stats-card ")
+    parts.push(class_name)
+    parts.push("\">")
+    parts.push("<div class=\"stats-value\">")
+    parts.push(value)
+    parts.push("</div>")
+    parts.push("<div class=\"stats-label\">")
+    parts.push(label)
+    parts.push("</div>")
+    parts.push("<div class=\"stats-bar\">")
+    parts.push("<div class=\"stats-bar-fill\" style=\"width:")
+    parts.push(pct.to_text())
+    parts.push("%;background:")
+    parts.push(bar_color)
+    parts.push(";\"></div>")
+    parts.push("</div>")
+    parts.push("<div class=\"stats-detail\">")
+    parts.push(pct.to_text())
+    parts.push("%</div>")
+    parts.push("</div>")
+    parts.join("")
+
+# =========================================================================
+# CSS
+# =========================================================================
+
+fn generate_stats_panel_css() -> text:
+    """CSS for the project stats panel."""
+    """
+/* Stats Panel */
+.stats-panel { padding: 8px; }
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+}
+.stats-card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 16px;
+    text-align: center;
+    transition: border-color 0.2s, transform 0.2s;
+}
+.stats-card:hover { transform: translateY(-2px); border-color: #58a6ff; }
+.stats-card-ok { border-left: 4px solid #3fb950; }
+.stats-card-warn { border-left: 4px solid #d29922; }
+.stats-card-fail { border-left: 4px solid #f85149; }
+.stats-value {
+    font-size: 28px;
+    font-weight: 700;
+    color: #e6edf3;
+    margin-bottom: 4px;
+}
+.stats-label {
+    font-size: 13px;
+    color: #8b949e;
+    font-weight: 500;
+    margin-bottom: 8px;
+}
+.stats-detail {
+    font-size: 11px;
+    color: #484f58;
+}
+.stats-bar {
+    height: 6px;
+    background: #21262d;
+    border-radius: 3px;
+    overflow: hidden;
+    margin: 8px 0;
+}
+.stats-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.5s ease;
+}
+"""

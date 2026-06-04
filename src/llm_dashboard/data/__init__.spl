@@ -1,0 +1,9 @@
+# LLM Dashboard Data Layer
+#
+# Core types, JSONL parsing, file watching, agent tree, and central store.
+
+export AgentActivity, LLMProvider, AgentNode, LLMStatus, RoomKind
+export FileActivity, URLActivity, ActivityEntry
+export AgentDashboardStore
+export JsonlParser, JsonlWatcher
+export AgentTree

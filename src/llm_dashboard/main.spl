@@ -1,0 +1,220 @@
+# LLM Agent Dashboard — Entry Point
+#
+# CLI entry point for the LLM Agent Dashboard.
+# Supports TUI mode (default) and web GUI mode.
+
+use app.llm_dashboard.data.store.{AgentDashboardStore}
+use app.web_dashboard.server.{DashboardServer}
+use std.text.{to_int_or}
+use std.cli.cli_util (get_cli_args)
+use std.cli.log_modes.{parse_log_options, log_options_help, render_progress}
+use std.log.{error}
+use app.dashboard.framework_policy.{strip_framework_flags}
+use lib.common.llm.output_gate.{OutputGate, filter_response_body}
+use lib.common.privilege.authority_token.{AuthorityToken}
+
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+
+# =========================================================================
+# LLM output gate helper (spm-winfs-llm-suite AC-5)
+# =========================================================================
+#
+# Every LLM-produced byte stream that leaves this process — web HTTP
+# body, websocket frame, TUI activity feed — must flow through the
+# pre-release gate. Each sink calls `gate_llm_emit` and writes the
+# returned (possibly redacted) bytes. See `src/app/web_dashboard/server.spl`
+# for the HTTP sink.
+
+fn gate_llm_emit(body: [u8], token: AuthorityToken) -> [u8]:
+    """Run the default OutputGate over `body` for caller `token`.
+    Pass-through on clean bodies; redacted bytes on Hold/Deny."""
+    val gate = OutputGate.default()
+    val filtered = filter_response_body(gate, body, token)
+    filtered
+
+# =========================================================================
+# Entry Point
+# =========================================================================
+
+fn main() -> i64:
+    """Standalone entry point."""
+    val args = get_cli_args()
+    return run_llm_dashboard(args)
+
+fn run_llm_dashboard(args: [text]) -> i64:
+    """Main entry point for LLM Agent Dashboard.
+
+    Args:
+        args: CLI arguments after 'agents' subcommand
+
+    Returns:
+        Exit code (0 = success)
+    """
+    val log_opts = parse_log_options(args)
+    if not log_opts.valid:
+        error("llm-dashboard", log_opts.error)
+        return 1
+
+    val log_clean_args = llm_dashboard_clean_log_args(args)
+    val clean_args = strip_framework_flags(log_clean_args)
+    if clean_args.len() == 0 and log_opts.log_mode == "json":
+        print "{\"command\":\"llm-dashboard\",\"status\":\"usage\"}"
+        return 0
+
+    var mode = "tui"
+    var port = 3001
+    var watch_dir = ""
+    var enable_terminal = false
+    var enable_tmux = false
+    var is_ios = false
+
+    # Parse arguments
+    var i = 0
+    while i < clean_args.len():
+        val arg = clean_args[i]
+        match arg:
+            "--gui" => mode = "gui"
+            "--web" => mode = "gui"
+            "--tui" => mode = "tui"
+            "--ios" =>
+                is_ios = true
+                mode = "gui"
+            "--terminal" => enable_terminal = true
+            "--tmux" => enable_tmux = true
+            "--port" =>
+                if i + 1 < clean_args.len():
+                    port = to_int_or(clean_args[i + 1], 3001)
+                    i = i + 1
+            "--dir" =>
+                if i + 1 < clean_args.len():
+                    watch_dir = clean_args[i + 1]
+                    i = i + 1
+            "--help" =>
+                print_agents_help_with_progress(log_opts.progress)
+                return 0
+            "-h" =>
+                print_agents_help_with_progress(log_opts.progress)
+                return 0
+            _ => pass_dn
+        i = i + 1
+
+    # --terminal and --tmux imply GUI mode
+    if enable_terminal or enable_tmux:
+        mode = "gui"
+
+    match mode:
+        "tui":
+            return run_tui_dashboard_subprocess(clean_args)
+        "gui":
+            val store = if watch_dir != "":
+                AgentDashboardStore.with_dir(watch_dir)
+            else:
+                AgentDashboardStore.new()
+            if is_ios:
+                run_ios_dashboard(store, port, watch_dir)
+            else:
+                run_gui_dashboard(store, port, watch_dir)
+            return 0
+        _:
+            return run_tui_dashboard_subprocess(clean_args)
+
+fn run_ios_dashboard(store: AgentDashboardStore, port: i32, watch_dir: text):
+    """Start the web-based GUI dashboard in iOS mode.
+
+    Constructs DashboardServer with is_ios=true so that:
+    - /agents is served without auth (WKWebView is the sole client)
+    - iOS CSS overrides are injected into the HTML
+    - Cache-Control: no-store is set for dev convenience
+    """
+    val _ = store
+    val server = DashboardServer.new_ios(port, watch_dir)
+    server.start()
+
+fn run_gui_dashboard(store: AgentDashboardStore, port: i32, watch_dir: text):
+    """Start the web-based GUI dashboard.
+
+    The server routes /api/tmux/* and /ws/terminal through the
+    terminal and tmux panels now living in llm_dashboard.gui.
+    """
+    val _ = store
+    val server = if watch_dir != "":
+        DashboardServer.new_with_agent_dir(port, watch_dir)
+    else:
+        DashboardServer.new(port)
+    server.start()
+
+fn run_tui_dashboard_subprocess(args: [text]) -> i64:
+    var cmd_args = ["run", "src/app/llm_dashboard/tui_main.spl"]
+    for arg in args:
+        cmd_args.push(arg)
+    val (stdout, stderr, code) = rt_process_run("bin/simple", cmd_args)
+    if stdout != "":
+        print stdout
+    if stderr != "":
+        print stderr
+    return code
+
+fn print_agents_help():
+    """Print help for the agents subcommand."""
+    print "LLM Agent Dashboard"
+    print ""
+    print "USAGE:"
+    print "  simple dashboard agents [options]"
+    print ""
+    print "OPTIONS:"
+    print "  --tui          Terminal UI mode (default)"
+    print "  --gui, --web   Web browser GUI mode"
+    print "  --terminal     Enable terminal panel in GUI (implies --gui)"
+    print "  --tmux         Enable tmux panel in GUI (implies --gui)"
+    print "  --port <N>     Port for GUI mode (default: 3001)"
+    print "  --dir <path>   Custom JSONL watch directory"
+    print "  --help, -h     Show this help"
+    print ""
+    print "DESCRIPTION:"
+    print "  Real-time monitoring of LLM agent activity."
+    print "  Watches ~/.claude/projects/ for JSONL transcripts."
+    print "  Shows agent hierarchy, file I/O, URL fetches, tool usage."
+    print ""
+    print "EXAMPLES:"
+    print "  simple dashboard agents              # TUI mode"
+    print "  simple dashboard agents --gui        # Web GUI"
+    print "  simple dashboard agents --port 8080  # Custom port"
+    print ""
+    print "TUI KEYS:"
+    print "  1-7     Switch rooms (Research/Code/Skills/Servers/Chat/Feed/Tasks)"
+    print "  Tab     Cycle through rooms"
+    print "  j/k     Scroll activity feed"
+    print "  r       Force refresh"
+    print "  c       Clear filters"
+    print "  q       Quit"
+    print ""
+    print "Shared log options:"
+    for line in log_options_help():
+        print "  {line}"
+
+fn print_agents_help_with_progress(progress_mode: text):
+    val progress = render_progress(progress_mode, 0, 1, "usage")
+    if progress != "":
+        print progress
+    print_agents_help()
+
+fn llm_dashboard_is_log_option(arg: text) -> bool:
+    arg == "--human" or arg == "--llm" or arg == "--json" or
+        arg == "--tui" or arg == "--stdout" or arg == "--quiet" or
+        arg == "--verbose" or arg == "--dots" or arg == "--count" or
+        arg == "--no-progress" or arg == "--log-mode" or arg == "--surface" or
+        arg == "--progress" or arg.starts_with("--log-mode=") or
+        arg.starts_with("--surface=") or arg.starts_with("--progress=")
+
+fn llm_dashboard_clean_log_args(args: [text]) -> [text]:
+    var cleaned: [text] = []
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+        if llm_dashboard_is_log_option(arg):
+            if arg == "--log-mode" or arg == "--surface" or arg == "--progress":
+                i = i + 1
+        else:
+            cleaned.push(arg)
+        i = i + 1
+    cleaned

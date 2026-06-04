@@ -1,0 +1,81 @@
+# Mail Compose
+#
+# Draft composition, reply, and forward helpers with compose UI.
+
+use common.ui.widget.{WidgetNode}
+use common.ui.builder.{column, row, panel, label, text_field, textarea, button, dialog}
+use app.office.mail.message.{Email, EmailAddress, email_address_display}
+
+# =========================================================================
+# Draft Struct
+# =========================================================================
+
+struct ComposeDraft:
+    to: text
+    cc: text
+    subject: text
+    body: text
+
+# =========================================================================
+# Draft Constructors
+# =========================================================================
+
+fn new_draft() -> ComposeDraft:
+    """Create an empty compose draft."""
+    return ComposeDraft(
+        to: "",
+        cc: "",
+        subject: "",
+        body: ""
+    )
+
+fn reply_draft(email: Email) -> ComposeDraft:
+    """Create a reply draft pre-filled with sender and quoted body."""
+    val from_display = email_address_display(email.from_addr)
+    val quoted_body = "\n\n--- Original Message ---\nFrom: {from_display}\n\n{email.body}"
+    val subject = if email.subject.starts_with("Re: "): email.subject else: "Re: {email.subject}"
+    return ComposeDraft(
+        to: email.from_addr.address,
+        cc: "",
+        subject: subject,
+        body: quoted_body
+    )
+
+fn forward_draft(email: Email) -> ComposeDraft:
+    """Create a forward draft pre-filled with original body."""
+    val from_display = email_address_display(email.from_addr)
+    val fwd_body = "\n\n--- Forwarded Message ---\nFrom: {from_display}\nSubject: {email.subject}\n\n{email.body}"
+    val subject = if email.subject.starts_with("Fwd: "): email.subject else: "Fwd: {email.subject}"
+    return ComposeDraft(
+        to: "",
+        cc: "",
+        subject: subject,
+        body: fwd_body
+    )
+
+# =========================================================================
+# Compose UI
+# =========================================================================
+
+fn build_compose_ui(draft: ComposeDraft) -> WidgetNode:
+    """Build a compose dialog with to, cc, subject, body fields and action buttons."""
+    val to_field = text_field("compose_to", draft.to, "To...")
+    val cc_field = text_field("compose_cc", draft.cc, "Cc...")
+    val subject_field = text_field("compose_subject", draft.subject, "Subject")
+    val body_area = textarea("compose_body", draft.body, "Write your message...", 12)
+
+    val send_btn = button("btn_send", "Send", "send")
+    val save_draft_btn = button("btn_save_draft", "Save Draft", "save_draft")
+    val discard_btn = button("btn_discard", "Discard", "discard")
+    val actions = row("compose_actions", [send_btn, save_draft_btn, discard_btn])
+
+    return dialog("compose_dialog", "New Message", [
+        label("compose_to_label", "To:"),
+        to_field,
+        label("compose_cc_label", "Cc:"),
+        cc_field,
+        label("compose_subject_label", "Subject:"),
+        subject_field,
+        body_area,
+        actions
+    ])

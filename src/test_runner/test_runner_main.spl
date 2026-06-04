@@ -1,0 +1,817 @@
+# Test Runner Main Orchestration
+#
+# Main test runner entry point and orchestration logic.
+# Supports DB writes, parallel execution, feature DB, and doc generation.
+#
+# Split into:
+#   - test_runner_config.spl: CLI args, env propagation, mode conversion, run management
+#   - test_runner_modes.spl: Execution modes (doctest, combined, parallel, container),
+#                            result parsing, categorization, warnings, database updates
+
+use std.io.{env_set, env_get}
+use std.io.{time_now_unix_micros}
+use std.io.{dir_create_all}
+use std.io.{file_write, file_read, file_exists}
+use std.io.{process_run}
+use std.io_runtime.{get_args}
+
+use std.test_runner.test_runner_types.{TestExecutionMode, TestFileResult, TestOptions, TestRunResult}
+use std.test_runner.test_runner_args.parse_test_args
+use std.test_runner.test_config.{TestConfig, load_test_config}
+use std.test_runner.test_runner_files.{discover_test_files, discover_test_files_fast, print_discovery_summary, strip_ansi, file_has_di_test_tag, is_skip_marker_file, count_skip_marker_cases, save_manifest_from_discovery, order_tests_by_duration, validate_system_test_covers}
+use std.test_runner.test_manifest.{MANIFEST_PATH, manifest_load, manifest_save, manifest_is_fresh}
+use std.test_runner.test_manifest_scanner.{manifest_full_scan}
+use std.test_runner.test_runner_execute.{run_test_file_interpreter, run_test_file_smf, run_test_file_native, run_test_file_compile, run_test_file_safe_mode, run_test_file_composite}
+use std.test_runner.test_runner_output.{print_result, print_summary}
+use std.test_runner.test_runner_config.{report_free_mem, mode_to_str, propagate_env_vars, get_cli_args, get_flag_value, handle_run_management, has_run_management_flag}
+use app.test_daemon.session_scheduler.{schedule_session_tests, schedule_summary, schedule_flatten, schedule_session_file_paths, schedule_local_file_paths}
+# MEMORY DEBUG: groups 3-9 commented out to isolate memory usage
+# GROUP 3: Container & coverage
+# use sequential_container.{SequentialContainerConfig, sequential_container_run_all_tests}
+# use test_runner_container.container_detect_runtime
+# use test_runner_coverage.{setup_coverage, collect_coverage, print_coverage_summary, generate_coverage_reports, check_coverage_threshold, get_coverage_threshold, print_coverage_delta}
+# GROUP 4: Database & feature tracking
+# use test_db_compat.{TestDatabase, load_test_db_compat, micros_to_rfc3339}  # Using compatibility layer
+# use test_db_types.*
+# use std.database.feature.{FeatureDatabase, load_feature_database, create_feature_database, FeatureStatus}
+# GROUP 5: Doc generation & sdoctest
+# use doc_generator.generate_all_docs
+# use rust_test_runner.{run_rust_tests, RustTestResult}
+use std.test_runner.sdoctest.config.load_sdoctest_config
+use std.test_runner.sdoctest.runner.{run_sdoctest_mode, print_sdoctest_summary}
+# use sdoctest.types.{SdoctestRunResult, SdoctestFileResult, BlockStatus}
+# use doctest_runner.{run_spl_doctests_same_file, discover_spl_doctest_files}
+# use sdoctest.result_db.write_sdoctest_db
+# use sdoctest.doc_gen.generate_sdoctest_report
+# Change-detection cache for incremental test runs
+use app.test_incremental_state_shared.{IncrementalTestState, incremental_test_state_new, incremental_test_state_load}
+# GROUP 6: Self-protection imports
+use std.test_runner.checkpoint.{checkpoint_load, checkpoint_exists, checkpoint_skip_completed, checkpoint_save, checkpoint_delete}
+use std.test_runner.system_monitor.{system_exceeds_threshold, ensure_kill_monitor_running, is_linux}
+use std.test_runner.shutdown.{shutdown_graceful}
+# GROUP 7: Parallel execution imports
+use std.test_runner.test_runner_async.{run_tests_parallel_with_monitoring, get_cpu_count}
+# GROUP 7: Lifecycle imports
+# use app.test_runner_new.runner_lifecycle.{cleanup_all_children, lifecycle_enable_heartbeat, lifecycle_send_heartbeat}
+# GROUP 7b: QEMU test runner + classification
+use std.test_runner.test_classification.{separate_qemu_tests, classify_test_session, separate_session_tests}
+use std.test_runner.qemu_test_runner.{run_qemu_tests_all}
+# Session sharing: daemon client + broker
+use app.test_daemon.client.{test_daemon_ensure_running, test_submit_and_wait, test_daemon_status, test_daemon_stop}
+use app.test_daemon.types.{TestDaemonConfig, test_daemon_config_default, TestResult, TRESP_COMPLETED, TRESP_FAILED, TRESP_CACHED}
+use app.test_daemon.session_types.{TestSessionMeta, meta_needs_session, meta_to_session_key, session_kind_name}
+# GROUP 8: Signal handler imports (with fallback)
+# use app.io.signal_handlers.{install_signal_handlers, create_signal_cleanup_handler, signal_handlers_available}
+# use app.test_runner_new.process_tracker.{tracker_kill_all_children, tracker_stop_all_containers}
+# GROUP 9: Closure warnings
+# use compiler.core.closure_analysis.{closure_warnings_get, closure_warnings_has}
+# GROUP 9: Call graph warnings
+# use compiler.core.call_graph.{call_graph_warnings_get, call_graph_warnings_has}
+
+# =========================================================================
+# Runner
+# =========================================================================
+
+fn generate_spipe_docs_for_results(results: [TestFileResult], options: TestOptions):
+    if options.list or options.list_ignored:
+        return
+
+    var docgen_args: [text] = ["spipe-docgen"]
+    for result in results:
+        if result.cached or not result.is_ok():
+            continue
+        if not result.path.ends_with("_spec.spl"):
+            continue
+        if result.path.contains("/.spipe_matchers_") or result.path.contains("/.sspec_wrapped_entry_"):
+            continue
+        docgen_args.push(result.path)
+
+    if docgen_args.len() <= 1:
+        return
+
+    docgen_args.push("--output")
+    docgen_args.push("doc/06_spec")
+    docgen_args.push("--no-index")
+    val (stdout, stderr, code) = process_run("bin/simple", docgen_args)
+    val spec_count = docgen_args.len() - 4
+    if code == 0:
+        if options.verbose:
+            print "Generated SPipe manual docs for {spec_count} spec file(s)"
+    else:
+        print "Warning: spipe-docgen failed for {spec_count} spec file(s)"
+        if options.verbose:
+            print stderr
+
+fn run_tests(options: TestOptions) -> TestRunResult:
+    # CI mode override (config already loaded by main(), use options.ci_mode)
+    # Apply CI mode overrides
+    var updated_options = options
+    if options.ci_mode:
+        updated_options.run_all = true
+        updated_options.fail_fast = false
+        updated_options.verbose = true
+        print "CI mode enabled (via --ci flag)"
+        print ""
+
+    # MEMORY DEBUG: checkpoint disabled (GROUP 6)
+    # Load checkpoint if resuming
+    # var ckpt_loaded = false
+    var ckpt_passed = 0
+    var ckpt_failed = 0
+    var ckpt_skipped = 0
+
+    # Handle --manifest-status: show manifest info and exit
+    if updated_options.manifest_status:
+        val manifest = manifest_load(MANIFEST_PATH)
+        val fresh = manifest_is_fresh(manifest)
+        val fresh_str = if fresh: "fresh" else: "stale"
+        print "Manifest: {MANIFEST_PATH}"
+        print "  Status: {fresh_str}"
+        val manifest_entries = manifest.entries
+        val manifest_sdoctest = manifest.sdoctest_entries
+        print "  Entries: {manifest_entries.len()} test files"
+        print "  Sdoctest: {manifest_sdoctest.len()} files"
+        print "  Scan timestamp: {manifest.scan_timestamp}"
+        return TestRunResult(files: [], total_passed: 0, total_failed: 0, total_skipped: 0, total_pending: 0, total_timed_out: 0, total_duration_ms: 0, total_setup_ms: 0, total_cached: 0)
+
+    # Handle --refresh-manifest: force full rescan before running
+    if updated_options.refresh_manifest:
+        print "Refreshing test manifest..."
+        var scan_dirs: [text] = ["test/"]
+        if updated_options.path != "test/" and updated_options.path != "test":
+            scan_dirs = [updated_options.path]
+        val fresh_manifest = manifest_full_scan(scan_dirs)
+        manifest_save(fresh_manifest, MANIFEST_PATH)
+        val fresh_entries = fresh_manifest.entries
+        val fresh_sdoctest = fresh_manifest.sdoctest_entries
+        print "  Indexed {fresh_entries.len()} test files, {fresh_sdoctest.len()} sdoctest files"
+        print ""
+
+    # Session env setup starts here — this time is tracked separately
+    val session_setup_start = time_now_unix_micros()
+
+    val use_cache = not updated_options.no_cache
+    val all_files = discover_test_files_fast(updated_options.path, updated_options, use_cache)
+
+    # Validate # @cover annotations for system tests
+    if not updated_options.no_cover_check:
+        val missing_covers = validate_system_test_covers(all_files)
+        if missing_covers.len() > 0:
+            print ""
+            print "ERROR: System test(s) missing required # @cover annotation:"
+            for mc in missing_covers:
+                print "  {mc}"
+            print ""
+            print "Add at the top of each file:"
+            print "  # @cover src/path/to/component.spl 80%"
+            print ""
+            print "Bypass: --no-cover-check"
+            print "Found {missing_covers.len()} system test(s) without # @cover."
+            return TestRunResult(files: [], total_passed: 0, total_failed: missing_covers.len(), total_skipped: 0, total_pending: 0, total_timed_out: 0, total_duration_ms: 0, total_setup_ms: 0, total_cached: 0)
+
+    # MEMORY DEBUG: checkpoint filtering disabled (GROUP 6)
+    var files = all_files
+    # if options.resume and checkpoint_exists():
+    #     val ckpt = checkpoint_load()
+    #     ckpt_loaded = true
+    #     ckpt_passed = ckpt.total_passed
+    #     ckpt_failed = ckpt.total_failed
+    #     ckpt_skipped = ckpt.total_skipped
+    #     files = checkpoint_skip_completed(all_files, ckpt)
+    #     print "Resuming from checkpoint (reason: {ckpt.shutdown_reason})"
+    #     print "Previous progress: {ckpt_passed} passed, {ckpt_failed} failed, {ckpt_skipped} skipped"
+    #     print ""
+
+    if options.list:
+        print_discovery_summary(files, options)
+        return TestRunResult(files: [], total_passed: 0, total_failed: 0, total_skipped: 0, total_pending: 0, total_timed_out: 0, total_duration_ms: 0, total_setup_ms: 0, total_cached: 0)
+
+    if files.len() == 0:
+        print "No test files found in {options.path}"
+        return TestRunResult(files: [], total_passed: 0, total_failed: 0, total_skipped: 0, total_pending: 0, total_timed_out: 0, total_duration_ms: 0, total_setup_ms: 0, total_cached: 0)
+
+    # MEMORY DEBUG: coverage disabled (GROUP 3)
+    # if options.coverage:
+    #     setup_coverage()
+
+    # Propagate env vars
+    propagate_env_vars(options)
+
+    # MEMORY DEBUG: container mode disabled (GROUP 3)
+    # val exec_mode = options.execution_mode
+    # val is_container_seq1 = exec_mode == "container-seq"
+    # val is_container_seq2 = exec_mode == "container_seq"
+    # val is_container_seq3 = exec_mode == "container-sequential"
+    # val is_container_seq = is_container_seq1 or is_container_seq2 or is_container_seq3
+    # if is_container_seq or options.container_sequential:
+    #     return run_tests_sequential_containers(files, options)
+
+    # Session-daemon mode: route all tests through daemon (sequential path)
+    # CLI flags OR SDN config can enable session sharing
+    val config = load_test_config()
+    val session_enabled = updated_options.session_daemon or updated_options.session_share or config.session_share or config.session_daemon
+    val show_session_debug = updated_options.session_debug or config.session_debug
+    if session_enabled and not updated_options.parallel:
+        val daemon_config = _make_daemon_config(updated_options, config)
+        val daemon_ok = test_daemon_ensure_running(daemon_config)
+        if daemon_ok:
+            val (regular_files, session_files) = separate_session_tests(files)
+            if session_files.len() > 0:
+                # Build schedule for session tests
+                var session_metas: [TestSessionMeta] = []
+                for sf in session_files:
+                    session_metas.push(classify_test_session(sf))
+                val schedule = schedule_session_tests(session_metas)
+                if show_session_debug:
+                    print "  [session] {schedule_summary(schedule)}"
+                val ordered_session_files = schedule_session_file_paths(schedule)
+                if show_session_debug:
+                    print "  [session] Routing {ordered_session_files.len()} session test(s) through daemon (sequential)"
+                val daemon_results = run_tests_via_daemon(ordered_session_files, updated_options, daemon_config)
+                # Print and aggregate daemon results
+                var daemon_passed: i64 = 0
+                var daemon_failed: i64 = 0
+                for dr in daemon_results:
+                    print_result(dr, updated_options.format)
+                    daemon_passed = daemon_passed + dr.passed
+                    daemon_failed = daemon_failed + dr.failed
+                total_passed = total_passed + daemon_passed
+                total_failed = total_failed + daemon_failed
+                files = regular_files
+                if show_session_debug:
+                    print "  [session] Done: {daemon_passed} passed, {daemon_failed} failed"
+        else:
+            if show_session_debug:
+                print "  [session] Daemon unavailable, using direct execution"
+
+    # Sequential flag overrides parallel
+    if updated_options.sequential:
+        updated_options.parallel = false
+
+    # Parallel execution with resource governor
+    if updated_options.parallel:
+        if not is_linux():
+            print "WARNING: --parallel is experimental on non-Linux platforms. Attempting with graceful fallback."
+        return run_tests_parallel_mode(
+            files,
+            updated_options,
+            ckpt_passed: ckpt_passed,
+            ckpt_failed: ckpt_failed,
+            ckpt_skipped: ckpt_skipped
+        )
+
+    report_free_mem("BEFORE_TEST_LOOP")
+    val mode_name = mode_to_str(updated_options.mode)
+    var fork_label = ""
+    if updated_options.fork_mode:
+        fork_label = ", fork"
+    print "Running {files.len()} test file(s) [mode: {mode_name}{fork_label}]..."
+    if updated_options.seed_set:
+        print "Seed: {updated_options.seed}"
+    if updated_options.self_protect:
+        val free_cpu = 100.0 - updated_options.cpu_threshold
+        val free_mem = 100.0 - updated_options.mem_threshold
+        print "Self-protection enabled (stops when free CPU < {free_cpu}% AND free RAM < {free_mem}%)"
+    if updated_options.max_mem_gb > 0 and not updated_options.no_limits:
+        print "  Max memory per test: {updated_options.max_mem_gb}GB"
+
+    # Load change-detection cache (skip if --clean)
+    val cache_path = ".simple/test-result-cache.sdn"
+    var incremental_state = incremental_test_state_new(cache_path, "", false)
+    var use_result_cache = not updated_options.clean and not updated_options.no_cache and not updated_options.assert_ran
+    if use_result_cache:
+        incremental_state = incremental_test_state_load(cache_path, "", false)
+    else:
+        print "Change-detection cache bypassed (--clean)"
+
+    # Smart test ordering: sort longest-first to avoid tail blockers
+    if use_result_cache:
+        files = order_tests_by_duration(files, incremental_state.entries)
+
+    # Session env setup complete — record setup time
+    val session_setup_end = time_now_unix_micros()
+    val session_setup_ms = (session_setup_end - session_setup_start) / 1000
+    if session_setup_ms > 0:
+        print "Session setup: {session_setup_ms}ms"
+
+    print ""
+
+    var results: [TestFileResult] = []
+    var total_passed = ckpt_passed
+    var total_failed = ckpt_failed
+    var total_skipped = ckpt_skipped
+    var total_pending = 0
+    var total_timed_out = 0
+    var total_duration_ms = 0
+    var total_setup_ms = session_setup_ms
+    var total_cached = 0
+    var completed_files: [text] = []
+    var tests_run = 0
+
+    for file_path in files:
+        # Only check system thresholds every 20 tests (avoids 100ms CPU sleep per check)
+        if updated_options.self_protect and tests_run % 20 == 0:
+            val (violated, reason) = system_exceeds_threshold(updated_options.cpu_threshold, updated_options.mem_threshold)
+            if violated:
+                shutdown_graceful(reason, completed_files, total_passed, total_failed, total_skipped)
+
+        if updated_options.self_protect and tests_run % 50 == 0 and tests_run > 0:
+            checkpoint_save(completed_files, total_passed, total_failed, total_skipped, "periodic")
+
+        # Check change-detection cache before running.
+        # EXCEPTION: system specs (test/03_system/*) MUST actually execute their
+        # `it{}` bodies — they drive QEMU guests, capture framebuffers, and
+        # check serial markers. The change-detection cache would replay a
+        # silent PASSED (0ms) from an earlier interpreter-mode load, hiding
+        # real regressions. Route system specs through the real execution
+        # path instead. Mirrors the Rust seed `is_system_spec` bypass in
+        # src/compiler_rust/driver/src/cli/test_runner/runner.rs.
+        if use_result_cache and not file_path.contains("test/03_system/"):
+            val cached_entry = incremental_state.check_freshness(file_path)
+            if cached_entry.result_status != -1:
+                val cached_result = TestFileResult(
+                    path: file_path,
+                    passed: cached_entry.passed,
+                    failed: cached_entry.failed,
+                    skipped: cached_entry.result_skipped,
+                    pending: 0,
+                    duration_ms: cached_entry.result_duration_ms,
+                    setup_ms: 0,
+                    error: "",
+                    timed_out: false,
+                    cached: true
+                )
+                print_result(cached_result, updated_options.format)
+                total_passed = total_passed + cached_result.passed
+                total_failed = total_failed + cached_result.failed
+                total_skipped = total_skipped + cached_result.skipped
+                total_duration_ms = total_duration_ms + cached_result.duration_ms
+                total_cached = total_cached + 1
+                results.push(cached_result)
+                completed_files.push(file_path)
+                tests_run = tests_run + 1
+                continue
+
+        # Run test
+        val result = run_single_test(file_path, updated_options)
+        print_result(result, updated_options.format)
+
+        # Record result in cache (system specs skip the cache entirely so
+        # a stale interpreter-mode load never replays as a silent 0ms pass)
+        if use_result_cache and not file_path.contains("test/03_system/"):
+            incremental_state.record_runner_result(file_path, result.passed, result.failed, result.skipped, result.duration_ms)
+
+        total_passed = total_passed + result.passed
+        total_failed = total_failed + result.failed
+        total_skipped = total_skipped + result.skipped
+        total_pending = total_pending + result.pending
+        if result.timed_out:
+            total_timed_out = total_timed_out + 1
+        total_duration_ms = total_duration_ms + result.duration_ms
+        total_setup_ms = total_setup_ms + result.setup_ms
+        results.push(result)
+        completed_files.push(file_path)
+        tests_run = tests_run + 1
+
+        if updated_options.fail_fast and (result.failed > 0 or result.timed_out):
+            print ""
+            print "Stopping early (--fail-fast)"
+            break
+
+    # Save cache
+    if use_result_cache:
+        incremental_state.save()
+
+    if total_cached > 0:
+        print "Skipped {total_cached} unchanged test(s) (cached)"
+
+    generate_spipe_docs_for_results(results, updated_options)
+
+    # MEMORY DEBUG: checkpoint cleanup disabled (GROUP 6)
+    # if options.resume and checkpoint_exists():
+    #     checkpoint_delete()
+
+    TestRunResult(
+        files: results,
+        total_passed: total_passed,
+        total_failed: total_failed,
+        total_skipped: total_skipped,
+        total_pending: total_pending,
+        total_timed_out: total_timed_out,
+        total_duration_ms: total_duration_ms,
+        total_setup_ms: total_setup_ms,
+        total_cached: total_cached
+    )
+
+fn run_tests_parallel_mode(
+    files: [text],
+    options: TestOptions,
+    ckpt_passed: i64,
+    ckpt_failed: i64,
+    ckpt_skipped: i64
+) -> TestRunResult:
+    val parallel_setup_start = time_now_unix_micros()
+    val mode_name = mode_to_str(options.mode)
+
+    # Load change-detection cache (skip if --clean)
+    val cache_path = ".simple/test-result-cache.sdn"
+    var incremental_state = incremental_test_state_new(cache_path, "", false)
+    var use_result_cache = not options.clean and not options.no_cache and not options.assert_ran
+    if use_result_cache:
+        incremental_state = incremental_test_state_load(cache_path, "", false)
+    var cached_results: [TestFileResult] = []
+    var uncached_files: [text] = []
+
+    if use_result_cache:
+        for file_path in files:
+            # System specs (test/03_system/*) bypass the change-detection cache
+            # so they always go through real execution. See the sequential
+            # mode comment above for the rationale.
+            if file_path.contains("test/03_system/"):
+                uncached_files.push(file_path)
+                continue
+            val cached_entry = incremental_state.check_freshness(file_path)
+            if cached_entry.result_status != -1:
+                val cached_result = TestFileResult(
+                    path: file_path,
+                    passed: cached_entry.passed,
+                    failed: cached_entry.failed,
+                    skipped: cached_entry.result_skipped,
+                    pending: 0,
+                    duration_ms: cached_entry.result_duration_ms,
+                    setup_ms: 0,
+                    error: "",
+                    timed_out: false,
+                    cached: true
+                )
+                cached_results.push(cached_result)
+            else:
+                uncached_files.push(file_path)
+    else:
+        uncached_files = files
+
+    # Smart test ordering: sort longest-first to avoid tail blockers
+    if use_result_cache:
+        uncached_files = order_tests_by_duration(uncached_files, incremental_state.entries)
+
+    # Session-aware routing: if --session-daemon, route session tests through daemon
+    # CLI flags OR SDN config can enable session sharing
+    val par_config = load_test_config()
+    val par_session_enabled = options.session_daemon or options.session_share or par_config.session_share or par_config.session_daemon
+    val par_session_debug = options.session_debug or par_config.session_debug
+    var daemon_results: [TestFileResult] = []
+    var session_routed: i64 = 0
+    if par_session_enabled:
+        val daemon_config = _make_daemon_config(options, par_config)
+        val daemon_ok = test_daemon_ensure_running(daemon_config)
+        if daemon_ok:
+            val (regular_files, session_files) = separate_session_tests(uncached_files)
+            if session_files.len() > 0:
+                # Build schedule for optimal ordering
+                var session_metas: [TestSessionMeta] = []
+                for sf in session_files:
+                    session_metas.push(classify_test_session(sf))
+                val schedule = schedule_session_tests(session_metas)
+                val ordered_session_files = schedule_session_file_paths(schedule)
+                if par_session_debug:
+                    print "  [session] {schedule_summary(schedule)}"
+                    print "  [session] {ordered_session_files.len()} session-capable test(s) routed to daemon"
+                daemon_results = run_tests_via_daemon(ordered_session_files, options, daemon_config)
+                session_routed = ordered_session_files.len()
+            uncached_files = regular_files
+        else:
+            if par_session_debug:
+                print "  [session] Daemon unavailable, falling back to direct execution"
+
+    # Separate QEMU and normal tests from uncached files
+    val (normal_files, qemu_files) = separate_qemu_tests(uncached_files)
+
+    # Determine worker count
+    var max_workers = options.max_workers
+    if max_workers <= 0:
+        max_workers = get_cpu_count() * options.resource_limit_pct / 100
+        if max_workers < 1:
+            max_workers = 1
+        # Cap auto-detected worker count to prevent process explosion on
+        # high-core machines. Each worker spawns shell + simple binary (2
+        # processes), so 8 workers = up to 16 OS processes at peak.
+        # Use --max-workers=N to override explicitly.
+        if max_workers > 8:
+            max_workers = 8
+
+    val parallel_setup_end = time_now_unix_micros()
+    val parallel_setup_ms = (parallel_setup_end - parallel_setup_start) / 1000
+
+    val total_cached = cached_results.len()
+    print "Running {files.len()} test file(s) in parallel [mode: {mode_name}, workers: {max_workers}]"
+    if parallel_setup_ms > 0:
+        print "  Session setup: {parallel_setup_ms}ms"
+    if total_cached > 0:
+        print "  Cached: {total_cached}, to run: {uncached_files.len()}"
+    if session_routed > 0:
+        print "  Session-routed: {session_routed}"
+    if qemu_files.len() > 0:
+        print "  Normal tests: {normal_files.len()}, QEMU tests: {qemu_files.len()}"
+    print ""
+
+    # Print cached results first
+    for cached_r in cached_results:
+        print_result(cached_r, options.format)
+
+    # Run normal files via parallel runner with resource governor
+    val normal_results = run_tests_parallel_with_monitoring(normal_files, options, max_workers)
+
+    # Run QEMU files via session-sharing runner
+    val qemu_results = run_qemu_tests_all(qemu_files, options)
+
+    # Combine results
+    var total_passed = ckpt_passed
+    var total_failed = ckpt_failed
+    var total_skipped = ckpt_skipped
+    var total_pending = 0
+    var total_timed_out = 0
+    var total_duration_ms = 0
+    var all_results: [TestFileResult] = []
+
+    # Add cached results
+    for cached_r in cached_results:
+        total_passed = total_passed + cached_r.passed
+        total_failed = total_failed + cached_r.failed
+        total_skipped = total_skipped + cached_r.skipped
+        total_duration_ms = total_duration_ms + cached_r.duration_ms
+        all_results.push(cached_r)
+
+    for result in normal_results:
+        print_result(result, options.format)
+        total_passed = total_passed + result.passed
+        total_failed = total_failed + result.failed
+        total_skipped = total_skipped + result.skipped
+        total_pending = total_pending + result.pending
+        if result.timed_out:
+            total_timed_out = total_timed_out + 1
+        total_duration_ms = total_duration_ms + result.duration_ms
+        all_results.push(result)
+
+        # Record result in cache (system specs skip caching — see sequential mode)
+        if use_result_cache and not result.path.contains("test/03_system/"):
+            incremental_state.record_runner_result(result.path, result.passed, result.failed, result.skipped, result.duration_ms)
+
+    for result in qemu_results:
+        total_passed = total_passed + result.passed
+        total_failed = total_failed + result.failed
+        total_skipped = total_skipped + result.skipped
+        total_pending = total_pending + result.pending
+        if result.timed_out:
+            total_timed_out = total_timed_out + 1
+        total_duration_ms = total_duration_ms + result.duration_ms
+        all_results.push(result)
+
+    # Add daemon session results
+    for result in daemon_results:
+        print_result(result, options.format)
+        total_passed = total_passed + result.passed
+        total_failed = total_failed + result.failed
+        total_skipped = total_skipped + result.skipped
+        total_pending = total_pending + result.pending
+        if result.timed_out:
+            total_timed_out = total_timed_out + 1
+        total_duration_ms = total_duration_ms + result.duration_ms
+        all_results.push(result)
+
+        if use_result_cache and not result.path.contains("test/03_system/"):
+            incremental_state.record_runner_result(result.path, result.passed, result.failed, result.skipped, result.duration_ms)
+
+    # Save cache
+    if use_result_cache:
+        incremental_state.save()
+
+    if total_cached > 0:
+        print "Skipped {total_cached} unchanged test(s) (cached)"
+
+    generate_spipe_docs_for_results(all_results, options)
+
+    TestRunResult(
+        files: all_results,
+        total_passed: total_passed,
+        total_failed: total_failed,
+        total_skipped: total_skipped,
+        total_pending: total_pending,
+        total_timed_out: total_timed_out,
+        total_duration_ms: total_duration_ms,
+        total_setup_ms: parallel_setup_ms,
+        total_cached: total_cached
+    )
+
+fn run_single_test(file_path: text, options: TestOptions) -> TestFileResult:
+    if is_skip_marker_file(file_path):
+        val skipped = count_skip_marker_cases(file_path)
+        return TestFileResult(path: file_path, passed: 0, failed: 0, skipped: skipped, pending: 0, duration_ms: 0, setup_ms: 0, error: "", timed_out: false, cached: false)
+
+    # Set runtime mode env var so skip_it/skip_on_interpreter can detect mode
+    val mode_str = mode_to_str(options.mode)
+    env_set("SIMPLE_RUNTIME_MODE", mode_str)
+    if options.assert_ran:
+        env_set("SIMPLE_TEST_ASSERT_RAN", "1")
+    else:
+        env_set("SIMPLE_TEST_ASSERT_RAN", "0")
+
+    # DI system test lock: block DI modifications in system tests unless @di_test
+    val is_system = file_path.contains("/system/") or file_path.contains("/feature/")
+    if is_system:
+        env_set("SIMPLE_SYSTEM_TEST", "1")
+    else:
+        env_set("SIMPLE_SYSTEM_TEST", "0")
+    if is_system and file_has_di_test_tag(file_path):
+        env_set("SIMPLE_DI_TEST", "1")
+    else:
+        env_set("SIMPLE_DI_TEST", "0")
+
+    # Override timeout for advanced testing modes
+    var effective_options = options
+    if options.fuzz_mode:
+        val fuzz_timeout = options.fuzz_time_secs + 30
+        if fuzz_timeout > effective_options.timeout:
+            effective_options.timeout = fuzz_timeout
+    if options.chaos_mode:
+        var chaos_timeout = options.chaos_trials * 2
+        if chaos_timeout < 300:
+            chaos_timeout = 300
+        if chaos_timeout > effective_options.timeout:
+            effective_options.timeout = chaos_timeout
+
+    # G1: Use safe mode with resource limits when enabled
+    if effective_options.safe_mode:
+        return run_test_file_safe_mode(file_path, effective_options)
+    match effective_options.mode:
+        case TestExecutionMode.Interpreter:
+            run_test_file_interpreter(file_path, effective_options)
+        case TestExecutionMode.Smf:
+            run_test_file_smf(file_path, effective_options)
+        case TestExecutionMode.Native:
+            run_test_file_native(file_path, effective_options)
+        case TestExecutionMode.Compile:
+            run_test_file_compile(file_path, effective_options)
+        case TestExecutionMode.Composite(spec):
+            run_test_file_composite(file_path, effective_options, spec)
+
+# =========================================================================
+# Session Config Propagation
+# =========================================================================
+
+fn _make_daemon_config(options: TestOptions, config: TestConfig) -> TestDaemonConfig:
+    """
+    Builds a TestDaemonConfig merging SDN config and CLI overrides.
+    CLI flags take precedence over SDN settings.
+    """
+    var dc = test_daemon_config_default()
+    # Apply SDN config
+    dc.session_share = config.session_share
+    dc.session_daemon = config.session_daemon
+    dc.session_idle_timeout_ms = config.session_idle_timeout_ms
+    dc.session_startup_timeout_ms = config.session_startup_timeout_ms
+    # CLI overrides SDN
+    if options.session_share:
+        dc.session_share = true
+    if options.session_daemon:
+        dc.session_daemon = true
+        dc.session_share = true
+    if options.max_sessions > 0:
+        dc.max_qemu_sessions = options.max_sessions
+    dc
+
+# =========================================================================
+# Session-Aware Daemon Execution
+# =========================================================================
+
+fn run_tests_via_daemon(
+    files: [text],
+    options: TestOptions,
+    daemon_config: TestDaemonConfig
+) -> [TestFileResult]:
+    """
+    Runs tests through the test daemon, which manages session sharing.
+    Falls back to direct execution if daemon is unavailable.
+    """
+    var results: [TestFileResult] = []
+    val clean = options.clean
+
+    if options.session_debug:
+        print "  [session] Routing {files.len()} test(s) through daemon"
+
+    for file_path in files:
+        val start_time = time_now_unix_micros()
+
+        # Submit to daemon and wait for result
+        val daemon_result = test_submit_and_wait(file_path, daemon_config, clean, options.timeout * 1000)
+
+        if daemon_result.status == TRESP_COMPLETED or daemon_result.status == TRESP_FAILED or daemon_result.status == TRESP_CACHED:
+            val duration_ms = (time_now_unix_micros() - start_time) / 1000
+            val result = TestFileResult(
+                path: file_path,
+                passed: daemon_result.passed,
+                failed: daemon_result.failed,
+                skipped: daemon_result.skipped,
+                pending: 0,
+                duration_ms: if daemon_result.duration_ms > 0: daemon_result.duration_ms else: duration_ms,
+                setup_ms: 0,
+                error: if daemon_result.status == TRESP_FAILED: daemon_result.output else: "",
+                timed_out: false,
+                cached: daemon_result.cached
+            )
+            results.push(result)
+
+            if options.session_debug:
+                val cached_str = if daemon_result.cached: " (cached)" else: ""
+                print "  [session] {file_path}: {daemon_result.passed}p {daemon_result.failed}f{cached_str}"
+        else:
+            # Daemon returned unexpected status — fall back to direct execution
+            if options.session_debug:
+                print "  [session] Fallback to direct execution for {file_path}"
+            val fallback_result = run_single_test(file_path, options)
+            results.push(fallback_result)
+
+        if options.fail_fast:
+            val last = results[results.len() - 1]
+            if last.failed > 0 or last.timed_out:
+                break
+
+    results
+
+# =========================================================================
+# Main Entry Point
+# =========================================================================
+
+fn main() -> i64:
+    print "[DBG] main start"
+    report_free_mem("START")
+    print "[DBG] after report_free_mem"
+    # Start resource safeguard (kills runaway simple processes when CPU+MEM exhausted)
+    ensure_kill_monitor_running()
+    print "[DBG] after ensure_kill_monitor"
+    val all_args = get_cli_args()
+    print "[DBG] after get_cli_args"
+    var args: [text] = []
+    var skip_first = all_args.len() > 0 and all_args[0] == "test"
+    var i = 0
+    if skip_first:
+        i = 1
+    while i < all_args.len():
+        args.push(all_args[i])
+        i = i + 1
+
+    val options = parse_test_args(args)
+    report_free_mem("AFTER_PARSE_ARGS")
+
+    # Set recursion guard so child processes use Rust runner
+    env_set("SIMPLE_TEST_RUNNER_RUST", "1")
+
+    # Handle run management commands (status/stop/etc.)
+    if has_run_management_flag(args):
+        return handle_run_management(args)
+
+    # Load test configuration to determine what to run
+    val config = load_test_config()
+    var run_spec = config.run_spec_tests
+    var run_sdoc = config.run_sdoctests
+
+    if not run_spec and not run_sdoc:
+        print "Error: No test types enabled. Check config/simple.test.sdn configuration."
+        print "  run_spec_tests: {config.run_spec_tests}"
+        print "  run_sdoctests: {config.run_sdoctests}"
+        return 1
+
+    if options.sdoctest:
+        run_sdoc = true
+
+    propagate_env_vars(options)
+
+    var exit_code = 0
+
+    # Run spec tests with self-protection enabled in run_tests()
+    if run_spec:
+        print "Simple Test Runner v0.8.1"
+        print ""
+
+        val result = run_tests(options)
+
+        val result_files = result.files
+        report_free_mem("AFTER_RUN_{result_files.len()}_files")
+        print_summary(result, options.format)
+
+        if not result.is_ok():
+            exit_code = 1
+
+    if run_sdoc:
+        val sdoctest_config = load_sdoctest_config("config/sdoctest.sdn")
+        val sdoctest_result = run_sdoctest_mode(options, sdoctest_config)
+        print_sdoctest_summary(sdoctest_result)
+        if not sdoctest_result.is_ok():
+            exit_code = 1
+
+    exit_code
+
+# =========================================================================
+# Exports
+# =========================================================================
+
+# Functions defined in this file

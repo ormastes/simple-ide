@@ -1,0 +1,256 @@
+# Trace32 Debug Adapter
+# Wraps Trace32Client to implement the DebugAdapter trait
+# Provides unified interface for Trace32-based debugging (Lauterbach hardware probes)
+
+use std.nogc_async_mut.debug.coordinator.{VarInfo, FrameInfo, LocationInfo}
+use std.nogc_sync_mut.dap.adapter.mod.{DebugAdapter, AdapterCapabilities, AdapterConfig}
+use std.nogc_sync_mut.debug.remote.protocol.trace32.Trace32Client
+use std.nogc_sync_mut.debug.remote.types.DebugConfig
+use std.common.types.{DurationMs}
+
+# Trace32 adapter implementing DebugAdapter trait
+class Trace32Adapter:
+    client: Option<Trace32Client>
+    config: AdapterConfig
+    attached: bool
+    capabilities: AdapterCapabilities
+
+impl Trace32Adapter:
+    # Create adapter from config
+    static fn connect(config: AdapterConfig) -> Result<Trace32Adapter, text>:
+        val debug_config = DebugConfig(
+            host: config.host,
+            port: config.port,
+            target: Architecture.Arm32,
+            program: config.program,
+            options: {"backend": "trace32"}
+        )
+
+        val client = Trace32Client.connect(debug_config)?
+
+        Ok(Trace32Adapter(
+            client: Some(client),
+            config: config,
+            attached: true,
+            capabilities: AdapterCapabilities.basic()
+                .with_reset()
+                .with_memory()
+                .with_registers()
+        ))
+
+    # Create adapter wrapping existing Trace32Client
+    static fn from_client(client: Trace32Client, config: AdapterConfig) -> Trace32Adapter:
+        Trace32Adapter(
+            client: Some(client),
+            config: config,
+            attached: true,
+            capabilities: AdapterCapabilities.basic()
+                .with_reset()
+                .with_memory()
+                .with_registers()
+        )
+
+    # Get capabilities
+    fn get_capabilities() -> AdapterCapabilities:
+        self.capabilities
+
+    # --- DebugAdapter trait implementation ---
+
+    fn name() -> text:
+        "trace32"
+
+    fn is_attached() -> bool:
+        self.attached
+
+    fn attach(program: text, args: [text]) -> Result<text, text>:
+        match self.client:
+            Some(client):
+                if program.len() > 0:
+                    client.flash_program(program)?
+                self.attached = true
+                Ok("attached via Trace32")
+            nil:
+                Err("Trace32 client not connected")
+
+    fn detach() -> Result<text, text>:
+        match self.client:
+            Some(client):
+                client.disconnect()
+                self.attached = false
+                Ok("detached from Trace32")
+            nil:
+                Err("Trace32 client not connected")
+
+    # --- Execution Control ---
+
+    fn halt() -> Result<text, text>:
+        match self.client:
+            Some(client): client.halt()
+            nil: Err("Trace32 client not connected")
+
+    fn resume() -> Result<text, text>:
+        match self.client:
+            Some(client): client.resume()
+            nil: Err("Trace32 client not connected")
+
+    fn single_step() -> Result<text, text>:
+        match self.client:
+            Some(client): client.single_step()
+            nil: Err("Trace32 client not connected")
+
+    fn step_over() -> Result<text, text>:
+        match self.client:
+            Some(client): client.step_over()
+            nil: Err("Trace32 client not connected")
+
+    fn step_out() -> Result<text, text>:
+        match self.client:
+            Some(client): client.step_out()
+            nil: Err("Trace32 client not connected")
+
+    fn reverse_step() -> Result<text, text>:
+        Err("reverse step not supported by this adapter")
+
+    fn reverse_continue() -> Result<text, text>:
+        Err("reverse continue not supported by this adapter")
+
+    fn reset() -> Result<text, text>:
+        match self.client:
+            Some(client): client.system_reset()
+            nil: Err("Trace32 client not connected")
+
+    # --- Breakpoints ---
+
+    fn set_breakpoint(file: text, line: i32) -> Result<i32, text>:
+        match self.client:
+            Some(client):
+                val location = "{file}\\{line}"
+                client.set_breakpoint(location)
+            nil:
+                Err("Trace32 client not connected")
+
+    fn set_breakpoint_at_addr(addr: i64) -> Result<i32, text>:
+        match self.client:
+            Some(client): client.set_breakpoint_at_addr(addr)
+            nil: Err("Trace32 client not connected")
+
+    fn delete_breakpoint(id: i32) -> Result<text, text>:
+        match self.client:
+            Some(client): client.delete_breakpoint(id)
+            nil: Err("Trace32 client not connected")
+
+    fn set_watchpoint(expr: text, access: text) -> Result<i32, text>:
+        match self.client:
+            Some(client): client.set_watchpoint(expr, access)
+            nil: Err("Trace32 client not connected")
+
+    # --- Variable Inspection (returns same VarInfo as GDB) ---
+
+    fn read_locals() -> Result<[VarInfo], text>:
+        match self.client:
+            Some(client): client.read_locals()
+            nil: Err("Trace32 client not connected")
+
+    fn read_arguments() -> Result<[VarInfo], text>:
+        match self.client:
+            Some(client): client.read_arguments()
+            nil: Err("Trace32 client not connected")
+
+    fn read_globals() -> Result<[VarInfo], text>:
+        match self.client:
+            Some(client): client.read_globals()
+            nil: Err("Trace32 client not connected")
+
+    fn evaluate(expr: text) -> Result<text, text>:
+        match self.client:
+            Some(client): client.evaluate(expr)
+            nil: Err("Trace32 client not connected")
+
+    # --- Stack Inspection (returns same FrameInfo as GDB) ---
+
+    fn stack_trace() -> Result<[FrameInfo], text>:
+        match self.client:
+            Some(client): client.stack_trace()
+            nil: Err("Trace32 client not connected")
+
+    fn stack_depth() -> Result<i32, text>:
+        match self.client:
+            Some(client): client.stack_depth()
+            nil: Err("Trace32 client not connected")
+
+    fn select_frame(level: i32) -> Result<text, text>:
+        match self.client:
+            Some(client): client.select_frame(level)
+            nil: Err("Trace32 client not connected")
+
+    fn current_location() -> Result<LocationInfo, text>:
+        match self.client:
+            Some(client): client.current_location()
+            nil: Err("Trace32 client not connected")
+
+    # --- Memory Access (returns same [i32] as GDB) ---
+
+    fn read_memory(addr: i64, size: i32) -> Result<[i32], text>:
+        match self.client:
+            Some(client): client.read_memory(addr, size)
+            nil: Err("Trace32 client not connected")
+
+    fn write_memory(addr: i64, data: [i32]) -> Result<text, text>:
+        match self.client:
+            Some(client): client.write_memory(addr, data)
+            nil: Err("Trace32 client not connected")
+
+    # --- Register Access (returns same types as GDB) ---
+
+    fn read_register(name: text) -> Result<i64, text>:
+        match self.client:
+            Some(client): client.read_register(name)
+            nil: Err("Trace32 client not connected")
+
+    fn read_all_registers() -> Result<Dict<text, i64>, text>:
+        match self.client:
+            Some(client): client.read_all_registers()
+            nil: Err("Trace32 client not connected")
+
+    fn write_register(name: text, value: i64) -> Result<text, text>:
+        match self.client:
+            Some(client): client.write_register(name, value)
+            nil: Err("Trace32 client not connected")
+
+    # --- Context Management ---
+
+    fn clear_context() -> Result<text, text>:
+        # Hardware target - no interpreter context to clear
+        Ok("context clearing not supported (hardware target)")
+
+    fn reload_program(program: text) -> Result<text, text>:
+        match self.client:
+            Some(client):
+                client.flash_program(program)?
+                client.system_reset()?
+                Ok("program reloaded via Trace32")
+            nil:
+                Err("Trace32 client not connected")
+
+    # Rich breakpoint — delegates to basic set_breakpoint
+    fn set_breakpoint_rich(file: text, line: i32, condition: Option<text>,
+                           hit_condition: Option<text>, log_message: Option<text>) -> Result<i32, text>:
+        self.set_breakpoint(file, line)
+
+    fn list_children(var_ref: text) -> Result<[VarInfo], text>:
+        Err("nested variable expansion not supported")
+
+    fn capabilities() -> AdapterCapabilities:
+        self.capabilities
+
+    # --- Trace32-Unique Operations ---
+
+    fn trace_capture(duration_ms: i32) -> Result<text, text>:
+        match self.client:
+            Some(client): client.trace_capture(DurationMs(value: duration_ms))
+            nil: Err("Trace32 client not connected")
+
+    fn coverage_collect(module: text) -> Result<text, text>:
+        match self.client:
+            Some(client): client.coverage_collect(module)
+            nil: Err("Trace32 client not connected")

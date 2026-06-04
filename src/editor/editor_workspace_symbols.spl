@@ -1,0 +1,63 @@
+# Editor Workspace Symbols
+#
+# Workspace symbol indexing for goto-symbol functionality.
+
+use std.editor.view.lsp_result_panel.*
+use std.editor.core.path_text.*
+
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_dir_walk(path: text) -> [text]
+
+fn _editor_workspace_symbol_index(root: text) -> [LspResultRow]:
+    var rows: [LspResultRow] = []
+    val files = rt_dir_walk(root)
+    for file in files:
+        if not file.ends_with(".spl"):
+            continue
+        val content = rt_file_read_text(file) ?? ""
+        val lines = content.split("\n")
+        var line_idx = 0
+        for line in lines:
+            val name = _editor_workspace_symbol_name(line)
+            if name != "":
+                rows.push(LspResultRow(icon: "symbol", label: name, detail: file + ":" + (line_idx + 1).to_text(), path: file, line: line_idx, col: _editor_workspace_symbol_col(line, name), command_name: "", command_payload: "", depth: 0, expanded: false))
+                if rows.len() >= 500:
+                    return rows
+            line_idx = line_idx + 1
+    rows
+
+fn _editor_workspace_symbol_name(line: text) -> text:
+    var trimmed = line.trim()
+    if trimmed.starts_with("pub "):
+        trimmed = trimmed.slice(4, trimmed.len()).trim()
+    elif trimmed.starts_with("pri "):
+        trimmed = trimmed.slice(4, trimmed.len()).trim()
+    elif trimmed.starts_with("pub("):
+        val close_idx = editor_find_text(trimmed, ")")
+        if close_idx >= 0 and close_idx + 1 < trimmed.len():
+            trimmed = trimmed.slice(close_idx + 1, trimmed.len()).trim()
+    val kinds = ["fn", "me", "class", "struct", "enum", "trait", "val", "var"]
+    for kind in kinds:
+        val prefix = kind + " "
+        if trimmed.starts_with(prefix):
+            return _editor_workspace_symbol_name_after(trimmed.slice(prefix.len(), trimmed.len()).trim())
+    ""
+
+fn _editor_workspace_symbol_name_after(rest: text) -> text:
+    var name = ""
+    var i = 0
+    while i < rest.len():
+        val ch = rest.char_at(i)
+        if ch == "(" or ch == ":" or ch == " " or ch == "\t" or ch == "=":
+            return name
+        name = name + ch
+        i = i + 1
+    name
+
+fn _editor_workspace_symbol_col(line: text, name: text) -> i64:
+    if name == "":
+        return 0
+    val idx = editor_find_text(line, name)
+    if idx < 0:
+        return 0
+    idx

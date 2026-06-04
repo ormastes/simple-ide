@@ -1,0 +1,404 @@
+# Editor TUI Shell
+#
+# Terminal UI shell for the editor. Uses EditorController for shared logic.
+# Layout: [tab bar] [file tree | editor] [status bar] [command line]
+
+use std.tui.terminal.*
+use std.tui.style.*
+use std.editor.buffer.buffer.*
+use std.editor.core.session.*
+use std.editor.core.document.*
+use std.editor.core.path_text.*
+use std.editor.common.types.*
+use std.editor.common.config.*
+use std.editor.view.layout.*
+use std.editor.view.split_tree.*
+use std.editor.view.dock_zone.*
+use std.editor.view.markdown_state.*
+use std.editor.view.lsp_popup.*
+use std.editor.services.diagnostics.*
+use std.editor.extensions.builtin.md_edit_assist.*
+use std.editor.view.diagnostics_panel.*
+use std.editor.view.lsp_result_panel.*
+use std.editor.view.wiki_panel.*
+use app.editor.editor_controller.*
+use app.editor.editor_controller_types.*
+use app.editor.tui_shell_panels.*
+
+extern fn stdin_read_char() -> text
+extern fn rt_string_len(value: text) -> i64
+
+fn editor_tui_run(session: EditSession):
+    terminal_enter_alt_screen()
+    terminal_enter_raw_mode()
+    terminal_hide_cursor()
+
+    var ctrl = EditorController.new(session)
+
+    while ctrl.is_running():
+        val size = terminal_get_size()
+        val zones = ctrl_compute_zones(ctrl, size.cols, size.rows)
+        val buffer = ctrl.active_buffer()
+        if buffer != nil:
+            buffer.viewport.width = zones.editor_w
+            buffer.viewport.height = zones.editor_h
+            buffer.ensure_cursor_visible()
+
+        ctrl._refresh_lsp_results()
+        ctrl._poll_file_watcher()
+        ctrl._poll_inlay_hint_refresh_after(100)
+        ctrl._poll_debug_dap_client()
+        _tui_render_frame(ctrl, zones, size)
+        terminal_flush()
+
+        val key = stdin_read_char()
+        val rects = editor_layout_compute_rects(ctrl.session.layout, zones.editor_x, zones.editor_y, zones.editor_w, zones.editor_h)
+        val action = ctrl.handle_key(key, rects)
+
+    terminal_show_cursor()
+    terminal_exit_raw_mode()
+    terminal_exit_alt_screen()
+
+
+fn _tui_render_frame(ctrl: EditorController, zones: LayoutZones, size: TerminalSize):
+    terminal_clear_screen()
+    val line_num_width = 4
+    val buffer = ctrl.active_buffer()
+    val multi_pane = ctrl.session.layout.tree.leaf_count() > 1
+
+    _tui_render_tab_bar(ctrl.session, size.cols)
+
+    if ctrl.settings_view != nil:
+        _tui_render_settings(ctrl, zones)
+        _tui_render_status_bar(ctrl, zones, size.cols)
+        _tui_render_command_line(ctrl, zones)
+        terminal_show_cursor()
+        return
+
+    if ctrl.file_tree_visible:
+        val ft_focused = ctrl.focus_panel == "file_tree"
+        _tui_render_file_tree(ctrl.file_tree, zones.sidebar_y, zones.sidebar_h, zones.sidebar_w, ft_focused)
+
+    if multi_pane:
+        val rects = editor_layout_compute_rects(ctrl.session.layout, zones.editor_x, zones.editor_y, zones.editor_w, zones.editor_h)
+        var ri = 0
+        while ri < rects.len():
+            val rect = rects[ri]
+            val gidx = _layout_find_group_index_local(ctrl.session.layout.groups, rect.group_id)
+            if gidx >= 0:
+                val grp = ctrl.session.layout.groups[gidx]
+                val is_active = rect.group_id == ctrl.session.layout.active_group_id
+                _tui_render_pane_tabs(grp, rect, is_active)
+                val pane_buf = _group_active_buffer(ctrl.session, gidx)
+                val pane_path = _group_active_path(ctrl.session, gidx)
+                val pane_diags = ctrl.diagnostic_store.diagnostics_for(pane_path)
+                val content_y = rect.y + 1
+                val content_h = rect.h - 1
+                _tui_render_pane_content(pane_buf, rect.x, content_y, rect.w, content_h, line_num_width, pane_path, pane_diags, "dark")
+            ri = ri + 1
+        _tui_render_split_borders(ctrl.session.layout.tree, rects, ctrl.session.layout.active_group_id, zones.editor_x, zones.editor_y, zones.editor_w, zones.editor_h)
+    else:
+        val active_doc = ctrl.session.active_document()
+        var render_buffer: EditorBuffer = nil
+        var active_path = ""
+        var active_diags: [EditorDiagnostic] = []
+        if active_doc != nil and buffer != nil:
+            render_buffer = buffer
+            active_path = active_doc.path()
+            active_diags = ctrl.diagnostic_store.diagnostics_for(active_path)
+        _tui_render_single_pane(render_buffer, zones.editor_x, zones.editor_y, zones.editor_w, zones.editor_h, line_num_width, active_path, active_diags, "dark")
+
+    if ctrl.session.dock_layout.right_visible:
+        val rz = ctrl_right_zone(ctrl, zones)
+        if ctrl.session.dock_layout.active_right == "wiki-panel":
+            _tui_render_wiki_panel(ctrl.wiki_panel, rz.x, zones.editor_y, rz.w, zones.editor_h)
+        elif ctrl.session.dock_layout.active_right == "lsp-panel":
+            _tui_render_lsp_result_panel(ctrl.lsp_result_panel, rz.x, zones.editor_y, rz.w, zones.editor_h)
+        elif ctrl.session.dock_layout.active_right == "problems":
+            _tui_render_diagnostics_panel(ctrl.diagnostics_panel, rz.x, zones.editor_y, rz.w, zones.editor_h)
+
+    if ctrl.palette_state != nil:
+        val palette_state: PaletteState = ctrl.palette_state
+        val palette_visible: bool = palette_state.visible
+        if palette_visible:
+            _tui_render_palette(palette_state, zones, size.cols)
+    _tui_render_lsp_popups(ctrl, zones)
+    _tui_render_status_bar(ctrl, zones, size.cols)
+    _tui_render_command_line(ctrl, zones)
+    _tui_render_cursor(ctrl, buffer, zones, line_num_width)
+
+
+fn _tui_render_single_pane(buffer: EditorBuffer, x: i64, y: i64, w: i64, h: i64, line_num_width: i64, path: text, diagnostics: [EditorDiagnostic], theme: text):
+    var row = 0
+    while row < h:
+        val screen_row = y + row
+        terminal_move_cursor(screen_row, x)
+        if buffer != nil:
+            val file_row: i64 = buffer.visible_line_at(row)
+            if file_row >= 0 and file_row < buffer.line_count():
+                val num_str: text = str(file_row + 1)
+                var padding = ""
+                var p = 0
+                while p < line_num_width - num_str.len():
+                    padding = padding + " "
+                    p = p + 1
+                val gutter = diagnostics_gutter_icon(diagnostics, path, file_row)
+                terminal_write(padding + num_str + gutter + " ")
+                val line: text = buffer.line_with_fold_marker(file_row)
+                val visible_start: i64 = buffer.viewport.left_col
+                val visible_end: i64 = visible_start + w - line_num_width - 2
+                if visible_start < line.len():
+                    val end_idx: i64 = if visible_end < line.len() then visible_end else: line.len()
+                    val visible_line: text = line.slice(visible_start, end_idx)
+                    terminal_write(tui_render_editor_line_at_theme(buffer, file_row, visible_line, visible_start, theme, path))
+            else:
+                terminal_write("~")
+        else:
+            if row == h / 2:
+                terminal_write("  No file open. Press :e <path> to open a file.")
+            else:
+                terminal_write("~")
+        row = row + 1
+
+
+fn _tui_render_status_bar(ctrl: EditorController, zones: LayoutZones, width: i64):
+    terminal_move_cursor(zones.status_y, 0)
+    val buffer = ctrl.active_buffer()
+    val mode_str = editor_mode_name(ctrl.session.mode)
+    var path_str = "[No Name]"
+    var dirty_str = ""
+    var pos_str = "0,0"
+    if buffer != nil:
+        val bp = buffer.path
+        path_str = if bp != "" then bp else: "[No Name]"
+        dirty_str = if buffer.dirty then " [+]" else: ""
+        val cr = buffer.cursor_row + 1
+        val cc = buffer.cursor_col + 1
+        pos_str = "{cr},{cc}"
+    val doc_count: i64 = ctrl.session.document_count()
+    val left_status = " {mode_str} | {path_str}{dirty_str} | {doc_count} files"
+    var right_status = "{pos_str} "
+    val doc_sb = ctrl.session.active_document()
+    if doc_sb != nil and doc_sb.language_id == "markdown":
+        val stats_text = md_stats_to_status_bar(doc_sb.cached_md_stats)
+        right_status = stats_text + " | " + right_status
+    var fill = ""
+    var f = 0
+    val fill_len = width - left_status.len() - right_status.len()
+    while f < fill_len:
+        fill = fill + " "
+        f = f + 1
+    if fill_len < 0:
+        terminal_write("\x1b[7m" + left_status + " " + right_status + "\x1b[0m")
+    else:
+        terminal_write("\x1b[7m" + left_status + fill + right_status + "\x1b[0m")
+
+
+fn tui_render_line_with_semantic_tokens(buffer: EditorBuffer, row: i64, line: text) -> text:
+    tui_render_line_with_semantic_tokens_at_theme(buffer, row, line, 0, "dark")
+
+
+fn tui_render_line_with_semantic_tokens_at(buffer: EditorBuffer, row: i64, line: text, source_col_offset: i64) -> text:
+    tui_render_line_with_semantic_tokens_at_theme(buffer, row, line, source_col_offset, "dark")
+
+
+fn tui_render_line_with_semantic_tokens_theme(buffer: EditorBuffer, row: i64, line: text, theme: text) -> text:
+    tui_render_line_with_semantic_tokens_at_theme(buffer, row, line, 0, theme)
+
+
+fn tui_render_line_with_semantic_tokens_at_theme(buffer: EditorBuffer, row: i64, line: text, source_col_offset: i64, theme: text) -> text:
+    if buffer != nil and buffer.line_has_selection(row):
+        return tui_render_line_with_selection(buffer, row, line, source_col_offset)
+    if buffer == nil or buffer.semantic_tokens.len() == 0:
+        return line
+    var out = ""
+    var col = 0
+    var active_type = -1
+    var open_style = false
+    while col < line.len():
+        val token_type = buffer.semantic_token_type_at(row, source_col_offset + col)
+        if token_type != active_type:
+            if open_style:
+                out = out + "\x1b[0m"
+                open_style = false
+            if token_type >= 0:
+                out = out + _tui_semantic_token_style(token_type, theme)
+                open_style = true
+            active_type = token_type
+        out = out + line.char_at(col)
+        col = col + 1
+    if open_style:
+        out = out + "\x1b[0m"
+    out
+
+fn tui_render_editor_line_at_theme(buffer: EditorBuffer, row: i64, line: text, source_col_offset: i64, theme: text, path: text) -> text:
+    if editor_is_markdown_path(path) and buffer != nil and row == buffer.cursor_row:
+        val table_line = buffer.line_at(row)
+        if md_table_is_row(table_line) and not md_table_is_separator_row(table_line):
+            return tui_render_markdown_table_focus_line(buffer, row, line, source_col_offset)
+    tui_render_line_with_semantic_tokens_at_theme(buffer, row, line, source_col_offset, theme)
+
+fn tui_render_markdown_table_focus_line(buffer: EditorBuffer, row: i64, line: text, source_col_offset: i64) -> text:
+    val table_line = buffer.line_at(row)
+    val active_col = md_table_column_at(table_line, buffer.cursor_col)
+    val starts = md_table_cell_start_columns(table_line)
+    if active_col < 0 or active_col >= starts.len():
+        return line
+    val cell_start = starts[active_col]
+    var cell_end = cell_start
+    while cell_end < table_line.len() and table_line.char_at(cell_end) != "|":
+        cell_end = cell_end + 1
+    while cell_end > cell_start and table_line.char_at(cell_end - 1) == " ":
+        cell_end = cell_end - 1
+    var out = ""
+    var highlighted = false
+    var i = 0
+    while i < line.len():
+        val source_col = source_col_offset + i
+        val in_cell = source_col >= cell_start and source_col < cell_end
+        if in_cell and not highlighted:
+            out = out + "\x1b[7m"
+            highlighted = true
+        elif highlighted and not in_cell:
+            out = out + "\x1b[0m"
+            highlighted = false
+        out = out + line.char_at(i)
+        i = i + 1
+    if highlighted:
+        out = out + "\x1b[0m"
+    out
+
+fn tui_render_line_with_selection(buffer: EditorBuffer, row: i64, line: text, source_col_offset: i64) -> text:
+    var out = ""
+    var col = 0
+    var selected = false
+    while col < line.len():
+        val source_col = source_col_offset + col
+        val is_selected = buffer.position_selected(row, source_col)
+        if is_selected != selected:
+            if selected:
+                out = out + "\x1b[0m"
+            if is_selected:
+                out = out + "\x1b[7m"
+            selected = is_selected
+        out = out + line.char_at(col)
+        col = col + 1
+    if selected:
+        out = out + "\x1b[0m"
+    out
+
+
+fn _tui_semantic_token_style(token_type: i64, theme: text) -> text:
+    if theme == "light":
+        if token_type == 1:
+            return "\x1b[34m"
+        if token_type == 2:
+            return "\x1b[35m"
+        if token_type == 3:
+            return "\x1b[32m"
+        if token_type == 4:
+            return "\x1b[36m"
+        return "\x1b[33m"
+    if theme == "solarized":
+        if token_type == 1:
+            return "\x1b[36m"
+        if token_type == 2:
+            return "\x1b[33m"
+        if token_type == 3:
+            return "\x1b[32m"
+        if token_type == 4:
+            return "\x1b[34m"
+        return "\x1b[35m"
+    if token_type == 1:
+        return "\x1b[36m"
+    if token_type == 2:
+        return "\x1b[35m"
+    if token_type == 3:
+        return "\x1b[32m"
+    if token_type == 4:
+        return "\x1b[34m"
+    "\x1b[33m"
+
+fn tui_render_lsp_hover_popup_lines(popup: LspHoverPopup, width: i64) -> [text]:
+    if not popup.visible:
+        return []
+    val content: text = popup.content
+    val detail: text = popup.detail
+    _tui_popup_lines("Hover", content, detail, width)
+
+fn tui_render_lsp_signature_popup_lines(popup: LspSignaturePopup, width: i64) -> [text]:
+    if not popup.visible:
+        return []
+    _tui_signature_popup_lines(popup, width)
+
+fn _tui_signature_popup_lines(popup: LspSignaturePopup, width: i64) -> [text]:
+    var w = width
+    if w < 16:
+        w = 16
+    if w > 72:
+        w = 72
+    val inner = w - 4
+    var lines: [text] = []
+    val label: text = popup.label
+    val detail: text = popup.detail
+    val active_parameter: text = popup.active_parameter
+    val clean_label: text = _tui_fit_text(_tui_popup_clean(label), inner + 1)
+    val highlighted: text = _tui_highlight_signature_parameter(clean_label, active_parameter)
+    lines.push("\x1b[48;5;236m\x1b[38;5;250m " + _tui_fit_text("Signature", inner + 1) + "\x1b[0m")
+    lines.push("\x1b[48;5;236m\x1b[38;5;255m " + highlighted + "\x1b[0m")
+    if detail != "":
+        lines.push("\x1b[48;5;236m\x1b[38;5;244m " + _tui_fit_text(_tui_popup_clean(detail), inner + 1) + "\x1b[0m")
+    lines
+
+fn _tui_highlight_signature_parameter(label: text, active_parameter: text) -> text:
+    if active_parameter == "":
+        return label
+    label + " \x1b[1;38;5;81m" + active_parameter + "\x1b[38;5;255m"
+
+fn _tui_popup_lines(title: text, primary: text, detail: text, width: i64) -> [text]:
+    var w = width
+    if w < 16:
+        w = 16
+    if w > 72:
+        w = 72
+    val inner = w - 4
+    var lines: [text] = []
+    lines.push("\x1b[48;5;236m\x1b[38;5;250m " + _tui_fit_text(title, inner + 1) + "\x1b[0m")
+    lines.push("\x1b[48;5;236m\x1b[38;5;255m " + _tui_fit_text(_tui_popup_clean(primary), inner + 1) + "\x1b[0m")
+    if detail != "":
+        lines.push("\x1b[48;5;236m\x1b[38;5;244m " + _tui_fit_text(_tui_popup_clean(detail), inner + 1) + "\x1b[0m")
+    lines
+
+fn _tui_popup_clean(value: text) -> text:
+    value
+
+fn _tui_fit_text(value: text, width: i64) -> text:
+    value
+
+fn _tui_render_lsp_popups(ctrl: EditorController, zones: LayoutZones):
+    var lines: [text] = []
+    if ctrl.lsp_signature_popup.visible:
+        lines = tui_render_lsp_signature_popup_lines(ctrl.lsp_signature_popup, zones.editor_w)
+    elif ctrl.lsp_hover_popup.visible:
+        lines = tui_render_lsp_hover_popup_lines(ctrl.lsp_hover_popup, zones.editor_w)
+    if lines.len() == 0:
+        return
+    val buffer = ctrl.active_buffer()
+    var row = zones.editor_y
+    var col = zones.editor_x + 2
+    if buffer != nil:
+        row = ctrl.lsp_hover_popup.line - buffer.viewport.top_row + zones.editor_y + 1
+        if ctrl.lsp_signature_popup.visible:
+            row = ctrl.lsp_signature_popup.line - buffer.viewport.top_row + zones.editor_y + 1
+        col = zones.editor_x + 2
+    if row < zones.editor_y:
+        row = zones.editor_y
+    if row + lines.len() >= zones.status_y:
+        row = zones.status_y - lines.len() - 1
+    if row < zones.editor_y:
+        row = zones.editor_y
+    var i = 0
+    while i < lines.len():
+        terminal_move_cursor(row + i, col)
+        terminal_write(lines[i])
+        i = i + 1

@@ -1,0 +1,9 @@
+# Phase 1 rich editor math sample
+
+fn main()
+    val inline = m{ x^2 + y^2 }
+    val frac_demo = m{ frac(1, 1 + exp(-x)) }
+    val sum_demo = m{ sum(y[i] * log(p[i]), i=1..n) }
+    val nested = m{ frac(sqrt(alpha^2 + beta^2), 1 + hat(y)[i]) }
+    val malformed = m{ frac(1, sqrt(x) }
+    return inline

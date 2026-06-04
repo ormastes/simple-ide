@@ -1,0 +1,84 @@
+# Email Message Model
+#
+# Types for email messages, addresses, attachments, and mail folders.
+
+# =========================================================================
+# Core Structs and Enums
+# =========================================================================
+
+struct EmailAddress:
+    name: text
+    address: text
+
+struct Attachment:
+    filename: text
+    mime_type: text
+    size: i64
+
+struct Email:
+    id: text
+    from_addr: EmailAddress
+    to: [EmailAddress]
+    cc: [EmailAddress]
+    subject: text
+    body: text
+    date: text
+    read: bool
+    starred: bool
+    thread_id: text
+    folder: text
+    attachments: [Attachment]
+
+enum MailFolder:
+    Inbox
+    Sent
+    Drafts
+    Trash
+    Custom(name: text)
+
+# =========================================================================
+# Constructors and Helpers
+# =========================================================================
+
+fn new_email(id: text, from_addr: EmailAddress, to: [EmailAddress], subject: text, body: text) -> Email:
+    """Create a new email with default metadata."""
+    return Email(
+        id: id,
+        from_addr: from_addr,
+        to: to,
+        cc: [],
+        subject: subject,
+        body: body,
+        date: "",
+        read: false,
+        starred: false,
+        thread_id: id,
+        folder: "Inbox",
+        attachments: []
+    )
+
+fn email_preview(email: Email, max_len: i32) -> text:
+    """Return the first max_len characters of the email body as a preview."""
+    if email.body.len() <= max_len:
+        return email.body
+    return "{email.body.substring(0, max_len)}..."
+
+fn folder_name(folder: MailFolder) -> text:
+    """Return the display name of a mail folder."""
+    match folder:
+        MailFolder.Inbox:
+            return "Inbox"
+        MailFolder.Sent:
+            return "Sent"
+        MailFolder.Drafts:
+            return "Drafts"
+        MailFolder.Trash:
+            return "Trash"
+        MailFolder.Custom(name):
+            return name
+
+fn email_address_display(addr: EmailAddress) -> text:
+    """Format an email address for display: 'Name <email>' or just the address."""
+    if addr.name != "":
+        return "{addr.name} <{addr.address}>"
+    return addr.address

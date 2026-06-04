@@ -1,0 +1,43 @@
+# Simple IDE entrypoint.
+#
+# Thin VS Code-like product entry that reuses the shared editor launch contract.
+# The heavy controller/rendering logic remains in src/app/editor and
+# src/lib/editor so embedded and example IDEs consume the same reusable core.
+
+use std.cli.cli_util (get_cli_args)
+use std.editor.core.launch.*
+use app.ide.feature_report.{ide_feature_check_report}
+
+fn main() -> i64:
+    val args = editor_launch_clean_log_args(get_cli_args())
+    if args.len() > 0 and (args[0] == "--help" or args[0] == "-h"):
+        ide_print_help()
+        return 0
+    if args.len() > 0 and (args[0] == "--version" or args[0] == "-v"):
+        print "Simple IDE v0.1.0"
+        return 0
+    if args.len() > 0 and args[0] == "--feature-check":
+        val launch = editor_launch_parse(args.slice(1, args.len()))
+        for line in ide_feature_check_report(launch.mode):
+            print line
+        return 0
+    val launch = editor_launch_parse(args)
+    if launch.unknown_option != "":
+        print "Unknown option: {launch.unknown_option}"
+        return 1
+    print "Simple IDE v0.1.0"
+    print "Ready for {launch.mode} IDE startup with {launch.files.len()} file(s)."
+    0
+
+fn ide_print_help():
+    print "Simple IDE"
+    print ""
+    print "Usage: simple ide [options] [workspace-or-file ...]"
+    print ""
+    print "Options:"
+    print "  -h, --help       Show this help message"
+    print "  -v, --version    Show version information"
+    print "  --tui            Select terminal IDE mode"
+    print "  --gui            Select GUI mode"
+    print "  --gui-sdl        Select SDL GUI mode"
+    print "  --feature-check  Print IDE plugin/app capability checks"

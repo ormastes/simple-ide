@@ -1,0 +1,172 @@
+# Tasks Panel HTML
+#
+# Task management UI for the Tasks tab.
+# Shows active loops, schedules, remote-control sessions, and daemons.
+# Supports creating new loops/schedules and cancelling running tasks.
+
+use app.llm_dashboard.data.store.{AgentDashboardStore}
+use app.llm_dashboard.data.types.{
+    ManagedTask, TaskKind, TaskState,
+    task_kind_name, task_state_name, format_tokens, format_timestamp
+}
+use app.llm_dashboard.collectors.schedule_collector.{collect_schedules, collect_daemons}
+use app.llm_dashboard.collectors.remote_collector.{collect_remote_sessions}
+use app.llm_dashboard.collectors.task_daemon_collector.{collect_task_daemon_tasks}
+
+# =========================================================================
+# Tasks Panel CSS
+# =========================================================================
+
+fn generate_tasks_panel_css() -> text:
+    return """
+.tasks-panel { padding: 16px; }
+.tasks-create-form { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+.tasks-create-form h4 { margin: 0 0 12px; color: #e6edf3; font-size: 0.9rem; }
+.form-row { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.form-row label { font-size: 0.8rem; color: #8b949e; min-width: 70px; }
+.form-input { background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #e6edf3; padding: 5px 8px; font-size: 0.85rem; flex: 1; min-width: 200px; }
+.form-select { background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #e6edf3; padding: 5px 8px; font-size: 0.85rem; }
+.btn-create { background: #238636; border: none; color: #fff; padding: 6px 16px; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+.btn-create:hover { background: #2ea043; }
+.task-cards { display: flex; flex-direction: column; gap: 10px; }
+.task-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 16px; display: flex; justify-content: space-between; align-items: flex-start; }
+.task-card-left { flex: 1; }
+.task-name { font-weight: 600; color: #e6edf3; font-size: 0.9rem; margin-bottom: 4px; }
+.task-cmd { font-size: 0.78rem; color: #8b949e; font-family: monospace; margin-bottom: 4px; word-break: break-all; }
+.task-meta { font-size: 0.75rem; color: #8b949e; display: flex; gap: 12px; flex-wrap: wrap; }
+.task-card-right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
+.badge-active  { background: #1a4731; color: #3fb950; }
+.badge-paused  { background: #3a2e00; color: #d29922; }
+.badge-done    { background: #161b22; color: #8b949e; }
+.badge-failed  { background: #4a1919; color: #f85149; }
+.badge-cancelled { background: #161b22; color: #8b949e; }
+.badge-loop     { background: #0d2a47; color: #58a6ff; }
+.badge-schedule { background: #2a1b3d; color: #bc8cff; }
+.badge-remote   { background: #1a3a1a; color: #56d364; }
+.badge-daemon   { background: #1a2a3a; color: #79c0ff; }
+.btn-cancel { background: transparent; border: 1px solid #f85149; color: #f85149; padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 0.78rem; }
+.btn-cancel:hover { background: #4a1919; }
+.tasks-empty { color: #8b949e; font-size: 0.85rem; padding: 16px; text-align: center; }
+"""
+
+# =========================================================================
+# Tasks Panel HTML
+# =========================================================================
+
+fn generate_tasks_panel_html(store: AgentDashboardStore) -> text:
+    # Gather all task sources
+    var all_tasks: [ManagedTask] = []
+    for t in store.get_managed_tasks():
+        all_tasks.push(t)
+    for t in collect_schedules():
+        all_tasks.push(t)
+    for t in collect_daemons():
+        all_tasks.push(t)
+    for t in collect_remote_sessions():
+        all_tasks.push(t)
+    for t in collect_task_daemon_tasks():
+        all_tasks.push(t)
+
+    val create_form = _create_form_html()
+    val task_list = _task_list_html(all_tasks)
+
+    return """<div class="tasks-panel">
+{create_form}
+<h4 style="color:#e6edf3;font-size:0.9rem;margin:0 0 12px">Active Tasks</h4>
+{task_list}
+</div>"""
+
+fn _create_form_html() -> text:
+    return """<div class="tasks-create-form">
+<h4>Create New Task</h4>
+<div class="form-row">
+  <label>Kind</label>
+  <select class="form-select" id="task-kind">
+    <option value="loop">/loop (interval)</option>
+    <option value="schedule">Scheduled (cron)</option>
+  </select>
+</div>
+<div class="form-row">
+  <label>Prompt</label>
+  <input class="form-input" id="task-prompt" type="text" placeholder="e.g. check build status and summarize failures">
+</div>
+<div class="form-row" id="row-interval">
+  <label>Interval</label>
+  <input class="form-input" id="task-interval" type="number" placeholder="seconds (e.g. 300)" style="max-width:160px">
+  <span style="font-size:0.78rem;color:#8b949e">seconds</span>
+</div>
+<div class="form-row" id="row-cron" style="display:none">
+  <label>Cron</label>
+  <input class="form-input" id="task-cron" type="text" placeholder='e.g. "0 9 * * *" (daily 9am)' style="max-width:240px">
+</div>
+<div class="form-row">
+  <button class="btn-create" onclick="createTask()">Create Task</button>
+</div>
+</div>
+<script>
+document.getElementById('task-kind').addEventListener('change', function() {
+  document.getElementById('row-interval').style.display = this.value === 'loop' ? 'flex' : 'none';
+  document.getElementById('row-cron').style.display = this.value === 'schedule' ? 'flex' : 'none';
+});
+function createTask() {
+  var kind = document.getElementById('task-kind').value;
+  var prompt = document.getElementById('task-prompt').value;
+  var interval = document.getElementById('task-interval').value;
+  var cron = document.getElementById('task-cron').value;
+  if (!prompt) { alert('Please enter a prompt.'); return; }
+  fetch('/api/tasks/create', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({kind: kind, prompt: prompt, interval_seconds: parseInt(interval)||0, cron_expr: cron})
+  }).then(r => r.json()).then(d => { if(d.ok) location.reload(); else alert('Error: ' + d.error); });
+}
+function cancelTask(id) {
+  if (!confirm('Cancel task ' + id + '?')) return;
+  fetch('/api/tasks/cancel', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({task_id: id})
+  }).then(() => location.reload());
+}
+</script>"""
+
+fn _task_list_html(tasks: [ManagedTask]) -> text:
+    if tasks.len() == 0:
+        return """<div class="tasks-empty">No active tasks.<br>Create a loop or schedule above to get started.</div>"""
+
+    var cards = ""
+    for task in tasks:
+        val state_badge = _state_badge(task.state)
+        val kind_badge = _kind_badge(task.kind)
+        val run_info = if task.run_count > 0: "Runs: {task.run_count}" else: "Not yet run"
+        val next_info = if task.next_run_time > 0: "Next: {format_timestamp(task.next_run_time / 1000)}" else: ""
+        val interval_info = if task.interval_seconds > 0: "Every {task.interval_seconds}s" elif task.cron_expr != "": task.cron_expr else: ""
+        val tok_info = if task.total_tokens > 0: "Tokens: {format_tokens(task.total_tokens)}" else: ""
+        val cancel_btn = if task.state == TaskState.Active:
+            """<button class="btn-cancel" onclick="cancelTask('{task.id}')">Cancel</button>"""
+        else:
+            ""
+        val cmd_preview = if task.command.len() > 80:
+            "{task.command.slice(0, 77)}..."
+        else:
+            task.command
+        cards = "{cards}<div class=\"task-card\"><div class=\"task-card-left\"><div class=\"task-name\">{task.name}</div><div class=\"task-cmd\">{cmd_preview}</div><div class=\"task-meta\"><span>{run_info}</span><span>{next_info}</span><span>{interval_info}</span><span>{tok_info}</span></div></div><div class=\"task-card-right\">{state_badge}{kind_badge}{cancel_btn}</div></div>"
+
+    return """<div class="task-cards">{cards}</div>"""
+
+fn _state_badge(state: TaskState) -> text:
+    match state:
+        TaskState.Active: """<span class="badge badge-active">active</span>"""
+        TaskState.Paused: """<span class="badge badge-paused">paused</span>"""
+        TaskState.Completed: """<span class="badge badge-done">done</span>"""
+        TaskState.Failed: """<span class="badge badge-failed">failed</span>"""
+        TaskState.Cancelled: """<span class="badge badge-cancelled">cancelled</span>"""
+
+fn _kind_badge(kind: TaskKind) -> text:
+    match kind:
+        TaskKind.Loop: """<span class="badge badge-loop">loop</span>"""
+        TaskKind.Schedule: """<span class="badge badge-schedule">schedule</span>"""
+        TaskKind.RemoteControl: """<span class="badge badge-remote">remote</span>"""
+        TaskKind.Daemon: """<span class="badge badge-daemon">daemon</span>"""
+        TaskKind.Job: """<span class="badge badge-daemon">job</span>"""

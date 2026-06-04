@@ -1,0 +1,220 @@
+# Checkpoint Manager - Test Progress Persistence
+#
+# Saves test runner progress to disk for resume after shutdown.
+# Used by graceful shutdown system to enable --resume flag.
+
+use std.io.{file_write, file_read, file_exists, file_delete}
+use std.io.{time_now_unix_micros}
+
+# ============================================================================
+# Checkpoint Data Structure
+# ============================================================================
+
+struct Checkpoint:
+    timestamp_ms: i64
+    completed_files: [text]
+    total_passed: i64
+    total_failed: i64
+    total_skipped: i64
+    shutdown_reason: text
+
+# ============================================================================
+# Checkpoint File Path
+# ============================================================================
+
+val CHECKPOINT_FILE = "tmp/.simple-test-checkpoint.sdn"
+
+# ============================================================================
+# Checkpoint Operations
+# ============================================================================
+
+fn make_empty_checkpoint() -> Checkpoint:
+    """Create empty checkpoint (used when no checkpoint exists)"""
+    Checkpoint(
+        timestamp_ms: 0,
+        completed_files: [],
+        total_passed: 0,
+        total_failed: 0,
+        total_skipped: 0,
+        shutdown_reason: ""
+    )
+
+fn checkpoint_save(
+    completed: [text],
+    passed: i64,
+    failed: i64,
+    skipped: i64,
+    reason: text
+):
+    """
+    Save checkpoint to disk in SDN format.
+
+    Args:
+        completed: List of completed test file paths
+        passed: Total tests passed so far
+        failed: Total tests failed so far
+        skipped: Total tests skipped so far
+        reason: Shutdown reason ('cpu', 'memory', 'timeout', 'signal', etc.)
+    """
+    val timestamp = time_now_unix_micros() / 1000  # Convert to milliseconds
+
+    # Build SDN content manually (std.sdn.parser broken in runtime)
+    var lines: [text] = []
+    lines.push("checkpoint {")
+    lines.push("  timestamp_ms {timestamp}")
+    lines.push("  total_passed {passed}")
+    lines.push("  total_failed {failed}")
+    lines.push("  total_skipped {skipped}")
+    lines.push("  shutdown_reason \"{reason}\"")
+    lines.push("")
+    lines.push("  completed_files [")
+
+    for file_path in completed:
+        lines.push("    \"{file_path}\"")
+
+    lines.push("  ]")
+    lines.push("}")
+
+    val content = lines.join("\n")
+    file_write(CHECKPOINT_FILE, content)
+
+fn checkpoint_load() -> Checkpoint:
+    """
+    Load checkpoint from disk.
+
+    Returns: Checkpoint struct, or empty checkpoint if file doesn't exist
+
+    NOTE: Uses manual line-based parsing because std.sdn.parser is broken
+    """
+    if not file_exists(CHECKPOINT_FILE):
+        return make_empty_checkpoint()
+
+    val content = file_read(CHECKPOINT_FILE)
+    if content == "" or content == nil:
+        return make_empty_checkpoint()
+
+    # Parse SDN manually (line-based parser)
+    val lines = content.split("\n")
+
+    var timestamp_ms = 0
+    var total_passed = 0
+    var total_failed = 0
+    var total_skipped = 0
+    var shutdown_reason = ""
+    var completed_files: [text] = []
+    var in_files_array = false
+
+    for line in lines:
+        val trimmed = line.trim()
+
+        # Skip empty lines and braces
+        if trimmed == "" or trimmed == "{" or trimmed == "}" or trimmed == "[" or trimmed == "]":
+            continue
+
+        # Detect completed_files array section
+        if trimmed.contains("completed_files"):
+            in_files_array = true
+            continue
+
+        # Parse fields
+        if trimmed.starts_with("timestamp_ms"):
+            timestamp_ms = parse_sdn_int_field(line: trimmed, field_name: "timestamp_ms")
+        elif trimmed.starts_with("total_passed"):
+            total_passed = parse_sdn_int_field(line: trimmed, field_name: "total_passed")
+        elif trimmed.starts_with("total_failed"):
+            total_failed = parse_sdn_int_field(line: trimmed, field_name: "total_failed")
+        elif trimmed.starts_with("total_skipped"):
+            total_skipped = parse_sdn_int_field(line: trimmed, field_name: "total_skipped")
+        elif trimmed.starts_with("shutdown_reason"):
+            shutdown_reason = parse_sdn_text_field(line: trimmed, field_name: "shutdown_reason")
+        elif in_files_array and trimmed.starts_with("\""):
+            # File path in array: "path/to/file.spl"
+            val file_path = trimmed.replace("\"", "")
+            completed_files.push(file_path)
+
+    Checkpoint(
+        timestamp_ms: timestamp_ms,
+        completed_files: completed_files,
+        total_passed: total_passed,
+        total_failed: total_failed,
+        total_skipped: total_skipped,
+        shutdown_reason: shutdown_reason
+    )
+
+fn parse_sdn_int_field(line: text, field_name: text) -> i64:
+    """
+    Parse integer field from SDN line.
+
+    Example: "  timestamp_ms 1739530800000" -> 1739530800000
+    """
+    val parts = line.split(" ")
+    if parts.len() < 2:
+        return 0
+
+    # Last part is the value
+    val value_str = parts[parts.len() - 1].trim()
+    if value_str == "" or value_str == nil:
+        return 0
+
+    # Convert to int (returns 0 if invalid)
+    val result = to_int(value_str)
+    result
+
+fn parse_sdn_text_field(line: text, field_name: text) -> text:
+    """
+    Parse text field from SDN line.
+
+    Example: '  shutdown_reason "memory"' -> "memory"
+    """
+    # Find first quote
+    val first_quote = line.index_of("\"") ?? -1
+    if first_quote < 0:
+        return ""
+
+    # Find second quote (closing)
+    val second_quote = line.index_of("\"", first_quote + 1) ?? -1
+    if second_quote < 0:
+        return ""
+
+    # Extract content between quotes
+    line[first_quote + 1:second_quote]
+
+fn checkpoint_exists() -> bool:
+    """Check if checkpoint file exists"""
+    file_exists(CHECKPOINT_FILE)
+
+fn checkpoint_delete():
+    """Delete checkpoint file (after successful resume)"""
+    if file_exists(CHECKPOINT_FILE):
+        file_delete(CHECKPOINT_FILE)
+
+fn checkpoint_skip_completed(all_files: [text], ckpt: Checkpoint) -> [text]:
+    """
+    Filter out completed files from test file list.
+
+    Args:
+        all_files: All test files to run
+        ckpt: Loaded checkpoint
+
+    Returns: List of files not yet completed
+    """
+    var remaining: [text] = []
+
+    for file_path in all_files:
+        var is_completed = false
+
+        # Check if file is in completed list
+        for completed_file in ckpt.completed_files:
+            if file_path == completed_file:
+                is_completed = true
+                break
+
+        # Add to remaining if not completed
+        if not is_completed:
+            remaining.push(file_path)
+
+    remaining
+
+# ============================================================================
+# Exports
+# ============================================================================

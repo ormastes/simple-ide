@@ -1,0 +1,73 @@
+# Simple Debug Adapter Protocol entrypoint.
+# Startup-light CLI surface for help/version/log-mode preflight.
+
+use std.cli.cli_util (get_cli_args)
+use std.cli.log_modes.{parse_log_options, log_options_help, render_progress}
+use std.log.{error}
+
+fn main() -> i64:
+    val raw_args = get_cli_args()
+    val log_opts = parse_log_options(raw_args)
+    if not log_opts.valid:
+        error("dap", log_opts.error)
+        return 1
+
+    val args = dap_clean_log_args(raw_args)
+    if args.len() > 0 and (args[0] == "--help" or args[0] == "-h"):
+        print_help_with_progress(log_opts.progress)
+        return 0
+    if args.len() > 0 and (args[0] == "--version" or args[0] == "-v"):
+        if log_opts.log_mode == "json":
+            print "{\"command\":\"dap\",\"status\":\"ok\",\"version\":\"0.1.0\"}"
+        else:
+            print "simple-dap 0.1.0"
+            print "Simple Debug Adapter Protocol (DAP)"
+        return 0
+    if log_opts.log_mode == "json":
+        print "{\"command\":\"dap\",\"status\":\"ready\",\"transport\":\"stdio\"}"
+        return 0
+
+    print_help_with_progress(log_opts.progress)
+    0
+
+fn print_help():
+    print "Simple Debug Adapter Protocol (DAP)"
+    print ""
+    print "Usage: simple dap [options]"
+    print ""
+    print "The debug adapter communicates over stdin/stdout using DAP JSON messages."
+    print ""
+    print "Options:"
+    print "  -h, --help       Show this help message"
+    print "  -v, --version    Show version information"
+    print ""
+    print "Shared log options:"
+    for line in log_options_help():
+        print "  {line}"
+
+fn print_help_with_progress(progress_mode: text):
+    val progress = render_progress(progress_mode, 0, 1, "usage")
+    if progress != "":
+        print progress
+    print_help()
+
+fn dap_is_log_option(arg: text) -> bool:
+    arg == "--human" or arg == "--llm" or arg == "--json" or
+        arg == "--tui" or arg == "--stdout" or arg == "--quiet" or
+        arg == "--verbose" or arg == "--dots" or arg == "--count" or
+        arg == "--no-progress" or arg == "--log-mode" or arg == "--surface" or
+        arg == "--progress" or arg.starts_with("--log-mode=") or
+        arg.starts_with("--surface=") or arg.starts_with("--progress=")
+
+fn dap_clean_log_args(args: [text]) -> [text]:
+    var cleaned: [text] = []
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+        if dap_is_log_option(arg):
+            if arg == "--log-mode" or arg == "--surface" or arg == "--progress":
+                i = i + 1
+        else:
+            cleaned.push(arg)
+        i = i + 1
+    cleaned

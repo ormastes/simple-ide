@@ -1,0 +1,120 @@
+# Test Runner Database Operations
+#
+# Test database tracking, file locking, and result persistence.
+
+use std.test_runner.test_runner_types.{TestRunResult}
+use std.io.{file_exists, file_read, file_atomic_write, file_lock, file_unlock}
+use std.io.{env_get}
+use std.log.{debug}
+
+fn _is_debug_enabled() -> bool:
+    val env = env_get("SIMPLE_LOG")
+    env == "debug" or env == "trace"
+
+# =========================================================================
+# Database Operations
+# =========================================================================
+
+fn write_test_db_run(result: TestRunResult, start_time: i64, end_time: i64):
+    val run_id = start_time
+    val start_iso = micros_to_iso(start_time)
+    val end_iso = micros_to_iso(end_time)
+    val test_count = result.total_passed + result.total_failed
+    val passed = result.total_passed
+    val failed = result.total_failed
+    val timed_out = result.total_timed_out
+
+    # Use atomic update with file locking (same as Rust implementation)
+    val db_path = "doc/08_tracking/test/test_db.sdn"
+    val result_opt = atomic_update_file_test_db(
+        path: db_path,
+        run_id: run_id,
+        start_time: start_iso,
+        end_time: end_iso,
+        test_count: test_count,
+        passed: passed,
+        failed: failed,
+        timed_out: timed_out
+    )
+
+    match result_opt:
+        case Ok(_):
+            # Success - database updated atomically
+            return
+        case Err(e):
+            # Log error but don't fail the test run
+            print "Warning: Failed to update test database: {e}"
+
+# Atomic file update for test database
+# Uses file locking + atomic write (same pattern as Rust unified_db)
+fn atomic_update_file_test_db(
+    path: text,
+    run_id: i64,
+    start_time: text,
+    end_time: text,
+    test_count: i64,
+    passed: i64,
+    failed: i64,
+    timed_out: i64
+) -> Result<(), str>:
+    if _is_debug_enabled():
+        debug("test", "Writing to {path}")
+    # Acquire lock
+    val lock_path_result = acquire_file_lock(path: path, timeout_secs: 10)
+    if lock_path_result.is_err():
+        return Err("Failed to acquire lock")
+
+    val lock_path = lock_path_result.unwrap()
+
+    # Read existing content
+    var content = ""
+    if file_exists(path):
+        content = file_read(path)
+
+    # Build new test_runs row
+    val row = "        {run_id}, \"{start_time}\", \"{end_time}\", 0, \"simple-runner\", \"completed\", {test_count}, {passed}, {failed}, 0, {timed_out}\n"
+
+    # Append to test_runs table
+    var new_content = ""
+    if content.trim() == "":
+        # Create new database with test_runs table (add blank line terminator)
+        val header = "test_runs |run_id, start_time, end_time, pid, hostname, status, test_count, passed, failed, crashed, timed_out|\n"
+        new_content = header + row + "\n\n"  # Blank line terminator = \n\n
+    elif content.contains("test_runs |"):
+        # Append to existing test_runs table (maintain blank line terminator)
+        new_content = content.trim() + "\n" + row + "\n\n"  # Blank line terminator = \n\n
+    else:
+        # Add test_runs table at the end (add blank line terminator)
+        val header = "test_runs |run_id, start_time, end_time, pid, hostname, status, test_count, passed, failed, crashed, timed_out|\n"
+        new_content = content.trim() + "\n\n" + header + row + "\n\n"  # Double newline for separator and terminator
+
+    # Atomic write
+    val success = file_atomic_write(path, new_content)
+
+    # Release lock
+    file_unlock(lock_path)
+
+    if success:
+        return Ok(())
+    else:
+        return Err("Failed to write file")
+
+# Acquire file lock with timeout
+fn acquire_file_lock(path: text, timeout_secs: i64) -> Result<str, str>:
+    # Note: file_lock returns Result, we just pass it through
+    # In the future when try-catch is implemented, we can add error handling here
+    val lock_path = file_lock(path, timeout_secs)
+    Ok(lock_path)
+
+fn micros_to_iso(micros: i64) -> text:
+    # Simple approximation - just use the unix timestamp
+    val secs = micros / 1000000
+    "{secs}"
+
+# =========================================================================
+# Environment Variable Propagation
+# =========================================================================
+
+# =========================================================================
+# Exports
+# =========================================================================

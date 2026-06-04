@@ -1,0 +1,27 @@
+# `simple game run [--scene X]` — boot a project (AC-7).
+#
+# Runs `bin/simple <project>/src/main.spl` with `SIMPLE_GAME_HEADLESS=0`.
+# Defaults the project root to the current working directory.
+
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_env_set(key: text, value: text) -> bool
+extern fn rt_process_run(argv: [text]) -> i64
+
+
+fn _project_main() -> text:
+    if rt_file_exists("src/main.spl"):
+        return "src/main.spl"
+    if rt_file_exists("examples/11_advanced/game2d/hello/main.spl"):
+        return "examples/11_advanced/game2d/hello/main.spl"
+    ""
+
+
+fn cmd_run(scene: text) -> i64:
+    val main_spl = _project_main()
+    if main_spl.len() == 0:
+        print "error: no `src/main.spl` in current directory (exit 2)"
+        return 2
+    rt_env_set("SIMPLE_GAME_HEADLESS", "0")
+    rt_env_set("SIMPLE_GAME_SCENE", scene)
+    val argv: [text] = ["bin/simple", main_spl]
+    rt_process_run(argv)

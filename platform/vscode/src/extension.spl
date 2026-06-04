@@ -1,0 +1,101 @@
+"""
+Simple Language VSCode Extension Entry Point.
+
+Activates the LSP client, registers editor commands, and manages
+the lifecycle of the language server process.
+"""
+
+use app.vscode_extension.src.lsp_client_config.{LspClientConfig, lsp_client_config_create, lsp_client_config_capabilities}
+use app.vscode_extension.src.diagnostics_provider.{DiagnosticsProvider, diagnostics_provider_create, diagnostics_provider_handle, diagnostics_provider_clear_all}
+use app.vscode_extension.src.code_actions_provider.{CodeActionsProvider, code_actions_provider_create, code_actions_provider_clear}
+use app.vscode_extension.src.debug_adapter_config.{DebugAdapterConfig, debug_adapter_config_create}
+use app.vscode_extension.src.workspace_config.{WorkspaceConfig, workspace_config_create, workspace_config_server_path}
+
+struct ExtensionContext:
+    extension_path: text
+    storage_path: text
+    global_storage_path: text
+
+struct SimpleExtension:
+    lsp_config: LspClientConfig
+    diagnostics: DiagnosticsProvider
+    code_actions: CodeActionsProvider
+    debug_config: DebugAdapterConfig
+    workspace: WorkspaceConfig
+    initialized: bool
+
+struct ExtensionCommand:
+    id: text
+    title: text
+
+fn extension_activate(context: ExtensionContext) -> SimpleExtension:
+    val ws = workspace_config_create()
+    val config = lsp_client_config_create()
+    val diag = diagnostics_provider_create()
+    val actions = code_actions_provider_create()
+    val dbg = debug_adapter_config_create()
+    val ext = SimpleExtension(
+        lsp_config: config,
+        diagnostics: diag,
+        code_actions: actions,
+        debug_config: dbg,
+        workspace: ws,
+        initialized: true
+    )
+    ext
+
+fn extension_deactivate(ext: SimpleExtension):
+    diagnostics_provider_clear_all(ext.diagnostics)
+    code_actions_provider_clear(ext.code_actions)
+
+fn extension_commands() -> [ExtensionCommand]:
+    var cmds: [ExtensionCommand] = []
+    cmds.push(ExtensionCommand(id: "simple.format", title: "Simple: Format Document"))
+    cmds.push(ExtensionCommand(id: "simple.lint", title: "Simple: Run Linter"))
+    cmds.push(ExtensionCommand(id: "simple.build", title: "Simple: Build Project"))
+    cmds.push(ExtensionCommand(id: "simple.test", title: "Simple: Run Tests"))
+    cmds.push(ExtensionCommand(id: "simple.restartLsp", title: "Simple: Restart Language Server"))
+    cmds.push(ExtensionCommand(id: "simple.debug.start", title: "Simple: Start Debugging"))
+    cmds.push(ExtensionCommand(id: "simple.debug.attach", title: "Simple: Attach to Process"))
+    cmds.push(ExtensionCommand(id: "simple.organizeImports", title: "Simple: Organize Imports"))
+    cmds
+
+fn extension_server_args() -> [text]:
+    var args: [text] = []
+    args.push("--stdio")
+    args
+
+fn extension_file_patterns() -> [text]:
+    var patterns: [text] = []
+    patterns.push("**/*.spl")
+    patterns.push("**/*.shs")
+    patterns.push("**/*.sdn")
+    patterns
+
+fn extension_is_active(ext: SimpleExtension) -> bool:
+    ext.initialized and ext.lsp_config.server_ready
+
+fn extension_capabilities_summary(ext: SimpleExtension) -> text:
+    val caps = lsp_client_config_capabilities()
+    var features: [text] = []
+    if caps.completion_provider:
+        features.push("completion")
+    if caps.definition_provider:
+        features.push("go-to-definition")
+    if caps.hover_provider:
+        features.push("hover")
+    if caps.references_provider:
+        features.push("find-references")
+    if caps.semantic_tokens_provider:
+        features.push("semantic-highlighting")
+    if caps.diagnostic_provider:
+        features.push("diagnostics")
+    if caps.code_action_provider:
+        features.push("code-actions")
+    if caps.document_formatting_provider:
+        features.push("formatting")
+    if caps.code_lens_provider:
+        features.push("code-lens")
+    if caps.debug_adapter_support:
+        features.push("debug-adapter")
+    "Simple Language Server: " + features.join(", ")

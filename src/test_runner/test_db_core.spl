@@ -1,0 +1,580 @@
+# Test Database Core
+#
+# Main TestDatabase class: load, save, update from test results, merge.
+# Manages both stable (test_db.sdn) and volatile (test_db_runs.sdn) data.
+
+use std.io.{getpid, hostname}
+use std.io.{time_now_unix_micros, timestamp_year, timestamp_month, timestamp_day, timestamp_hour, timestamp_minute, timestamp_second}
+use std.test_runner.string_interner.StringInterner
+use std.test_runner.test_db_types.{TestStatus, FileRecord, SuiteRecord, TestRecord, CounterRecord, TimingSummary, TimingRun, ChangeEvent, RunRecord, TimingConfig, status_to_str, change_type_str, is_flaky_change}
+use std.test_runner.test_db_io.{DB_PATH, RUNS_PATH, read_db_file, write_db_file_locked}
+use std.test_runner.test_db_parser.{parse_stable_db, parse_volatile_db, ParsedStableDb, ParsedVolatileDb}
+use std.test_runner.test_db_serializer.{serialize_stable_db, serialize_volatile_db}
+use std.test_runner.test_stats.{compute_statistics, compute_percentiles, detect_outliers_iqr, sort_f64, percentile_at, abs_f64, detect_flaky_test}
+
+# =========================================================================
+# TestDatabase
+# =========================================================================
+
+struct TestDatabase:
+    interner: StringInterner
+    files: List<FileRecord>
+    suites: List<SuiteRecord>
+    tests: List<TestRecord>
+    counters: List<CounterRecord>
+    timing: List<TimingSummary>
+    timing_runs: List<TimingRun>
+    changes: List<ChangeEvent>
+    test_runs: List<RunRecord>
+    dirty: bool
+    # Perf indexes — O(1) lookups instead of linear scans
+    _file_index: Dict<i64, i64>        # path_str -> file_id
+    _suite_index: Dict<text, i64>      # "{file_id}:{name_str}" -> suite_id
+    _counter_index: Dict<i64, i64>     # test_id -> index in counters
+    _timing_index: Dict<i64, i64>      # test_id -> index in timing
+
+impl TestDatabase:
+    static fn empty() -> TestDatabase:
+        TestDatabase(
+            interner: StringInterner.empty(),
+            files: [],
+            suites: [],
+            tests: [],
+            counters: [],
+            timing: [],
+            timing_runs: [],
+            changes: [],
+            test_runs: [],
+            dirty: false,
+            _file_index: {},
+            _suite_index: {},
+            _counter_index: {},
+            _timing_index: {}
+        )
+
+    # -----------------------------------------------------------------
+    # Rebuild indexes from lists (call after load or deserialization)
+    # -----------------------------------------------------------------
+
+    me rebuild_indexes():
+        self._file_index = {}
+        self._suite_index = {}
+        self._counter_index = {}
+        self._timing_index = {}
+        for f in self.files:
+            self._file_index[f.path_str] = f.file_id
+        for s in self.suites:
+            val key = "{s.file_id}:{s.name_str}"
+            self._suite_index[key] = s.suite_id
+        var ci = 0
+        while ci < self.counters.len():
+            self._counter_index[self.counters[ci].test_id] = ci
+            ci = ci + 1
+        var ti = 0
+        while ti < self.timing.len():
+            self._timing_index[self.timing[ti].test_id] = ti
+            ti = ti + 1
+
+    # -----------------------------------------------------------------
+    # Load from disk
+    # -----------------------------------------------------------------
+
+    static fn load() -> Result<TestDatabase, text>:
+        var db = TestDatabase.empty()
+
+        # Load stable data
+        val stable_result = read_db_file(DB_PATH)
+        if stable_result.err.?:
+            return Err(stable_result.unwrap_err())
+
+        val stable_content = stable_result.unwrap()
+        if stable_content.trim() != "":
+            val parsed = parse_stable_db(stable_content)
+            db.interner = parsed.interner
+            db.files = parsed.files
+            db.suites = parsed.suites
+            db.tests = parsed.tests
+
+        # Load volatile data
+        val volatile_result = read_db_file(RUNS_PATH)
+        if volatile_result.err.?:
+            # Volatile data is optional - log warning but continue
+            print "Warning: Could not read {RUNS_PATH}: {volatile_result.unwrap_err()}"
+        else:
+            val volatile_content = volatile_result.unwrap()
+            if volatile_content.trim() != "":
+                val parsed_vol = parse_volatile_db(volatile_content)
+                db.counters = parsed_vol.counters
+                db.timing = parsed_vol.timing
+                db.timing_runs = parsed_vol.timing_runs
+                db.changes = parsed_vol.changes
+                db.test_runs = parsed_vol.test_runs
+
+        db.rebuild_indexes()
+        Ok(db)
+
+    # -----------------------------------------------------------------
+    # Save to disk
+    # -----------------------------------------------------------------
+
+    me save() -> Result<(), text>:
+        # Save stable data
+        val stable_content = serialize_stable_db(
+            self.interner, self.files, self.suites, self.tests
+        )
+        val stable_result = write_db_file_locked(DB_PATH, stable_content)
+        if stable_result.err.?:
+            return Err(stable_result.unwrap_err())
+
+        # Save volatile data
+        val volatile_content = serialize_volatile_db(
+            self.counters, self.timing, self.timing_runs,
+            self.changes, self.test_runs
+        )
+        val volatile_result = write_db_file_locked(RUNS_PATH, volatile_content)
+        if volatile_result.err.?:
+            return Err(volatile_result.unwrap_err())
+
+        self.dirty = false
+        Ok(())
+
+    # -----------------------------------------------------------------
+    # Load/Save with custom path (for isolated testing)
+    # -----------------------------------------------------------------
+
+    static fn load_from(path: text) -> Result<TestDatabase, text>:
+        var db = TestDatabase.empty()
+        val stable_result = read_db_file(path)
+        if stable_result.err.?:
+            return Err(stable_result.unwrap_err())
+        val stable_content = stable_result.unwrap()
+        if stable_content.trim() != "":
+            val parsed = parse_stable_db(stable_content)
+            db.interner = parsed.interner
+            db.files = parsed.files
+            db.suites = parsed.suites
+            db.tests = parsed.tests
+        db.rebuild_indexes()
+        Ok(db)
+
+    me save_to(path: text) -> Result<(), text>:
+        val stable_content = serialize_stable_db(
+            self.interner, self.files, self.suites, self.tests
+        )
+        val stable_result = write_db_file_locked(path, stable_content)
+        if stable_result.err.?:
+            return Err(stable_result.unwrap_err())
+        self.dirty = false
+        Ok(())
+
+    # -----------------------------------------------------------------
+    # Intern helpers
+    # -----------------------------------------------------------------
+
+    me get_or_create_file(path: text) -> i64:
+        val path_str = self.interner.intern(path)
+        # O(1) index lookup
+        if self._file_index.has(path_str):
+            return self._file_index[path_str]
+        # Create new file
+        val file_id = self.files.len()
+        self.files.push(FileRecord(file_id: file_id, path_str: path_str))
+        self._file_index[path_str] = file_id
+        self.dirty = true
+        file_id
+
+    me get_or_create_suite(file_path: text, suite_name: text) -> i64:
+        val file_id = self.get_or_create_file(file_path)
+        val name_str = self.interner.intern(suite_name)
+        # O(1) index lookup
+        val key = "{file_id}:{name_str}"
+        if self._suite_index.has(key):
+            return self._suite_index[key]
+        # Create new suite
+        val suite_id = self.suites.len()
+        self.suites.push(SuiteRecord(suite_id: suite_id, file_id: file_id, name_str: name_str))
+        self._suite_index[key] = suite_id
+        self.dirty = true
+        suite_id
+
+    # -----------------------------------------------------------------
+    # Find test by name
+    # -----------------------------------------------------------------
+
+    fn find_test_index(name_str: i64, suite_id: i64) -> i64:
+        var i = 0
+        while i < self.tests.len():
+            if self.tests[i].name_str == name_str and self.tests[i].suite_id == suite_id:
+                return i
+            i = i + 1
+        -1
+
+    # -----------------------------------------------------------------
+    # Update from individual test result
+    # -----------------------------------------------------------------
+
+    me update_test_result(
+        test_name: text,
+        test_file: text,
+        suite_name: text,
+        category: text,
+        status: TestStatus,
+        duration_ms: f64
+    ):
+        val suite_id = self.get_or_create_suite(test_file, suite_name)
+        val name_str = self.interner.intern(test_name)
+        val category_str = self.interner.intern(category)
+        val status_str_val = status_to_str(status)
+        val status_str = self.interner.intern(status_str_val)
+
+        val test_idx = self.find_test_index(name_str, suite_id)
+        val is_new = test_idx < 0
+        var change = "new_test"
+
+        if is_new:
+            # Create new test record
+            self.tests.push(TestRecord(
+                suite_id: suite_id,
+                name_str: name_str,
+                category_str: category_str,
+                status_str: status_str,
+                tags_str: "",
+                description_str: "",
+                valid: true,
+                qualified_by: "",
+                qualified_at: "",
+                qualified_reason: ""
+            ))
+        else:
+            # Update existing test
+            val old_status_str = self.interner.get(self.tests[test_idx].status_str)
+            change = change_type_str(old_status_str, status_str_val, false)
+
+            var t = self.tests[test_idx]
+            t.status_str = status_str
+            t.category_str = category_str
+            t.valid = true
+            self.tests[test_idx] = t
+
+            # Track change
+            if change != "no_change":
+                self.changes.push(ChangeEvent(
+                    test_id: name_str,
+                    change_type: change,
+                    run_id: ""
+                ))
+
+        # C1: Update counters with flaky detection
+        self.update_counter(name_str, status_str_val, is_new, change)
+
+        # Update timing with percentile computation and window cap
+        self.update_timing(name_str, duration_ms)
+
+        self.dirty = true
+
+    # -----------------------------------------------------------------
+    # Counter management (C1: flaky count on PassToFail/FailToPass)
+    # -----------------------------------------------------------------
+
+    me update_counter(name_str: i64, status: text, is_new: bool, change: text):
+        # Map status to short label for last_10_runs
+        val run_label = if status == "passed": "pass" elif status == "failed": "fail" else: "skip"
+
+        # O(1) index lookup
+        if self._counter_index.has(name_str):
+            val i = self._counter_index[name_str]
+            var c = self.counters[i]
+            c.total_runs = c.total_runs + 1
+            if status == "passed":
+                c.passed = c.passed + 1
+            elif status == "failed":
+                c.failed = c.failed + 1
+            # C1: Increment flaky count on status flip
+            if is_flaky_change(change):
+                c.flaky_count = c.flaky_count + 1
+            c.last_change = change
+            # B1: Update last_10_runs (cap at 10)
+            c.last_10_runs = append_run_label(c.last_10_runs, run_label)
+            # B2: Compute failure_rate_pct
+            val total = c.total_runs
+            if total > 0:
+                c.failure_rate_pct = c.failed.to_float() / total.to_float() * 100.0
+            self.counters[i] = c
+        else:
+            val passed_count = if status == "passed": 1 else: 0
+            val failed_count = if status == "failed": 1 else: 0
+            val fail_rate = if status == "failed": 100.0 else: 0.0
+            val idx = self.counters.len()
+            self.counters.push(CounterRecord(
+                test_id: name_str,
+                total_runs: 1,
+                passed: passed_count,
+                failed: failed_count,
+                flaky_count: 0,
+                last_change: "new_test",
+                last_10_runs: run_label,
+                failure_rate_pct: fail_rate
+            ))
+            self._counter_index[name_str] = idx
+
+    # -----------------------------------------------------------------
+    # Timing management (C2: percentiles, C3: window cap, C6: baseline)
+    # -----------------------------------------------------------------
+
+    me update_timing(name_str: i64, duration_ms: f64):
+        val config = TimingConfig.defaults()
+        val now_str = micros_to_rfc3339(time_now_unix_micros())
+
+        # Add timing run
+        self.timing_runs.push(TimingRun(
+            test_id: name_str,
+            timestamp: now_str,
+            duration_ms: duration_ms,
+            outlier: false
+        ))
+
+        # C3: Cap timing runs to max per test
+        self.cap_timing_runs(name_str, config.max_runs_per_test)
+
+        # Collect runs for this test
+        val runs = self.collect_timing_runs(name_str)
+
+        # H4: Remove outliers using IQR method
+        val outlier_result = detect_outliers_iqr(runs, config.outlier_iqr_multiplier)
+        val clean_runs = outlier_result.inliers
+
+        # B3: Compute full statistics
+        val stats = compute_statistics(clean_runs)
+
+        # Update or create summary — O(1) index lookup
+        if self._timing_index.has(name_str):
+            val i = self._timing_index[name_str]
+            var ts = self.timing[i]
+            val old_baseline = ts.baseline_median
+            ts.last_ms = duration_ms
+            ts.p50 = stats.p50
+            ts.p90 = stats.p90
+            ts.p95 = stats.p95
+            ts.p99 = stats.p99
+            ts.min_time = stats.min
+            ts.max_time = stats.max
+            ts.iqr = stats.iqr
+            ts.mean = stats.mean
+            ts.std_dev = stats.std_dev
+            ts.cv_pct = stats.cv_pct
+            # C6: Baseline recomputation with change detection
+            if old_baseline == 0.0 or old_baseline < 0.001:
+                ts.baseline_median = stats.p50
+                ts.baseline_mean = stats.mean
+                ts.baseline_std_dev = stats.std_dev
+                ts.baseline_cv_pct = stats.cv_pct
+                ts.baseline_last_updated = now_str
+                ts.baseline_run_count = stats.count
+                ts.baseline_update_reason = "initial"
+            else:
+                val change_ratio = abs_f64(stats.p50 - old_baseline) / old_baseline
+                if change_ratio > config.baseline_change_threshold:
+                    ts.baseline_median = stats.p50
+                    ts.baseline_mean = stats.mean
+                    ts.baseline_std_dev = stats.std_dev
+                    ts.baseline_cv_pct = stats.cv_pct
+                    ts.baseline_last_updated = now_str
+                    ts.baseline_run_count = stats.count
+                    ts.baseline_update_reason = "threshold_exceeded"
+            self.timing[i] = ts
+        else:
+            val idx = self.timing.len()
+            self.timing.push(TimingSummary(
+                test_id: name_str,
+                last_ms: duration_ms,
+                p50: stats.p50,
+                p90: stats.p90,
+                p95: stats.p95,
+                baseline_median: stats.p50,
+                p99: stats.p99,
+                min_time: stats.min,
+                max_time: stats.max,
+                iqr: stats.iqr,
+                mean: stats.mean,
+                std_dev: stats.std_dev,
+                cv_pct: stats.cv_pct,
+                baseline_mean: stats.mean,
+                baseline_std_dev: stats.std_dev,
+                baseline_cv_pct: stats.cv_pct,
+                baseline_last_updated: now_str,
+                baseline_run_count: stats.count,
+                baseline_update_reason: "initial"
+            ))
+            self._timing_index[name_str] = idx
+
+    me cap_timing_runs(test_id: i64, max_count: i64):
+        # Count runs for this test
+        var count = 0
+        for tr in self.timing_runs:
+            if tr.test_id == test_id:
+                count = count + 1
+
+        # If over cap, rebuild list keeping only the newest max_count runs
+        if count > max_count:
+            var to_skip = count - max_count
+            var new_runs: List<TimingRun> = []
+            for tr in self.timing_runs:
+                if tr.test_id == test_id and to_skip > 0:
+                    to_skip = to_skip - 1
+                    continue
+                new_runs.push(tr)
+            self.timing_runs = new_runs
+
+    fn collect_timing_runs(test_id: i64) -> List<f64>:
+        var runs: List<f64> = []
+        for tr in self.timing_runs:
+            if tr.test_id == test_id:
+                runs.push(tr.duration_ms)
+        runs
+
+    # -----------------------------------------------------------------
+    # Run tracking
+    # -----------------------------------------------------------------
+
+    me start_run() -> text:
+        val now = time_now_unix_micros()
+        val run_id = "run_{now}"
+        val pid = getpid()
+        val host = hostname()
+
+        self.test_runs.push(RunRecord(
+            run_id: run_id,
+            start_time: micros_to_rfc3339(now),
+            end_time: "",
+            pid: pid,
+            hostname: host,
+            status: "running",
+            test_count: 0,
+            passed: 0,
+            failed: 0,
+            crashed: 0,
+            timed_out: 0
+        ))
+        self.dirty = true
+        run_id
+
+    me complete_run(run_id: text, test_count: i64, passed: i64, failed: i64, timed_out: i64):
+        var i = 0
+        while i < self.test_runs.len():
+            if self.test_runs[i].run_id == run_id:
+                self.test_runs[i].end_time = micros_to_rfc3339(time_now_unix_micros())
+                self.test_runs[i].status = "completed"
+                self.test_runs[i].test_count = test_count
+                self.test_runs[i].passed = passed
+                self.test_runs[i].failed = failed
+                self.test_runs[i].timed_out = timed_out
+                self.dirty = true
+                return
+            i = i + 1
+
+    # -----------------------------------------------------------------
+    # H1: Cleanup stale runs (time-based, mark as crashed if > max_age)
+    # -----------------------------------------------------------------
+
+    me cleanup_stale_runs(max_age_hours: i64):
+        val now = time_now_unix_micros()
+        val max_age_micros = max_age_hours * 3600 * 1000000
+        var i = 0
+        while i < self.test_runs.len():
+            if self.test_runs[i].status == "running":
+                # Parse start_time back to micros for comparison
+                val start_micros = parse_rfc3339_to_micros(self.test_runs[i].start_time)
+                if start_micros > 0 and (now - start_micros) > max_age_micros:
+                    self.test_runs[i].status = "crashed"
+                    self.test_runs[i].end_time = micros_to_rfc3339(now)
+                    self.dirty = true
+            i = i + 1
+
+    # -----------------------------------------------------------------
+    # H2: Prune old runs (keep N most recent)
+    # -----------------------------------------------------------------
+
+    me prune_runs(keep_count: i64):
+        if self.test_runs.len() <= keep_count:
+            return
+        val start = self.test_runs.len() - keep_count
+        var new_runs: List<RunRecord> = []
+        var i = start
+        while i < self.test_runs.len():
+            new_runs.push(self.test_runs[i])
+            i = i + 1
+        self.test_runs = new_runs
+        self.dirty = true
+
+    # -----------------------------------------------------------------
+    # H3: List runs with status filter
+    # -----------------------------------------------------------------
+
+    fn list_runs(status_filter: text) -> List<RunRecord>:
+        if status_filter == "" or status_filter == "all":
+            return self.test_runs
+        var result: List<RunRecord> = []
+        for r in self.test_runs:
+            if r.status == status_filter:
+                result.push(r)
+        result
+
+# =========================================================================
+# C7: RFC 3339 timestamp formatting using SFFI
+# =========================================================================
+
+fn micros_to_rfc3339(micros: i64) -> text:
+    val year = timestamp_year(micros)
+    val month = timestamp_month(micros)
+    val day = timestamp_day(micros)
+    val hour = timestamp_hour(micros)
+    val minute = timestamp_minute(micros)
+    val second = timestamp_second(micros)
+    val y = pad_int(year, 4)
+    val mo = pad_int(month, 2)
+    val d = pad_int(day, 2)
+    val h = pad_int(hour, 2)
+    val mi = pad_int(minute, 2)
+    val s = pad_int(second, 2)
+    "{y}-{mo}-{d}T{h}:{mi}:{s}Z"
+
+fn pad_int(n: i64, width: i64) -> text:
+    var s = "{n}"
+    while s.len() < width:
+        s = "0{s}"
+    s
+
+fn parse_rfc3339_to_micros(ts: text) -> i64:
+    # Parse "YYYY-MM-DDTHH:MM:SSZ" back to approximate micros
+    # Falls back to 0 on parse failure
+    if ts.len() < 19:
+        return 0
+    val year = ts[0:4].parse_int() ?? 0
+    val month = ts[5:7].parse_int() ?? 1
+    val day = ts[8:10].parse_int() ?? 1
+    val hour = ts[11:13].parse_int() ?? 0
+    val minute = ts[14:16].parse_int() ?? 0
+    val second = ts[17:19].parse_int() ?? 0
+    # Approximate: use days since epoch
+    # Rough estimate: 365.25 days/year, 30.44 days/month
+    val days = (year - 1970) * 365 + (month - 1) * 30 + (day - 1)
+    val secs = days * 86400 + hour * 3600 + minute * 60 + second
+    secs * 1000000
+
+# =========================================================================
+# Helper: append run label to last_10_runs (cap at 10 entries)
+# =========================================================================
+
+fn append_run_label(existing: text, label: text) -> text:
+    if existing == "":
+        return label
+    val parts = existing.split(",")
+    var trimmed: List<text> = []
+    for p in parts:
+        trimmed.push(p.trim())
+    trimmed.push(label)
+    # Cap at 10
+    while trimmed.len() > 10:
+        trimmed = trimmed[1:]
+    trimmed.join(",")
+

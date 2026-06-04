@@ -1,0 +1,249 @@
+# Cell Model
+#
+# Types for spreadsheet cells, references, and formatting.
+
+# =========================================================================
+# Cell Value Types
+# =========================================================================
+
+enum CellValue:
+    Empty
+    TextVal(value: text)
+    NumberVal(value: f64)
+    BoolVal(value: bool)
+    FormulaVal(expr: text, cached_display: text)
+    ErrorVal(message: text)
+
+struct CellStyle:
+    bold: bool
+    italic: bool
+    align: text        # "left", "center", "right"
+    format: text       # "general", "number:2", "currency:$:2", "percent:1", "date"
+
+struct Cell:
+    value: CellValue
+    style: CellStyle
+
+struct CellRef:
+    col: i32    # 0-based (A=0, B=1, ...)
+    row: i32    # 0-based
+
+# =========================================================================
+# Default Constructors
+# =========================================================================
+
+fn default_style() -> CellStyle:
+    """Return a default cell style: left-aligned, general format, no bold/italic."""
+    CellStyle(
+        bold: false,
+        italic: false,
+        align: "left",
+        format: "general"
+    )
+
+fn empty_cell() -> Cell:
+    """Return an empty cell with default style."""
+    Cell(value: CellValue.Empty, style: default_style())
+
+fn text_cell(value: text) -> Cell:
+    """Create a cell containing a text value."""
+    Cell(value: CellValue.TextVal(value: value), style: default_style())
+
+fn number_cell(value: f64) -> Cell:
+    """Create a cell containing a numeric value."""
+    Cell(value: CellValue.NumberVal(value: value), style: default_style())
+
+fn formula_cell(expr: text) -> Cell:
+    """Create a cell containing a formula expression. Cached display starts empty."""
+    Cell(value: CellValue.FormulaVal(expr: expr, cached_display: ""), style: default_style())
+
+# =========================================================================
+# Cell Display
+# =========================================================================
+
+fn cell_display_text(cell: Cell) -> text:
+    """Get the display string for a cell based on its value and format style."""
+    val fmt = cell.style.format
+    match cell.value:
+        CellValue.Empty:
+            return ""
+        CellValue.TextVal(value):
+            return value
+        CellValue.NumberVal(value):
+            return _format_number_by_style(value, fmt)
+        CellValue.BoolVal(value):
+            if value:
+                return "TRUE"
+            return "FALSE"
+        CellValue.FormulaVal(expr, cached_display):
+            if cached_display != "":
+                return cached_display
+            return "={expr}"
+        CellValue.ErrorVal(message):
+            return "#ERR: {message}"
+    return ""
+
+fn _format_number_by_style(value: f64, fmt: text) -> text:
+    """Format a number according to the cell format string."""
+    if fmt == "general":
+        return _format_general(value)
+    if fmt.starts_with("number:"):
+        val dec_str = fmt.substring(7)
+        val decimals = _parse_small_int(dec_str)
+        return _format_fixed(value, decimals)
+    if fmt.starts_with("currency:"):
+        # "currency:$:2"
+        val rest = fmt.substring(9)
+        val parts = rest.split(":")
+        if parts.len() >= 2:
+            val symbol = parts[0]
+            val decimals = _parse_small_int(parts[1])
+            return "{symbol}{_format_fixed(value, decimals)}"
+        return "{value}"
+    if fmt.starts_with("percent:"):
+        val dec_str = fmt.substring(8)
+        val decimals = _parse_small_int(dec_str)
+        val pct = value * 100.0
+        return "{_format_fixed(pct, decimals)}%"
+    if fmt == "date":
+        return "{value}"
+    return _format_general(value)
+
+fn _format_general(value: f64) -> text:
+    """Format a number in general mode: show integer form if no fraction."""
+    val int_val = value.to_i64()
+    val diff = value - int_val.to_f64()
+    if diff == 0.0:
+        return "{int_val}"
+    return "{value}"
+
+fn _format_fixed(value: f64, decimals: i32) -> text:
+    """Format a number to a fixed number of decimal places."""
+    if decimals <= 0:
+        val rounded = (value + 0.5).to_i64()
+        return "{rounded}"
+    val factor = _pow10(decimals)
+    val shifted = value * factor
+    val rounded_i = (shifted + 0.5).to_i64()
+    val int_part = rounded_i / factor.to_i64()
+    val frac_part = rounded_i - (int_part * factor.to_i64())
+    var frac_str = "{frac_part}"
+    # Pad with leading zeros
+    while frac_str.len() < decimals:
+        frac_str = "0{frac_str}"
+    return "{int_part}.{frac_str}"
+
+fn _pow10(exp: i32) -> f64:
+    """Calculate 10^exp for small non-negative exponents."""
+    var result = 1.0
+    var i = 0
+    while i < exp:
+        result = result * 10.0
+        i = i + 1
+    result
+
+fn _parse_small_int(s: text) -> i32:
+    """Parse a small non-negative integer from text. Returns 0 on failure."""
+    if s.len() == 0:
+        return 0
+    var result = 0
+    var i = 0
+    while i < s.len():
+        val c = s.char_at(i)
+        if _is_digit_char(c):
+            result = result * 10 + _digit_value(c)
+        else:
+            return 0
+        i = i + 1
+    result
+
+# =========================================================================
+# Column / Reference Conversion
+# =========================================================================
+
+fn col_to_letter(col: i32) -> text:
+    """Convert 0-based column index to letter(s). 0->A, 1->B, 25->Z, 26->AA."""
+    if col < 0:
+        return "A"
+    if col < 26:
+        return _chr_upper(col)
+    # Multi-letter: e.g. 26->AA, 27->AB
+    var result = ""
+    var remaining = col
+    while remaining >= 0:
+        val digit = remaining % 26
+        result = "{_chr_upper(digit)}{result}"
+        remaining = (remaining / 26) - 1
+    result
+
+fn _chr_upper(index: i32) -> text:
+    """Return single uppercase letter for index 0-25."""
+    val letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if index >= 0 and index < 26:
+        return letters.char_at(index)
+    return "A"
+
+fn letter_to_col(letter: text) -> i32:
+    """Convert column letter(s) to 0-based index. A->0, AA->26."""
+    val upper = letter.upper()
+    var result = 0
+    var i = 0
+    while i < upper.len():
+        val c = upper.char_at(i)
+        val code = c.char_code_at(0)
+        val char_val = code - 65  # 'A' = 65
+        if char_val < 0 or char_val > 25:
+            return 0
+        result = result * 26 + char_val + 1
+        i = i + 1
+    result - 1
+
+fn cell_ref_to_string(ref_val: CellRef) -> text:
+    """Convert a CellRef to A1-notation string. CellRef(1, 2) -> B3."""
+    val col_str = col_to_letter(ref_val.col)
+    val row_str = "{ref_val.row + 1}"
+    "{col_str}{row_str}"
+
+fn parse_cell_ref(ref_str: text) -> CellRef?:
+    """Parse A1-notation string to CellRef. B3 -> CellRef(1, 2). Returns nil if invalid."""
+    if ref_str.len() == 0:
+        return nil
+    val upper = ref_str.upper()
+    # Split into letter part and digit part
+    var letter_part = ""
+    var digit_part = ""
+    var i = 0
+    while i < upper.len():
+        val c = upper.char_at(i)
+        val code = c.char_code_at(0)
+        if code >= 65 and code <= 90:
+            if digit_part.len() > 0:
+                # Letters after digits: invalid
+                return nil
+            letter_part = "{letter_part}{c}"
+        elif _is_digit_char(c):
+            digit_part = "{digit_part}{c}"
+        else:
+            return nil
+        i = i + 1
+    if letter_part.len() == 0 or digit_part.len() == 0:
+        return nil
+    val col = letter_to_col(letter_part)
+    val row_num = _parse_small_int(digit_part)
+    if row_num <= 0:
+        return nil
+    CellRef(col: col, row: row_num - 1)
+
+# =========================================================================
+# Character Helpers
+# =========================================================================
+
+fn _is_digit_char(c: text) -> bool:
+    """Check if a single character is a digit 0-9."""
+    (c == "0" or c == "1" or c == "2" or c == "3" or c == "4" or
+     c == "5" or c == "6" or c == "7" or c == "8" or c == "9")
+
+fn _digit_value(c: text) -> i32:
+    """Return numeric value of a digit character."""
+    val code = c.char_code_at(0)
+    code - 48  # '0' = 48

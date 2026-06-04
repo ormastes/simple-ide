@@ -1,0 +1,492 @@
+# Dashboard CLI — Data Collectors
+#
+# Extracted from main.spl. Contains:
+# - collect_features, collect_todos, collect_tests, collect_plans, collect_coverage
+# - compute_summary
+
+use std.nogc_sync_mut.io.file_ops.{file_read, file_write, file_exists}
+use app.dashboard.main.{Table, load_table, load_table_named, header_index, get_field, count_eq, sum_int, count_nonempty, write_table, today_date, itos, DASHBOARD_TABLE_DIR}
+use std.nogc_sync_mut.io.process_ops.{shell_output_trimmed}
+
+fn load_first_named_table(paths: [text], name: text) -> Table:
+    for path in paths:
+        if file_exists(path):
+            val table = load_table_named(path, name)
+            if table.headers.len() > 0 or table.rows.len() > 0:
+                return table
+    Table(name: name, headers: [], rows: [])
+
+fn path_basename(path: text) -> text:
+    if path.contains("/"):
+        val last_slash = path.last_index_of("/") ?? -1
+        return path[last_slash + 1:]
+    return path
+
+fn strip_extension(name: text) -> text:
+    if name.contains("."):
+        val dot = name.last_index_of(".") ?? name.len()
+        return name[0:dot]
+    return name
+
+fn index_of_from(s: text, needle: text, start: i64) -> i64:
+    if needle == "":
+        return start
+    if start < 0:
+        return -1
+    if start >= s.len():
+        return -1
+    var i = start
+    while i + needle.len() <= s.len():
+        if s[i:i + needle.len()] == needle:
+            return i
+        i = i + 1
+    return -1
+
+fn plan_markdown_files() -> [text]:
+    val out = shell_output_trimmed("find doc/03_plan -maxdepth 1 -type f -name '*.md' | sort", "")
+    if out.trim() == "":
+        return []
+    var files: [text] = []
+    for line in out.split("\n"):
+        val trimmed = line.trim()
+        if trimmed != "":
+            files.push(trimmed)
+    return files
+
+fn detect_plan_title(path: text, content: text) -> text:
+    for line in content.split("\n"):
+        val trimmed = line.trim()
+        if trimmed.starts_with("# "):
+            return trimmed[2:].trim()
+    return strip_extension(path_basename(path))
+
+fn count_markdown_steps(content: text) -> (i64, i64):
+    var total = 0
+    var completed = 0
+    for line in content.split("\n"):
+        val trimmed = line.trim()
+        if trimmed.starts_with("- [x]") or trimmed.starts_with("- [X]"):
+            total = total + 1
+            completed = completed + 1
+        elif trimmed.starts_with("- [ ]"):
+            total = total + 1
+    (total, completed)
+
+fn detect_plan_blocked(content: text) -> bool:
+    val lower = content.lower()
+    return lower.contains("blocked") or lower.contains("waiting on")
+
+fn parse_search_hit(line: text) -> (text, text, text):
+    val first = line.index_of(":") ?? -1
+    if first < 0:
+        return ("", "", line.trim())
+    val second = index_of_from(line, ":", first + 1)
+    if second < 0:
+        return (line[0:first], "", line[first + 1:].trim())
+    val path = line[0:first]
+    val line_num = line[first + 1:second].trim()
+    val text = line[second + 1:].trim()
+    (path, line_num, text)
+
+fn infer_todo_area(path: text) -> text:
+    val lower = path.lower()
+    if lower.contains("/test") or lower.starts_with("test/"):
+        return "test"
+    if lower.contains("/doc") or lower.starts_with("doc/"):
+        return "doc"
+    if lower.contains("/ui") or lower.contains("/web_dashboard") or lower.contains("/llm_dashboard"):
+        return "ui"
+    if lower.contains("/driver/"):
+        return "driver"
+    if lower.contains("/compiler/"):
+        return "compiler"
+    if lower.contains("/loader/"):
+        return "loader"
+    if lower.contains("/pkg/"):
+        return "pkg"
+    if lower.contains("/stdlib/"):
+        return "stdlib"
+    if lower.contains("/parser/"):
+        return "parser"
+    "runtime"
+
+fn infer_todo_priority(text_line: text) -> text:
+    val lower = text_line.lower()
+    if text_line.contains("[P0]") or lower.contains("[critical]") or lower.contains("[p0]"):
+        return "P0"
+    if text_line.contains("[P1]") or lower.contains("[high]") or lower.contains("[p1]"):
+        return "P1"
+    if text_line.contains("[P2]") or lower.contains("[medium]") or lower.contains("[p2]"):
+        return "P2"
+    if text_line.contains("[P3]") or lower.contains("[low]") or lower.contains("[p3]"):
+        return "P3"
+    if lower.contains("fixme") or lower.contains("pass_todo"):
+        return "P1"
+    "P2"
+
+fn infer_todo_keyword(text_line: text) -> text:
+    val lower = text_line.lower()
+    if lower.contains("fixme"):
+        return "FIXME"
+    "TODO"
+
+fn clean_todo_description(text_line: text) -> text:
+    var text = text_line.trim()
+    if text.starts_with("#"):
+        text = text[1:].trim()
+    if text.starts_with("//"):
+        text = text[2:].trim()
+    if text.starts_with("///"):
+        text = text[3:].trim()
+    if text.starts_with("<!--"):
+        text = text.replace("<!--", "").replace("-->", "").trim()
+    text
+
+fn scan_source_findings(existing_keys: Dict<text, text>, next_id_start: i64, today: text) -> [[text]]:
+    val cmd = "rg -n --no-heading --glob '*.spl' --glob '*.rs' --glob '*.md' 'TODO:|FIXME:|pass_todo' src app test doc/03_plan doc/04_architecture doc/05_design"
+    val out = shell_output_trimmed(cmd, "")
+    if out.trim() == "":
+        return []
+
+    var rows: [[text]] = []
+    var next_id = next_id_start
+    for raw_line in out.split("\n"):
+        val hit = raw_line.trim()
+        if hit == "":
+            continue
+        val parsed = parse_search_hit(hit)
+        val file = parsed.0
+        val line_num = parsed.1
+        val text_line = parsed.2
+        if file == "" or line_num == "":
+            continue
+        val key = "{file}:{line_num}"
+        if existing_keys.has(key):
+            continue
+
+        val description = clean_todo_description(text_line)
+        val lower = description.lower()
+        if lower.contains("@skip_todo"):
+            continue
+
+        rows.push([
+            "scan_{next_id}",
+            infer_todo_keyword(description),
+            infer_todo_area(file),
+            infer_todo_priority(description),
+            description,
+            file,
+            line_num,
+            "",
+            "",
+            "open",
+            "0",
+            "",
+            today
+        ])
+        next_id = next_id + 1
+    rows
+
+fn next_numeric_id(rows: [[text]]) -> i64:
+    var max_id = 0
+    for row in rows:
+        if row.len() > 0:
+            val raw = row[0]
+            if raw.starts_with("scan_"):
+                continue
+            val value = raw.to_i64() ?? 0
+            if value > max_id:
+                max_id = value
+    max_id + 1
+
+fn collect_features():
+    val src = load_first_named_table([
+        "doc/06_spec/feature_db.sdn",
+        "doc/08_tracking/feature/feature_db.sdn"
+    ], "features")
+    val idx = header_index(src.headers)
+    var rows: [[text]] = []
+    val today = today_date()
+
+    for row in src.rows:
+        val valid = get_field(row, idx, "valid")
+        if valid != "" and valid != "true":
+            continue
+        val id = get_field(row, idx, "id")
+        if id == "":
+            continue
+        val category = get_field(row, idx, "category")
+        val name = get_field(row, idx, "name")
+        val status = get_field(row, idx, "status")
+        rows.push([id, category, name, status, "", today])
+
+    write_table("{DASHBOARD_TABLE_DIR}/features.sdn", "features",
+        ["id", "category", "name", "status", "test_coverage", "last_updated"], rows)
+    print "  [OK] Feature database"
+
+fn collect_todos():
+    val src = load_first_named_table([
+        "doc/08_tracking/todo/todo_db.sdn",
+        "doc/08_tracking/todo/todo_db.sdn"
+    ], "todos")
+    val idx = header_index(src.headers)
+    var rows: [[text]] = []
+    val today = today_date()
+    var existing_keys = {}
+
+    for row in src.rows:
+        val valid = get_field(row, idx, "valid")
+        if valid != "" and valid != "true":
+            continue
+        val id = get_field(row, idx, "id")
+        if id == "":
+            continue
+        val keyword = get_field(row, idx, "keyword")
+        val area = get_field(row, idx, "area")
+        val priority = get_field(row, idx, "priority")
+        val description = get_field(row, idx, "description")
+        val file = get_field(row, idx, "file")
+        val line = get_field(row, idx, "line")
+        val issue = get_field(row, idx, "issue")
+        val blocked = get_field(row, idx, "blocked")
+        val status = get_field(row, idx, "status")
+        rows.push([id, keyword, area, priority, description, file, line, issue, blocked, status, "0", "", today])
+        if file != "" and line != "":
+            existing_keys["{file}:{line}"] = "true"
+
+    val source_rows = scan_source_findings(existing_keys, next_numeric_id(rows), today)
+    for row in source_rows:
+        rows.push(row)
+
+    write_table("{DASHBOARD_TABLE_DIR}/todos.sdn", "todos",
+        ["id", "keyword", "area", "priority", "description", "file", "line", "issue", "blocked", "status", "age_days", "assigned", "last_updated"], rows)
+    print "  [OK] TODO items"
+
+fn collect_tests():
+    val test_db = if file_exists("doc/08_tracking/test/test_db.sdn"):
+        "doc/08_tracking/test/test_db.sdn"
+    else:
+        "doc/08_tracking/test/test_db.sdn"
+    val strings = load_table_named(test_db, "strings")
+    val files = load_table_named(test_db, "files")
+    val suites = load_table_named(test_db, "suites")
+    val tests = load_table_named(test_db, "tests")
+
+    var strings_map = {}
+    for row in strings.rows:
+        if row.len() >= 2:
+            strings_map[row[0]] = row[1]
+
+    var file_map = {}
+    for row in files.rows:
+        if row.len() >= 2:
+            val path_id = row[1]
+            val path = if strings_map.has(path_id): strings_map[path_id] else: ""
+            file_map[row[0]] = path
+
+    var suite_file = {}
+    var suite_title = {}
+    for row in suites.rows:
+        if row.len() >= 3:
+            val suite_id = row[0]
+            val file_id = row[1]
+            val name_id = row[2]
+            suite_file[suite_id] = if file_map.has(file_id): file_map[file_id] else: ""
+            suite_title[suite_id] = if strings_map.has(name_id): strings_map[name_id] else: ""
+
+    var suite_total = {}
+    var suite_passed = {}
+    var suite_failed = {}
+    var suite_skipped = {}
+    var suite_category = {}
+    var suite_has_docs = {}
+
+    for row in tests.rows:
+        if row.len() < 8:
+            continue
+        val suite_id = row[1]
+        val category_id = row[3]
+        val status_id = row[4]
+        val desc_id = row[6]
+        val valid = row[7]
+        if valid != "true" and valid != "":
+            continue
+
+        val status = if strings_map.has(status_id): strings_map[status_id] else: ""
+        val category = if strings_map.has(category_id): strings_map[category_id] else: "unknown"
+        val desc = if strings_map.has(desc_id): strings_map[desc_id] else: ""
+
+        if suite_total.has(suite_id):
+            suite_total[suite_id] = suite_total[suite_id] + 1
+        else:
+            suite_total[suite_id] = 1
+
+        if status == "passed":
+            if suite_passed.has(suite_id):
+                suite_passed[suite_id] = suite_passed[suite_id] + 1
+            else:
+                suite_passed[suite_id] = 1
+        elif status == "failed":
+            if suite_failed.has(suite_id):
+                suite_failed[suite_id] = suite_failed[suite_id] + 1
+            else:
+                suite_failed[suite_id] = 1
+        elif status == "skipped" or status == "ignored":
+            if suite_skipped.has(suite_id):
+                suite_skipped[suite_id] = suite_skipped[suite_id] + 1
+            else:
+                suite_skipped[suite_id] = 1
+
+        if not suite_category.has(suite_id) and category != "":
+            suite_category[suite_id] = category
+
+        if desc.trim() != "":
+            suite_has_docs[suite_id] = "true"
+
+    var spipe_rows: [[text]] = []
+    var total_all = 0
+    var passed_all = 0
+    var failed_all = 0
+    var skipped_all = 0
+    var next_id = 1
+    val today = today_date()
+
+    for suite_id in suite_total.keys():
+        val total = suite_total[suite_id]
+        val passed = if suite_passed.has(suite_id): suite_passed[suite_id] else: 0
+        val failed = if suite_failed.has(suite_id): suite_failed[suite_id] else: 0
+        val skipped = if suite_skipped.has(suite_id): suite_skipped[suite_id] else: 0
+        val status = if failed > 0: "failed" else: "passed"
+        val file = if suite_file.has(suite_id): suite_file[suite_id] else: ""
+        val title = if suite_title.has(suite_id): suite_title[suite_id] else: ""
+        val category = if suite_category.has(suite_id): suite_category[suite_id] else: "unknown"
+        val has_docs = if suite_has_docs.has(suite_id): suite_has_docs[suite_id] else: "false"
+
+        spipe_rows.push([itos(next_id), file, title, category, "-", status, itos(total), itos(passed), itos(failed), "0", has_docs, today])
+        next_id = next_id + 1
+
+        total_all = total_all + total
+        passed_all = passed_all + passed
+        failed_all = failed_all + failed
+        skipped_all = skipped_all + skipped
+
+    write_table("{DASHBOARD_TABLE_DIR}/spipe_tests.sdn", "spipe_tests",
+        ["id", "file", "title", "category", "difficulty", "status", "total_tests", "passed", "failed", "duration_ms", "has_docs", "last_run"], spipe_rows)
+
+    val test_status_rows = [[
+        "1", "spipe", "all", itos(total_all), itos(passed_all),
+        itos(failed_all), itos(skipped_all), "0", today
+    ]]
+    write_table("{DASHBOARD_TABLE_DIR}/test_status.sdn", "test_status",
+        ["id", "mode", "suite", "total", "passed", "failed", "skipped", "duration_ms", "timestamp"], test_status_rows)
+
+    print "  [OK] Test results"
+
+fn collect_plans():
+    val src = load_first_named_table([
+        "doc/08_tracking/task/task_db.sdn"
+    ], "tasks")
+    val idx = header_index(src.headers)
+    var rows: [[text]] = []
+    val today = today_date()
+    var seen_titles = {}
+
+    for row in src.rows:
+        val valid = get_field(row, idx, "valid")
+        if valid != "" and valid != "true":
+            continue
+        val id = get_field(row, idx, "id")
+        if id == "":
+            continue
+        val title = get_field(row, idx, "name")
+        val status = get_field(row, idx, "status")
+        rows.push([id, "", title, status, "", today, "0", "0", ""])
+        if title != "":
+            seen_titles[title] = "true"
+
+    var next_id = rows.len() + 1
+    for path in plan_markdown_files():
+        val content = file_read(path)
+        if content.trim() == "":
+            continue
+        val title = detect_plan_title(path, content)
+        if seen_titles.has(title):
+            continue
+        val counts = count_markdown_steps(content)
+        val total_steps = counts.0
+        val completed_steps = counts.1
+        val blocked = detect_plan_blocked(content)
+        val status = if total_steps > 0 and completed_steps == total_steps:
+            "complete"
+        elif completed_steps > 0:
+            "in_progress"
+        else:
+            "planned"
+        rows.push([
+            itos(next_id),
+            path,
+            title,
+            status,
+            "",
+            today,
+            itos(total_steps),
+            itos(completed_steps),
+            if blocked: "true" else: ""
+        ])
+        next_id = next_id + 1
+
+    write_table("{DASHBOARD_TABLE_DIR}/plans.sdn", "plans",
+        ["id", "file", "title", "status", "created", "last_updated", "total_steps", "completed_steps", "blocked"], rows)
+
+fn collect_coverage():
+    val src = load_table_named("build/coverage/coverage.sdn", "coverage")
+    val rows = if src.rows.len() > 0: src.rows else: []
+    write_table("{DASHBOARD_TABLE_DIR}/coverage.sdn", "coverage",
+        ["id", "level", "crate", "file", "lines_total", "lines_covered", "lines_percent", "branches_covered", "branches_percent", "timestamp"], rows)
+    print "  [OK] Coverage data"
+
+fn compute_summary() -> Dict<text, text>:
+    val feature_table = load_table("{DASHBOARD_TABLE_DIR}/features.sdn")
+    val todo_table = load_table("{DASHBOARD_TABLE_DIR}/todos.sdn")
+    val test_table = load_table("{DASHBOARD_TABLE_DIR}/test_status.sdn")
+    val coverage_table = load_table("{DASHBOARD_TABLE_DIR}/coverage.sdn")
+
+    val feature_idx = header_index(feature_table.headers)
+    val todo_idx = header_index(todo_table.headers)
+    val test_idx = header_index(test_table.headers)
+    val coverage_idx = header_index(coverage_table.headers)
+
+    val features_total = feature_table.rows.len()
+    val features_complete = count_eq(feature_table.rows, feature_idx, "status", "complete")
+    val features_in_progress = count_eq(feature_table.rows, feature_idx, "status", "in_progress")
+    val features_planned = count_eq(feature_table.rows, feature_idx, "status", "planned")
+
+    val todos_total = todo_table.rows.len()
+    val todos_open = count_eq(todo_table.rows, todo_idx, "status", "open")
+    val todos_blocked = count_nonempty(todo_table.rows, todo_idx, "blocked")
+
+    val tests_total = sum_int(test_table.rows, test_idx, "total")
+    val tests_passed = sum_int(test_table.rows, test_idx, "passed")
+    val tests_failed = sum_int(test_table.rows, test_idx, "failed")
+    val tests_skipped = sum_int(test_table.rows, test_idx, "skipped")
+
+    val lines_total = sum_int(coverage_table.rows, coverage_idx, "lines_total")
+    val lines_covered = sum_int(coverage_table.rows, coverage_idx, "lines_covered")
+    val coverage_pct = if lines_total > 0: (lines_covered * 100) / lines_total else: 0
+
+    {
+        "features_total": itos(features_total),
+        "features_complete": itos(features_complete),
+        "features_in_progress": itos(features_in_progress),
+        "features_planned": itos(features_planned),
+        "todos_total": itos(todos_total),
+        "todos_open": itos(todos_open),
+        "todos_blocked": itos(todos_blocked),
+        "tests_total": itos(tests_total),
+        "tests_passed": itos(tests_passed),
+        "tests_failed": itos(tests_failed),
+        "tests_skipped": itos(tests_skipped),
+        "lines_total": itos(lines_total),
+        "lines_covered": itos(lines_covered),
+        "coverage_pct": itos(coverage_pct)
+    }

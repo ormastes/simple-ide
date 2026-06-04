@@ -1,0 +1,110 @@
+# SDoctest File Discovery
+#
+# Discovers markdown files from configured sources and applies ignore patterns.
+
+use std.io.{file_exists}
+use std.io.{dir_walk, is_dir}
+use std.test_runner.sdoctest.types.{SdoctestConfig, SdoctestIgnore}
+use std.test_runner.sdoctest.glob.glob_match_path
+
+# =========================================================================
+# Public API
+# =========================================================================
+
+fn discover_sdoctest_files(config: SdoctestConfig, cli_path: text) -> [text]:
+    # If CLI path override is given, use it directly
+    if cli_path != "":
+        if is_dir(cli_path):
+            return discover_from_dir(dir_path: cli_path, pattern: "*.md", ignore: config.ignore)
+        # Single file - only include markdown files for sdoctest
+        if file_exists(cli_path) and cli_path.ends_with(".md"):
+            return [cli_path]
+        return []
+
+    # Walk all configured sources
+    var files: [text] = []
+
+    for source in config.sources:
+        if source.path == "":
+            continue
+
+        if source.is_dir:
+            val dir_files = discover_from_dir(dir_path: source.path, pattern: source.pattern, ignore: config.ignore)
+            for f in dir_files:
+                if not list_contains(files, f):
+                    files.push(f)
+        else:
+            if file_exists(source.path):
+                if not is_ignored(source.path, config.ignore):
+                    if not list_contains(files, source.path):
+                        files.push(source.path)
+
+    files
+
+# =========================================================================
+# Directory Walking
+# =========================================================================
+
+fn discover_from_dir(dir_path: text, pattern: text, ignore: SdoctestIgnore) -> [text]:
+    var files: [text] = []
+
+    if not is_dir(dir_path):
+        return files
+
+    val all_files = dir_walk(dir_path)
+
+    for file_path in all_files:
+        # Must be a markdown file
+        if not file_path.ends_with(".md"):
+            continue
+
+        # Apply glob pattern filter
+        if pattern != "" and pattern != "*.md":
+            val basename = extract_basename(file_path)
+            if not glob_match_path(basename, pattern):
+                continue
+
+        # Apply ignore patterns
+        if is_ignored(file_path, ignore):
+            continue
+
+        files.push(file_path)
+
+    files
+
+# =========================================================================
+# Ignore Pattern Checking
+# =========================================================================
+
+fn is_ignored(file_path: text, ignore: SdoctestIgnore) -> bool:
+    for pattern in ignore.paths:
+        if glob_match_path(file_path, pattern):
+            return true
+    false
+
+fn is_tag_ignored(tags: [text], ignore: SdoctestIgnore) -> bool:
+    for tag in tags:
+        for ignored_tag in ignore.tags:
+            if tag == ignored_tag:
+                return true
+    false
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn extract_basename(path: text) -> text:
+    val idx = path.last_index_of("/") ?? -1
+    if idx >= 0:
+        return path[idx + 1:]
+    path
+
+fn list_contains(items: [text], item: text) -> bool:
+    for x in items:
+        if x == item:
+            return true
+    false
+
+# =========================================================================
+# Exports
+# =========================================================================

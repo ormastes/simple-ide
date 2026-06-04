@@ -1,0 +1,99 @@
+"""
+Diagnostics Provider for the Simple VSCode Extension.
+
+Maps LSP publishDiagnostics notifications to the editor's
+diagnostic collection format.
+"""
+
+struct VscodeDiagnostic:
+    start_line: i64
+    start_col: i64
+    end_line: i64
+    end_col: i64
+    message: text
+    severity: i64
+    source: text
+    code: text
+
+struct DiagnosticCollection:
+    uri: text
+    diagnostics: [VscodeDiagnostic]
+
+struct DiagnosticsProvider:
+    collections: [DiagnosticCollection]
+
+struct LspDiagnostic:
+    start_line: i64
+    start_character: i64
+    end_line: i64
+    end_character: i64
+    message: text
+    severity: i64
+    source: text
+    code: text
+
+fn diagnostics_provider_create() -> DiagnosticsProvider:
+    DiagnosticsProvider(collections: [])
+
+fn map_lsp_severity(severity: i64) -> i64:
+    if severity == 1:
+        return 0
+    if severity == 2:
+        return 1
+    if severity == 3:
+        return 2
+    3
+
+fn map_lsp_diagnostic(d: LspDiagnostic) -> VscodeDiagnostic:
+    VscodeDiagnostic(
+        start_line: d.start_line,
+        start_col: d.start_character,
+        end_line: d.end_line,
+        end_col: d.end_character,
+        message: d.message,
+        severity: map_lsp_severity(d.severity),
+        source: d.source,
+        code: d.code
+    )
+
+fn diagnostics_provider_handle(provider: DiagnosticsProvider, uri: text, lsp_diagnostics: [LspDiagnostic]):
+    var mapped: [VscodeDiagnostic] = []
+    var i = 0
+    while i < lsp_diagnostics.len():
+        mapped.push(map_lsp_diagnostic(lsp_diagnostics[i]))
+        i = i + 1
+    var found = false
+    var j = 0
+    while j < provider.collections.len():
+        if provider.collections[j].uri == uri:
+            provider.collections[j] = DiagnosticCollection(uri: uri, diagnostics: mapped)
+            found = true
+        j = j + 1
+    if not found:
+        provider.collections.push(DiagnosticCollection(uri: uri, diagnostics: mapped))
+
+fn diagnostics_provider_clear(provider: DiagnosticsProvider, uri: text):
+    var i = 0
+    while i < provider.collections.len():
+        if provider.collections[i].uri == uri:
+            provider.collections[i] = DiagnosticCollection(uri: uri, diagnostics: [])
+        i = i + 1
+
+fn diagnostics_provider_clear_all(provider: DiagnosticsProvider):
+    provider.collections = []
+
+fn diagnostics_provider_get(provider: DiagnosticsProvider, uri: text) -> [VscodeDiagnostic]:
+    var i = 0
+    while i < provider.collections.len():
+        if provider.collections[i].uri == uri:
+            return provider.collections[i].diagnostics
+        i = i + 1
+    []
+
+fn diagnostics_provider_total_count(provider: DiagnosticsProvider) -> i64:
+    var count = 0
+    var i = 0
+    while i < provider.collections.len():
+        count = count + provider.collections[i].diagnostics.len()
+        i = i + 1
+    count

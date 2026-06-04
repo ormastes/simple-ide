@@ -1,0 +1,270 @@
+# LLM Dashboard Render Adapter
+#
+# Compatibility adapter that bridges the llm_dashboard's existing TUI
+# and GUI views to the shared ui.render contract.  Takes agent data,
+# activity feeds, and room layouts as input and produces a RenderResult
+# with text (for TUI/CLI export) and html (for web/GUI export).
+#
+# Delegates to existing tui/ and gui/ modules rather than duplicating
+# rendering logic.
+
+use std.text.{join_lines}
+use app.llm_dashboard.data.store.{AgentDashboardStore}
+use app.llm_dashboard.data.types.{
+    RoomKind, room_name, ActivityEntry, AgentNode, LLMStatus,
+    provider_name, format_tokens, format_timestamp, truncate_text
+}
+use app.llm_dashboard.tui.rooms.{RoomState, create_room_set, render_room_content,
+    build_research_content, build_code_content, build_skills_content, build_server_content}
+use app.llm_dashboard.tui.agent_panel.{render_agent_tree}
+use app.llm_dashboard.tui.activity_feed.{FeedState, render_feed}
+use app.llm_dashboard.tui.status_bar.{render_status_bar}
+use app.llm_dashboard.gui.html_views.{generate_agents_html}
+use app.ui.render.ansi.{RESET, BOLD, DIM, CYAN}
+use app.ui.render.types.{RenderConfig, RenderRequest, RenderResult}
+
+# =========================================================================
+# Render Adapter Entry Point
+# =========================================================================
+
+fn render_dashboard(config: RenderConfig, store: AgentDashboardStore) -> RenderResult:
+    """Render the LLM dashboard via the shared render contract.
+
+    Dispatches to text or HTML rendering based on config.format.
+    Both paths delegate to existing tui/ and gui/ modules.
+    """
+    match config.format:
+        "html":
+            return render_as_html(store, config)
+        "text":
+            return render_as_text(store, config)
+        "tree":
+            return render_as_tree(store, config)
+        _:
+            var result = RenderResult.empty()
+            result.warnings = ["Unknown format: {config.format}, falling back to text"]
+            val text_result = render_as_text(store, config)
+            result.text_output = text_result.text_output
+            result.metadata = text_result.metadata
+            return result
+
+# =========================================================================
+# Text Rendering (TUI export)
+# =========================================================================
+
+fn render_as_text(store: AgentDashboardStore, config: RenderConfig) -> RenderResult:
+    """Render dashboard as plain text, reusing TUI rendering logic.
+
+    Produces a multi-line text snapshot of the dashboard state including
+    rooms, agent tree, activity feed, and status bar.
+    """
+    var result = RenderResult.empty()
+    var lines: [text] = []
+
+    # Header
+    lines.push("{BOLD}LLM Agent Dashboard{RESET}")
+    lines.push("")
+
+    # Availability check
+    if not store.is_available():
+        lines.push("JSONL Transcript Watching Unavailable")
+        lines.push("Expected directory: ~/.claude/projects/")
+        lines.push("Run Claude Code to generate transcript files.")
+        result.text_output = join_lines(lines)
+        result.warnings = ["JSONL watching not available"]
+        return result
+
+    # Room summaries
+    lines.push("{BOLD}Rooms:{RESET}")
+    val feed = store.activity_feed
+    val max_room_lines = 6
+
+    val research_lines = build_research_content(feed, max_room_lines)
+    lines.push("")
+    lines.push("  {BOLD}Research{RESET}")
+    append_indented(lines, research_lines, "    ")
+
+    val code_lines = build_code_content(feed, max_room_lines)
+    lines.push("")
+    lines.push("  {BOLD}Code{RESET}")
+    append_indented(lines, code_lines, "    ")
+
+    val skills_lines = build_skills_content(feed, max_room_lines)
+    lines.push("")
+    lines.push("  {BOLD}Skills{RESET}")
+    append_indented(lines, skills_lines, "    ")
+
+    val server_lines = build_server_content(feed, max_room_lines)
+    lines.push("")
+    lines.push("  {BOLD}Servers{RESET}")
+    append_indented(lines, server_lines, "    ")
+
+    # Agent tree
+    lines.push("")
+    lines.push("{BOLD}Agent Tree:{RESET}")
+    val tree_max = if config.height > 10: config.height / 3 else: 10
+    val tree_lines = render_agent_tree(store.tree, tree_max)
+    append_indented(lines, tree_lines, "  ")
+
+    # Activity feed
+    lines.push("")
+    lines.push("{BOLD}Activity Feed:{RESET}")
+    val feed_state = FeedState.new()
+    val feed_max = if config.height > 10: config.height / 4 else: 8
+    val feed_entries = store.get_feed(100)
+    val feed_lines = render_feed(feed_entries, feed_state, feed_max)
+    append_indented(lines, feed_lines, "  ")
+
+    # Status bar
+    lines.push("")
+    val status = render_status_bar(store)
+    lines.push(status)
+
+    result.text_output = join_lines(lines)
+    result.metadata = build_metadata(store)
+    return result
+
+# =========================================================================
+# Tree Rendering (agent hierarchy only)
+# =========================================================================
+
+fn render_as_tree(store: AgentDashboardStore, config: RenderConfig) -> RenderResult:
+    """Render only the agent hierarchy tree as text."""
+    var result = RenderResult.empty()
+    var lines: [text] = []
+
+    lines.push("{BOLD}Agent Hierarchy{RESET}")
+    lines.push("")
+
+    val max_lines = if config.height > 0: config.height else: 40
+    val tree_lines = render_agent_tree(store.tree, max_lines)
+    for line in tree_lines:
+        lines.push(line)
+
+    lines.push("")
+    lines.push(store.summary_line())
+
+    result.text_output = join_lines(lines)
+    result.metadata = build_metadata(store)
+    return result
+
+# =========================================================================
+# HTML Rendering (GUI export)
+# =========================================================================
+
+fn render_as_html(store: AgentDashboardStore, config: RenderConfig) -> RenderResult:
+    """Render dashboard as full HTML page, reusing GUI rendering logic.
+
+    Delegates to gui/html_views.generate_agents_html() which produces a
+    complete HTML document with CSS sprites, room grid, agent tree,
+    activity feed, and status bar.
+    """
+    var result = RenderResult.empty()
+
+    if not store.is_available():
+        result.html_output = generate_unavailable_html()
+        result.warnings = ["JSONL watching not available"]
+        return result
+
+    result.html_output = generate_agents_html(store)
+    result.metadata = build_metadata(store)
+    return result
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn append_indented(target: [text], source: [text], indent: text):
+    """Append source lines to target with indentation prefix."""
+    if source.len() == 0:
+        target.push("{indent}(no activity)")
+        return
+    for line in source:
+        target.push("{indent}{line}")
+
+fn build_metadata(store: AgentDashboardStore) -> Dict<text, text>:
+    """Build metadata key-value pairs about the current dashboard state."""
+    var meta: Dict<text, text> = {}
+    val agents = store.tree.agent_count()
+    val reads = store.total_files_read()
+    val writes = store.total_files_written()
+    val urls = store.total_urls()
+    val tools = store.total_tools_used()
+    val events = store.total_events
+
+    meta["adapter"] = "llm_dashboard"
+    meta["agents"] = "{agents}"
+    meta["files_read"] = "{reads}"
+    meta["files_written"] = "{writes}"
+    meta["urls"] = "{urls}"
+    meta["tools"] = "{tools}"
+    meta["total_events"] = "{events}"
+
+    # Provider connection status
+    for status in store.llm_statuses:
+        val pname = provider_name(status.provider).lower()
+        val connected = if status.connected: "true" else: "false"
+        meta["{pname}_connected"] = connected
+        if status.connected:
+            val tokens = status.tokens_used
+            meta["{pname}_tokens"] = "{tokens}"
+
+    return meta
+
+fn generate_unavailable_html() -> text:
+    """Generate a simple HTML page for when JSONL watching is unavailable."""
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>LLM Agent Dashboard</title>
+<style>
+body {
+    font-family: -apple-system, BlinkMacSystemFont, monospace;
+    background: #0d1117;
+    color: #c9d1d9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    margin: 0;
+}
+.notice {
+    text-align: center;
+    padding: 40px;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    max-width: 480px;
+}
+h2 { color: #58a6ff; margin-bottom: 16px; }
+p { color: #8b949e; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div class="notice">
+    <h2>JSONL Transcript Watching Unavailable</h2>
+    <p>Expected directory: <code>~/.claude/projects/</code></p>
+    <p>Run Claude Code to generate transcript files, then reload this page.</p>
+</div>
+</body>
+</html>"""
+
+# =========================================================================
+# Convenience Functions
+# =========================================================================
+
+fn render_text_snapshot(store: AgentDashboardStore) -> text:
+    """Quick text snapshot of the dashboard — convenience wrapper."""
+    var config = RenderConfig.text_export()
+    config.width = 120
+    config.height = 40
+    config.adapter_name = "llm_dashboard"
+    val result = render_dashboard(config, store)
+    return result.text_output
+
+fn render_html_snapshot(store: AgentDashboardStore) -> text:
+    """Quick HTML snapshot of the dashboard — convenience wrapper."""
+    var config = RenderConfig.html_export()
+    config.adapter_name = "llm_dashboard"
+    val result = render_dashboard(config, store)
+    return result.html_output

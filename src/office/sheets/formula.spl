@@ -1,0 +1,672 @@
+# Formula Engine
+#
+# Recursive-descent parser and evaluator for spreadsheet formulas.
+# Supports numbers, cell references, ranges, arithmetic operators,
+# comparison operators, parentheses, and built-in functions.
+
+use app.office.sheets.cell.{CellValue, CellRef, parse_cell_ref, cell_ref_to_string}
+use app.office.sheets.cell_ref.{parse_range, expand_range_refs}
+use app.office.sheets.spreadsheet.{Sheet}
+
+# =========================================================================
+# Types
+# =========================================================================
+
+struct EvalResult:
+    value: CellValue
+    next_pos: i32
+
+struct DisplayEvalResult:
+    ok: bool
+    value: i64
+
+# =========================================================================
+# Main Entry Point
+# =========================================================================
+
+fn evaluate_formula(expr: text, sheet: Sheet) -> CellValue:
+    """Evaluate a formula expression. Strips leading '=' if present.
+    Returns a CellValue with the result or an error."""
+    var formula = expr.trim()
+    if formula.len() == 0:
+        return CellValue.Empty
+    if formula.starts_with("="):
+        formula = formula.substring(1)
+    if formula.len() == 0:
+        return CellValue.Empty
+    val tokens = tokenize_formula(formula)
+    if tokens.len() == 0:
+        return CellValue.Empty
+    val result = _eval_comparison(tokens, 0, sheet)
+    result.value
+
+fn evaluate_formula_display_text(expr: text, sheet: Sheet) -> text:
+    """Evaluate a simple arithmetic formula for display using integer-safe paths.
+
+    This complements `evaluate_formula` for UI/report surfaces that only need a
+    stable display value while the native f64-return path is not reliable from
+    every entrypoint.
+    """
+    var formula = expr.trim()
+    if formula.len() == 0:
+        return ""
+    if formula.starts_with("="):
+        formula = formula.substring(1)
+    val tokens = tokenize_formula(formula)
+    if tokens.len() == 0:
+        return ""
+    val result = _eval_display_sum(tokens, sheet)
+    if not result.ok:
+        return ""
+    "{result.value}"
+
+# =========================================================================
+# Tokenizer
+# =========================================================================
+
+fn tokenize_formula(expr: text) -> [text]:
+    """Tokenize a formula string into a list of tokens.
+    Recognizes: numbers, cell refs, function names, operators, parens, commas, colons."""
+    var tokens: [text] = []
+    var i = 0
+    val len = expr.len()
+    while i < len:
+        val c = expr.char_at(i)
+        # Skip whitespace
+        if c == " " or c == "\t":
+            i = i + 1
+            continue
+        # Operators and punctuation
+        if c == "+" or c == "-" or c == "*" or c == "/" or c == "^" or c == "(" or c == ")" or c == "," or c == ":":
+            tokens.push(c)
+            i = i + 1
+            continue
+        # Comparison operators
+        if c == "=":
+            tokens.push("=")
+            i = i + 1
+            continue
+        if c == "<":
+            if i + 1 < len:
+                val next = expr.char_at(i + 1)
+                if next == "=":
+                    tokens.push("<=")
+                    i = i + 2
+                    continue
+                if next == ">":
+                    tokens.push("<>")
+                    i = i + 2
+                    continue
+            tokens.push("<")
+            i = i + 1
+            continue
+        if c == ">":
+            if i + 1 < len and expr.char_at(i + 1) == "=":
+                tokens.push(">=")
+                i = i + 2
+                continue
+            tokens.push(">")
+            i = i + 1
+            continue
+        # Numbers
+        if _is_digit(c) or (c == "." and i + 1 < len and _is_digit(expr.char_at(i + 1))):
+            var num_str = ""
+            while i < len:
+                val ch = expr.char_at(i)
+                if _is_digit(ch) or ch == ".":
+                    num_str = "{num_str}{ch}"
+                    i = i + 1
+                else:
+                    break
+            tokens.push(num_str)
+            continue
+        # Letters: could be cell ref (A1) or function name (SUM)
+        if _is_alpha(c):
+            var word = ""
+            while i < len:
+                val ch = expr.char_at(i)
+                if _is_alpha(ch) or _is_digit(ch):
+                    word = "{word}{ch}"
+                    i = i + 1
+                else:
+                    break
+            tokens.push(word)
+            continue
+        # String literals in double quotes
+        if c == "\"":
+            var str_val = ""
+            i = i + 1
+            while i < len:
+                val ch = expr.char_at(i)
+                if ch == "\"":
+                    i = i + 1
+                    break
+                str_val = "{str_val}{ch}"
+                i = i + 1
+            tokens.push("\"{str_val}\"")
+            continue
+        # Unknown character, skip
+        i = i + 1
+    tokens
+
+# =========================================================================
+# Recursive Descent Parser
+# =========================================================================
+
+fn _eval_comparison(tokens: [text], pos: i32, sheet: Sheet) -> EvalResult:
+    """Parse comparison: expr (( '>' | '<' | '>=' | '<=' | '=' | '<>' ) expr)?"""
+    var left = _eval_expression(tokens, pos, sheet)
+    var cur_pos = left.next_pos
+    while cur_pos < tokens.len():
+        val op = tokens[cur_pos]
+        if op == ">" or op == "<" or op == ">=" or op == "<=" or op == "=" or op == "<>":
+            val right = _eval_expression(tokens, cur_pos + 1, sheet)
+            val lv = _to_number(left.value)
+            val rv = _to_number(right.value)
+            var bool_result = false
+            if op == ">":
+                bool_result = lv > rv
+            elif op == "<":
+                bool_result = lv < rv
+            elif op == ">=":
+                bool_result = lv >= rv
+            elif op == "<=":
+                bool_result = lv <= rv
+            elif op == "=":
+                bool_result = lv == rv
+            elif op == "<>":
+                bool_result = lv != rv
+            left = EvalResult(
+                value: CellValue.BoolVal(value: bool_result),
+                next_pos: right.next_pos
+            )
+            cur_pos = right.next_pos
+        else:
+            break
+    left
+
+fn _eval_expression(tokens: [text], pos: i32, sheet: Sheet) -> EvalResult:
+    """Parse addition/subtraction: term (( '+' | '-' ) term)*"""
+    var left = _eval_term(tokens, pos, sheet)
+    var cur_pos = left.next_pos
+    while cur_pos < tokens.len():
+        val op = tokens[cur_pos]
+        if op == "+" or op == "-":
+            val right = _eval_term(tokens, cur_pos + 1, sheet)
+            val lv = _to_number(left.value)
+            val rv = _to_number(right.value)
+            var result_val = 0.0
+            if op == "+":
+                result_val = lv + rv
+            else:
+                result_val = lv - rv
+            left = EvalResult(
+                value: CellValue.NumberVal(value: result_val),
+                next_pos: right.next_pos
+            )
+            cur_pos = right.next_pos
+        else:
+            break
+    left
+
+fn _eval_term(tokens: [text], pos: i32, sheet: Sheet) -> EvalResult:
+    """Parse multiplication/division: factor (( '*' | '/' ) factor)*"""
+    var left = _eval_power(tokens, pos, sheet)
+    var cur_pos = left.next_pos
+    while cur_pos < tokens.len():
+        val op = tokens[cur_pos]
+        if op == "*" or op == "/":
+            val right = _eval_power(tokens, cur_pos + 1, sheet)
+            val lv = _to_number(left.value)
+            val rv = _to_number(right.value)
+            var result_val = 0.0
+            if op == "*":
+                result_val = lv * rv
+            else:
+                if rv == 0.0:
+                    return EvalResult(
+                        value: CellValue.ErrorVal(message: "Division by zero"),
+                        next_pos: right.next_pos
+                    )
+                result_val = lv / rv
+            left = EvalResult(
+                value: CellValue.NumberVal(value: result_val),
+                next_pos: right.next_pos
+            )
+            cur_pos = right.next_pos
+        else:
+            break
+    left
+
+fn _eval_power(tokens: [text], pos: i32, sheet: Sheet) -> EvalResult:
+    """Parse exponentiation: unary ( '^' unary )*"""
+    var left = _eval_unary(tokens, pos, sheet)
+    var cur_pos = left.next_pos
+    while cur_pos < tokens.len():
+        val op = tokens[cur_pos]
+        if op == "^":
+            val right = _eval_unary(tokens, cur_pos + 1, sheet)
+            val base = _to_number(left.value)
+            val exp = _to_number(right.value)
+            val result_val = _pow_f64(base, exp)
+            left = EvalResult(
+                value: CellValue.NumberVal(value: result_val),
+                next_pos: right.next_pos
+            )
+            cur_pos = right.next_pos
+        else:
+            break
+    left
+
+fn _eval_unary(tokens: [text], pos: i32, sheet: Sheet) -> EvalResult:
+    """Parse unary minus: '-' primary | primary"""
+    if pos < tokens.len() and tokens.get(pos) == "-":
+        val inner = _eval_primary(tokens, pos + 1, sheet)
+        val v = _to_number(inner.value)
+        return EvalResult(
+            value: CellValue.NumberVal(value: 0.0 - v),
+            next_pos: inner.next_pos
+        )
+    _eval_primary(tokens, pos, sheet)
+
+fn _eval_primary(tokens: [text], pos: i32, sheet: Sheet) -> EvalResult:
+    """Parse primary: number | string | cell_ref | function_call | '(' expression ')'"""
+    if pos >= tokens.len():
+        return EvalResult(value: CellValue.NumberVal(value: 0.0), next_pos: pos)
+
+    val token = tokens.get(pos)
+
+    # Parenthesized expression
+    if token == "(":
+        val inner = _eval_comparison(tokens, pos + 1, sheet)
+        var end_pos = inner.next_pos
+        if end_pos < tokens.len() and tokens.get(end_pos) == ")":
+            end_pos = end_pos + 1
+        return EvalResult(value: inner.value, next_pos: end_pos)
+
+    # String literal
+    if token.starts_with("\""):
+        val str_content = token.substring(1, token.len() - 1)
+        return EvalResult(
+            value: CellValue.TextVal(value: str_content),
+            next_pos: pos + 1
+        )
+
+    # Number literal
+    if _is_digit(token.char_at(0)) or (token.char_at(0) == "." and token.len() > 1):
+        val num = _parse_f64_simple(token)
+        return EvalResult(
+            value: CellValue.NumberVal(value: num),
+            next_pos: pos + 1
+        )
+
+    # Identifier: could be function name or cell reference
+    if _is_alpha(token.char_at(0)):
+        val upper_token = token.upper()
+        # Check if this is a function call: NAME(
+        if pos + 1 < tokens.len() and tokens.get(pos + 1) == "(":
+            return _eval_function_call(upper_token, tokens, pos + 2, sheet)
+        # Otherwise it's a cell reference (possibly with range via colon)
+        # Check if next token is ':' for a range
+        if pos + 1 < tokens.len() and tokens.get(pos + 1) == ":":
+            if pos + 2 < tokens.len():
+                # This is a range reference like A1:B3 — return the first cell value
+                val ref_val = parse_cell_ref(upper_token)
+                if ref_val != nil:
+                    val v = resolve_cell_value(upper_token, sheet)
+                    return EvalResult(
+                        value: CellValue.NumberVal(value: v),
+                        next_pos: pos + 3  # skip ref, colon, ref
+                    )
+        val ref_val = parse_cell_ref(upper_token)
+        if ref_val != nil:
+            val v = resolve_cell_value(upper_token, sheet)
+            return EvalResult(
+                value: CellValue.NumberVal(value: v),
+                next_pos: pos + 1
+            )
+        # Unknown identifier — treat as error
+        return EvalResult(
+            value: CellValue.ErrorVal(message: "Unknown: {token}"),
+            next_pos: pos + 1
+        )
+
+    # Fallback
+    EvalResult(value: CellValue.NumberVal(value: 0.0), next_pos: pos + 1)
+
+# =========================================================================
+# Function Call Evaluation
+# =========================================================================
+
+fn _eval_function_call(name: text, tokens: [text], pos: i32, sheet: Sheet) -> EvalResult:
+    """Evaluate a function call. pos points to first token after '('."""
+    # Collect arguments separated by commas
+    # Each argument can be a range (A1:B3) or an expression
+    var args: [[f64]] = []
+    var cur_pos = pos
+
+    while cur_pos < tokens.len() and tokens.get(cur_pos) != ")":
+        # Check for range argument: REF:REF
+        if (cur_pos + 2 < tokens.len() and
+            tokens.get(cur_pos + 1) == ":" and
+            _is_cell_ref_token(tokens.get(cur_pos)) and
+            _is_cell_ref_token(tokens.get(cur_pos + 2))):
+            val range_str = "{tokens.get(cur_pos)}:{tokens.get(cur_pos + 2)}"
+            val values = resolve_cell_range(range_str, sheet)
+            args.push(values)
+            cur_pos = cur_pos + 3
+        else:
+            # Expression argument
+            val result = _eval_comparison(tokens, cur_pos, sheet)
+            val num_val = _to_number(result.value)
+            args.push([num_val])
+            cur_pos = result.next_pos
+
+        # Skip comma
+        if cur_pos < tokens.len() and tokens.get(cur_pos) == ",":
+            cur_pos = cur_pos + 1
+
+    # Skip closing paren
+    if cur_pos < tokens.len() and tokens.get(cur_pos) == ")":
+        cur_pos = cur_pos + 1
+
+    val result_val = _dispatch_function(name, args, sheet)
+    EvalResult(value: result_val, next_pos: cur_pos)
+
+fn _dispatch_function(name: text, args: [[f64]], sheet: Sheet) -> CellValue:
+    """Dispatch a function call by name to the appropriate implementation."""
+    val flat = _flatten_args(args)
+    match name:
+        "SUM":
+            return CellValue.NumberVal(value: eval_sum(flat))
+        "AVERAGE":
+            return CellValue.NumberVal(value: eval_average(flat))
+        "COUNT":
+            return CellValue.NumberVal(value: eval_count(flat))
+        "MIN":
+            return CellValue.NumberVal(value: eval_min(flat))
+        "MAX":
+            return CellValue.NumberVal(value: eval_max(flat))
+        "ABS":
+            if flat.len() > 0:
+                val v = flat[0]
+                val abs_v = if v < 0.0: 0.0 - v else: v
+                return CellValue.NumberVal(value: abs_v)
+            return CellValue.ErrorVal(message: "ABS requires 1 argument")
+        "ROUND":
+            if args.len() >= 2:
+                val v = _first_val(args[0])
+                val digits = _first_val(args[1]).to_i64()
+                val factor = _pow10_f64(digits)
+                val rounded = ((v * factor) + 0.5).to_i64().to_f64() / factor
+                return CellValue.NumberVal(value: rounded)
+            if flat.len() > 0:
+                val rounded = (flat[0] + 0.5).to_i64().to_f64()
+                return CellValue.NumberVal(value: rounded)
+            return CellValue.ErrorVal(message: "ROUND requires 1-2 arguments")
+        "IF":
+            if args.len() >= 3:
+                val cond = _first_val(args[0])
+                if cond != 0.0:
+                    return CellValue.NumberVal(value: _first_val(args[1]))
+                return CellValue.NumberVal(value: _first_val(args[2]))
+            return CellValue.ErrorVal(message: "IF requires 3 arguments")
+        _:
+            return CellValue.ErrorVal(message: "Unknown function: {name}")
+
+# =========================================================================
+# Cell Resolution
+# =========================================================================
+
+fn resolve_cell_value(ref_str: text, sheet: Sheet) -> f64:
+    """Get the numeric value of a cell. Returns 0.0 if cell is empty or non-numeric."""
+    val cell = sheet.get_cell(ref_str)
+    match cell.value:
+        CellValue.NumberVal(value):
+            return value
+        CellValue.BoolVal(value):
+            if value:
+                return 1.0
+            return 0.0
+        CellValue.FormulaVal(expr, cached_display):
+            # Recursively evaluate the formula
+            val result = evaluate_formula(expr, sheet)
+            return _to_number(result)
+        _:
+            return 0.0
+
+fn resolve_cell_range(range_str: text, sheet: Sheet) -> [f64]:
+    """Get all numeric values from cells in a range."""
+    var values: [f64] = []
+    val range = parse_range(range_str)
+    if range == nil:
+        return values
+    val refs = expand_range_refs(range)
+    for ref_str in refs:
+        val v = resolve_cell_value(ref_str, sheet)
+        values.push(v)
+    values
+
+fn resolve_cell_display_i64(ref_str: text, sheet: Sheet) -> DisplayEvalResult:
+    """Resolve a cell to an integer value for display-oriented formula checks."""
+    val cell = sheet.get_cell(ref_str)
+    match cell.value:
+        CellValue.NumberVal(value):
+            return DisplayEvalResult(ok: true, value: value.to_i64())
+        CellValue.TextVal(value):
+            return _parse_i64_text(value)
+        CellValue.BoolVal(value):
+            if value:
+                return DisplayEvalResult(ok: true, value: 1)
+            return DisplayEvalResult(ok: true, value: 0)
+        CellValue.FormulaVal(expr, cached_display):
+            if cached_display != "":
+                return _parse_i64_text(cached_display)
+            val text_value = evaluate_formula_display_text(expr, sheet)
+            return _parse_i64_text(text_value)
+        _:
+            return DisplayEvalResult(ok: false, value: 0)
+
+# =========================================================================
+# Aggregation Functions
+# =========================================================================
+
+fn eval_sum(values: [f64]) -> f64:
+    """Sum all values."""
+    var total = 0.0
+    for v in values:
+        total = total + v
+    total
+
+fn eval_average(values: [f64]) -> f64:
+    """Average of all values. Returns 0.0 if empty."""
+    if values.len() == 0:
+        return 0.0
+    val total = eval_sum(values)
+    total / values.len().to_f64()
+
+fn eval_count(values: [f64]) -> f64:
+    """Count of values."""
+    values.len().to_f64()
+
+fn eval_min(values: [f64]) -> f64:
+    """Minimum value. Returns 0.0 if empty."""
+    if values.len() == 0:
+        return 0.0
+    var result = values[0]
+    for v in values:
+        if v < result:
+            result = v
+    result
+
+fn eval_max(values: [f64]) -> f64:
+    """Maximum value. Returns 0.0 if empty."""
+    if values.len() == 0:
+        return 0.0
+    var result = values[0]
+    for v in values:
+        if v > result:
+            result = v
+    result
+
+# =========================================================================
+# Internal Helpers
+# =========================================================================
+
+fn _to_number(cv: CellValue) -> f64:
+    """Extract numeric value from a CellValue. Non-numeric values return 0.0."""
+    match cv:
+        CellValue.NumberVal(value):
+            return value
+        CellValue.BoolVal(value):
+            if value:
+                return 1.0
+            return 0.0
+        _:
+            return 0.0
+
+fn _is_digit(c: text) -> bool:
+    (c == "0" or c == "1" or c == "2" or c == "3" or c == "4" or
+     c == "5" or c == "6" or c == "7" or c == "8" or c == "9")
+
+fn _is_alpha(c: text) -> bool:
+    val code = c.char_code_at(0)
+    val is_upper = code >= 65 and code <= 90
+    val is_lower = code >= 97 and code <= 122
+    is_upper or is_lower
+
+fn _is_cell_ref_token(token: text) -> bool:
+    """Check if a token looks like a cell reference (letters followed by digits)."""
+    if token.len() == 0:
+        return false
+    if not _is_alpha(token.char_at(0)):
+        return false
+    var has_digit = false
+    var i = 0
+    while i < token.len():
+        val c = token.char_at(i)
+        if _is_digit(c):
+            has_digit = true
+        i = i + 1
+    has_digit
+
+fn _parse_f64_simple(s: text) -> f64:
+    """Parse a simple non-negative float from text."""
+    var int_part = 0.0
+    var frac_part = 0.0
+    var frac_divisor = 1.0
+    var in_frac = false
+    var i = 0
+    while i < s.len():
+        val c = s.char_at(i)
+        if c == ".":
+            in_frac = true
+        elif _is_digit(c):
+            val d = c.char_code_at(0) - 48
+            if in_frac:
+                frac_divisor = frac_divisor * 10.0
+                frac_part = frac_part + d.to_f64() / frac_divisor
+            else:
+                int_part = int_part * 10.0 + d.to_f64()
+        i = i + 1
+    int_part + frac_part
+
+fn _pow_f64(base: f64, exp: f64) -> f64:
+    """Simple power function for non-negative integer exponents."""
+    val int_exp = exp.to_i64()
+    if int_exp == 0:
+        return 1.0
+    var result = 1.0
+    var neg = false
+    var e = int_exp
+    if e < 0:
+        neg = true
+        e = 0 - e
+    var i: i64 = 0
+    while i < e:
+        result = result * base
+        i = i + 1
+    if neg:
+        return 1.0 / result
+    result
+
+fn _pow10_f64(exp: i64) -> f64:
+    """Calculate 10^exp for small exponents."""
+    var result = 1.0
+    var i: i64 = 0
+    var e = exp
+    if e < 0:
+        e = 0 - e
+    while i < e:
+        result = result * 10.0
+        i = i + 1
+    if exp < 0:
+        return 1.0 / result
+    result
+
+fn _flatten_args(args: [[f64]]) -> [f64]:
+    """Flatten a list of float lists into a single flat list."""
+    var result: [f64] = []
+    for group in args:
+        for v in group:
+            result.push(v)
+    result
+
+fn _first_val(vals: [f64]) -> f64:
+    """Get the first value from a float list, or 0.0 if empty."""
+    if vals.len() > 0:
+        return vals[0]
+    0.0
+
+fn _eval_display_sum(tokens: [text], sheet: Sheet) -> DisplayEvalResult:
+    var total: i64 = 0
+    var op = "+"
+    var expecting_value = true
+    for token in tokens:
+        if token == "+" or token == "-":
+            if expecting_value:
+                return DisplayEvalResult(ok: false, value: 0)
+            op = token
+            expecting_value = true
+            continue
+        val value = _display_token_i64(token, sheet)
+        if not value.ok:
+            return DisplayEvalResult(ok: false, value: 0)
+        if op == "-":
+            total = total - value.value
+        else:
+            total = total + value.value
+        expecting_value = false
+    if expecting_value:
+        return DisplayEvalResult(ok: false, value: 0)
+    DisplayEvalResult(ok: true, value: total)
+
+fn _display_token_i64(token: text, sheet: Sheet) -> DisplayEvalResult:
+    if token.len() == 0:
+        return DisplayEvalResult(ok: false, value: 0)
+    val upper_token = token.upper()
+    if parse_cell_ref(upper_token) != nil:
+        return resolve_cell_display_i64(upper_token, sheet)
+    _parse_i64_text(token)
+
+fn _parse_i64_text(s: text) -> DisplayEvalResult:
+    val trimmed = s.trim()
+    if trimmed.len() == 0:
+        return DisplayEvalResult(ok: false, value: 0)
+    var negative = false
+    var i = 0
+    if trimmed.char_at(0) == "-":
+        negative = true
+        i = 1
+        if trimmed.len() == 1:
+            return DisplayEvalResult(ok: false, value: 0)
+    var value: i64 = 0
+    while i < trimmed.len():
+        val c = trimmed.char_at(i)
+        if not _is_digit(c):
+            return DisplayEvalResult(ok: false, value: 0)
+        value = value * 10 + (c.char_code_at(0) - 48).to_i64()
+        i = i + 1
+    if negative:
+        return DisplayEvalResult(ok: true, value: 0 - value)
+    DisplayEvalResult(ok: true, value: value)

@@ -1,0 +1,593 @@
+# Editor Controller Wiki Methods
+#
+# Wiki panel, markdown editing, note embedding, task, backlinks, and vault helpers.
+
+use app.editor.editor_controller_types.*
+use app.editor.editor_controller.*
+use std.editor.core.session.*
+use std.editor.view.md_editing.*
+use std.editor.services.md_diagnostics.*
+use std.editor.services.md_wiki_index.*
+use std.editor.services.md_search.*
+use std.editor.view.diagnostics_panel.*
+use std.editor.view.wiki_panel.*
+use app.editor.editor_markdown_helpers.*
+use app.editor.editor_attachment_template.*
+use app.editor.editor_path_text_helpers.*
+
+fn ctrl_show_debug_session_panel(ctrl: mut EditorController, message: text):
+    ctrl.wiki_panel = _editor_debug_session_panel(editor_debug_first_session(ctrl.debug_registry))
+    ctrl_show_wiki_panel(ctrl, message)
+
+fn ctrl_wiki_daily_note_create(ctrl: mut EditorController, payload: text) -> EditorAction:
+    val date = _editor_payload_part(payload, 0)
+    if date == "":
+        ctrl.status_msg = "missing daily note date"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val folder = if _editor_payload_part(payload, 1) == "" then "Daily" else: _editor_payload_part(payload, 1)
+    val template_body = if _editor_payload_part(payload, 2) == "" then "# {{title}}\n\n" else: _editor_payload_part(payload, 2)
+    val title_format = if _editor_payload_part(payload, 3) == "" then "{{date}}" else: _editor_payload_part(payload, 3)
+    val config = md_wiki_daily_note_config_with_title(folder, title_format, _editor_payload_part(payload, 4), template_body)
+    val path = md_wiki_daily_note_path(config, date)
+    val content = md_wiki_daily_note_content(config, date)
+    val ok = rt_file_write_text(path, content)
+    if not ok:
+        ctrl.status_msg = "failed to create daily note"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    var session_daily = ctrl.session
+    val target_doc_id = session_daily.open_file(path)
+    ctrl._replace_session(session_daily)
+    ctrl_focus_lsp_target_doc(ctrl, target_doc_id)
+    ctrl.status_msg = "created daily note: " + path
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_daily_note_picker(ctrl: mut EditorController, payload: text) -> EditorAction:
+    val date = _editor_payload_part(payload, 0)
+    val folder = if _editor_payload_part(payload, 1) == "" then "Daily" else: _editor_payload_part(payload, 1)
+    val template_body = if _editor_payload_part(payload, 2) == "" then "# {{title}}\n\n" else: _editor_payload_part(payload, 2)
+    val title_format = if _editor_payload_part(payload, 3) == "" then "{{date}}" else: _editor_payload_part(payload, 3)
+    val config = md_wiki_daily_note_config_with_title(folder, title_format, _editor_payload_part(payload, 4), template_body)
+    ctrl.wiki_daily_note_payload = date + "|" + folder + "|" + template_body + "|" + title_format + "|" + config.extension
+    val preview_date = if date == "" then "YYYY-MM-DD" else: date
+    val path = md_wiki_daily_note_path(config, preview_date)
+    ctrl.wiki_panel = wiki_panel_with_rows("Daily Notes", [
+        WikiPanelRow(icon: "calendar", label: preview_date, detail: ctrl.wiki_daily_note_payload, path: path, line: 0)
+    ])
+    ctrl_show_wiki_panel(ctrl, "daily notes")
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_template_insert(ctrl: mut EditorController, payload: text) -> EditorAction:
+    val template_path = _editor_payload_part(payload, 0)
+    val target_path = _editor_payload_part(payload, 1)
+    val title = _editor_payload_part(payload, 2)
+    val date = _editor_payload_part(payload, 3)
+    if template_path == "" or target_path == "":
+        ctrl.status_msg = "missing template or target path"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val rendered = _editor_apply_template_text(rt_file_read_text(template_path) ?? "", title, date)
+    val existing = rt_file_read_text(target_path) ?? ""
+    val sep = if existing == "" or existing.ends_with("\n") then "" else: "\n"
+    val ok = rt_file_write_text(target_path, existing + sep + rendered)
+    if not ok:
+        ctrl.status_msg = "failed to insert template"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.status_msg = "inserted template: " + template_path
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_template_picker(ctrl: mut EditorController, payload: text) -> EditorAction:
+    val folder = _editor_payload_part(payload, 0)
+    val target_path = _editor_payload_part(payload, 1)
+    val title = _editor_payload_part(payload, 2)
+    val date = _editor_payload_part(payload, 3)
+    val query = _editor_payload_part(payload, 4).trim().to_lower()
+    if folder == "":
+        ctrl.status_msg = "missing template folder"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.wiki_template_picker_payload = folder + "|" + target_path + "|" + title + "|" + date + "|" + query
+    ctrl.wiki_template_query = query
+    ctrl.wiki_panel = wiki_panel_with_rows("Templates", _editor_template_picker_rows(folder, target_path, title, date, query))
+    ctrl_show_wiki_panel(ctrl, "templates: " + ctrl.wiki_panel.rows.len().to_text())
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_embed_insert(ctrl: mut EditorController, payload: text) -> EditorAction:
+    var target_path = _editor_payload_part(payload, 0)
+    val embed_source = _editor_payload_part(payload, 1)
+    val alias = _editor_payload_part(payload, 2)
+    val active_doc = ctrl.session.active_document()
+    if target_path == "" and active_doc != nil:
+        target_path = active_doc.path()
+    if target_path == "" or embed_source == "":
+        ctrl.status_msg = "missing target or embed path"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val embed_target = _editor_note_embed_target(embed_source)
+    val embed = _editor_wiki_note_embed(embed_target, alias)
+    var buffer = ctrl.session.active_buffer()
+    if active_doc != nil and buffer != nil and active_doc.path() == target_path:
+        buffer.insert_at_cursor(embed + "\n")
+        ctrl.session.update_active_buffer(buffer)
+        ctrl.status_msg = "inserted embed: " + embed_target
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val existing = rt_file_read_text(target_path) ?? ""
+    val sep = if existing == "" or existing.ends_with("\n") then "" else: "\n"
+    val ok = rt_file_write_text(target_path, existing + sep + embed + "\n")
+    if not ok:
+        ctrl.status_msg = "failed to insert embed"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.status_msg = "inserted embed: " + embed_target
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_attachment_insert(ctrl: mut EditorController, payload: text) -> EditorAction:
+    val target_path = _editor_payload_part(payload, 0)
+    val attachment_path = _editor_payload_part(payload, 1)
+    val label = _editor_payload_part(payload, 2)
+    val storage_dir = _editor_payload_part(payload, 3)
+    if target_path == "" or attachment_path == "":
+        ctrl.status_msg = "missing target or attachment path"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    var embed_path = attachment_path
+    if storage_dir != "":
+        val stored = _editor_store_attachment_for_note(target_path, attachment_path, storage_dir)
+        if stored == "":
+            ctrl.status_msg = "failed to store attachment"
+            return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+        embed_path = stored
+    val existing = rt_file_read_text(target_path) ?? ""
+    val embed = _editor_attachment_embed(embed_path, label)
+    val sep = if existing == "" or existing.ends_with("\n") then "" else: "\n"
+    val ok = rt_file_write_text(target_path, existing + sep + embed + "\n")
+    if not ok:
+        ctrl.status_msg = "failed to insert attachment"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.status_msg = "inserted attachment: " + embed_path
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_attachment_picker(ctrl: mut EditorController, payload: text) -> EditorAction:
+    val root = _editor_payload_part(payload, 0)
+    val query = _editor_payload_part(payload, 1).to_lower()
+    val target_path = _editor_payload_part(payload, 2)
+    val storage_dir = _editor_payload_part(payload, 3)
+    if root == "":
+        ctrl.status_msg = "missing attachment root"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.wiki_attachment_picker_payload = root + "|" + query + "|" + target_path + "|" + storage_dir
+    ctrl.wiki_attachment_query = query
+    ctrl.wiki_panel = wiki_panel_with_rows("Attachment Picker", _editor_attachment_picker_rows(root, query, target_path, storage_dir))
+    ctrl_show_wiki_panel(ctrl, "attachments: " + ctrl.wiki_panel.rows.len().to_text())
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_toggle_markdown_task_line(ctrl: mut EditorController, line: i64) -> EditorAction:
+    val doc = ctrl.session.active_document()
+    var buffer = ctrl.session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown task"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    if line < 0 or line >= buffer.line_count():
+        ctrl.status_msg = "task line out of range"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val current = buffer.line_at(line)
+    val toggled = md_assist_toggle_task(current)
+    if toggled == current:
+        ctrl.status_msg = "not a task"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    buffer.move_cursor(line, 0)
+    var i = 0
+    while i < current.len():
+        buffer.delete_at_cursor()
+        i = i + 1
+    buffer.insert_at_cursor(toggled)
+    ctrl_update_markdown_preview(ctrl, doc, buffer)
+    ctrl.session.update_active_buffer(buffer)
+    ctrl_notify_active_lsp_changed(ctrl)
+    ctrl.status_msg = "task toggled"
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_markdown_table_insert_row(ctrl: mut EditorController) -> EditorAction:
+    val doc = ctrl.session.active_document()
+    var buffer = ctrl.session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown table"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val edit = md_table_insert_row_after(buffer.to_text(), buffer.cursor_row)
+    if not edit.changed:
+        ctrl.status_msg = edit.message
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    buffer.push_undo_snapshot()
+    buffer.replace_content(edit.content)
+    buffer.dirty = true
+    buffer.move_cursor(edit.line, edit.col)
+    ctrl_update_markdown_preview(ctrl, doc, buffer)
+    ctrl.session.update_active_buffer(buffer)
+    ctrl_notify_active_lsp_changed(ctrl)
+    ctrl.status_msg = edit.message
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_markdown_table_insert_column(ctrl: mut EditorController) -> EditorAction:
+    val doc = ctrl.session.active_document()
+    var buffer = ctrl.session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown table"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val edit = md_table_insert_column_after(buffer.to_text(), buffer.cursor_row, buffer.cursor_col)
+    if not edit.changed:
+        ctrl.status_msg = edit.message
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    buffer.push_undo_snapshot()
+    buffer.replace_content(edit.content)
+    buffer.dirty = true
+    buffer.move_cursor(edit.line, edit.col)
+    ctrl_update_markdown_preview(ctrl, doc, buffer)
+    ctrl.session.update_active_buffer(buffer)
+    ctrl_notify_active_lsp_changed(ctrl)
+    ctrl.status_msg = edit.message
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_markdown_table_set_cell(ctrl: mut EditorController, line: i64, col: i64, value: text) -> EditorAction:
+    val doc = ctrl.session.active_document()
+    var buffer = ctrl.session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown table"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val edit = md_table_set_cell(buffer.to_text(), line, col, value)
+    if not edit.changed:
+        ctrl.status_msg = edit.message
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    buffer.push_undo_snapshot()
+    buffer.replace_content(edit.content)
+    buffer.dirty = true
+    buffer.move_cursor(line, 0)
+    ctrl_update_markdown_preview(ctrl, doc, buffer)
+    ctrl.session.update_active_buffer(buffer)
+    ctrl_notify_active_lsp_changed(ctrl)
+    ctrl.status_msg = edit.message
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_markdown_table_cell_nav(ctrl: mut EditorController, direction: text) -> EditorAction:
+    val doc = ctrl.session.active_document()
+    var buffer = ctrl.session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown table"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val nav = if direction == "prev" then md_table_prev_cell(buffer.to_text(), buffer.cursor_row, buffer.cursor_col) else: md_table_next_cell(buffer.to_text(), buffer.cursor_row, buffer.cursor_col)
+    if not nav.found:
+        ctrl.status_msg = nav.message
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    buffer.move_cursor(nav.line, nav.col)
+    ctrl.session.update_active_buffer(buffer)
+    ctrl.status_msg = nav.message
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_toggle_active_callout_fold(ctrl: mut EditorController) -> EditorAction:
+    val doc = ctrl.session.active_document()
+    var buffer = ctrl.session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no callout"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val result = md_callout_toggle_fold(buffer.to_text(), buffer.cursor_row)
+    if not result.changed:
+        ctrl.status_msg = result.message
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    buffer.push_undo_snapshot()
+    buffer.replace_content(result.content)
+    buffer.dirty = true
+    buffer.move_cursor(result.line, 0)
+    ctrl_update_markdown_preview(ctrl, doc, buffer)
+    ctrl.session.update_active_buffer(buffer)
+    ctrl_notify_active_lsp_changed(ctrl)
+    ctrl.status_msg = result.message
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_show_backlinks(ctrl: mut EditorController) -> EditorAction:
+    val doc = ctrl.session.active_document()
+    if doc == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown note open"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.wiki_property_vault_root = _editor_dirname(doc.path())
+    val index = ctrl_wiki_index_open_documents(ctrl)
+    ctrl.wiki_panel = wiki_panel_from_backlinks(md_wiki_backlinks(index, doc.path()))
+    ctrl_show_wiki_panel(ctrl, "wiki backlinks panel")
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_show_tasks(ctrl: mut EditorController, filter: text) -> EditorAction:
+    val index = ctrl_wiki_index_open_documents(ctrl)
+    val normalized = if _editor_payload_part(filter, 0).trim() == "" then "open" else: _editor_payload_part(filter, 0).trim().to_lower()
+    val query = _editor_payload_part(filter, 1).trim().to_lower()
+    ctrl.wiki_task_filter = normalized
+    ctrl.wiki_task_query = query
+    ctrl.wiki_panel = wiki_panel_from_tasks(_editor_tasks_matching(md_wiki_tasks_filtered(index, normalized), query))
+    ctrl_show_wiki_panel(ctrl, "wiki tasks: " + normalized)
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_task_batch(ctrl: mut EditorController, payload: text) -> EditorAction:
+    val doc = ctrl.session.active_document()
+    var buffer = ctrl.session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown task"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val normalized = payload.trim().to_lower()
+    val checked = normalized == "done" or normalized == "checked" or normalized == "complete" or normalized == "completed"
+    val next = md_tasks_set_checked(buffer.to_text(), checked)
+    if next == buffer.to_text():
+        ctrl.status_msg = "no tasks changed"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    buffer.push_undo_snapshot()
+    buffer.replace_content(next)
+    buffer.dirty = true
+    ctrl_update_markdown_preview(ctrl, doc, buffer)
+    ctrl.session.update_active_buffer(buffer)
+    ctrl_notify_active_lsp_changed(ctrl)
+    ctrl.wiki_property_vault_root = _editor_dirname(doc.path())
+    val index = ctrl_wiki_index_open_documents(ctrl)
+    ctrl.wiki_panel = wiki_panel_from_tasks(md_wiki_tasks_filtered(index, if checked then "done" else: "open"))
+    ctrl_show_wiki_panel(ctrl, if checked then "tasks marked done" else: "tasks marked open")
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_vault_task_batch(ctrl: mut EditorController, payload: text) -> EditorAction:
+    val root = _editor_payload_part(payload, 0)
+    val mode = _editor_payload_part(payload, 1).trim().to_lower()
+    if root == "":
+        ctrl.status_msg = "missing vault root"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val checked = mode == "done" or mode == "checked" or mode == "complete" or mode == "completed"
+    var changed_count = 0
+    val files = rt_dir_walk(root)
+    for file in files:
+        if not _editor_is_markdown_path(file):
+            continue
+        val existing = rt_file_read_text(file) ?? ""
+        val next = md_tasks_set_checked(existing, checked)
+        if next != existing:
+            if rt_file_write_text(file, next):
+                changed_count = changed_count + 1
+                ctrl_refresh_open_document_from_disk_batch(ctrl, file, next)
+    val index = md_wiki_index_documents(_editor_markdown_vault_documents(root))
+    ctrl.wiki_panel = wiki_panel_from_tasks(md_wiki_tasks_filtered(index, if checked then "done" else: "open"))
+    ctrl_show_wiki_panel(ctrl, "vault tasks changed: " + changed_count.to_text())
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_show_properties(ctrl: mut EditorController) -> EditorAction:
+    val doc = ctrl.session.active_document()
+    if doc == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown note open"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val index = ctrl_wiki_index_open_documents(ctrl)
+    ctrl.wiki_panel = wiki_panel_from_properties(md_wiki_properties_for_path(index, doc.path()))
+    ctrl_show_wiki_panel(ctrl, "wiki properties panel")
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_set_property(ctrl: mut EditorController, payload: text) -> EditorAction:
+    val doc = ctrl.session.active_document()
+    var buffer = ctrl.session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown note open"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val parsed = _editor_parse_property_payload(payload)
+    if parsed.key == "":
+        ctrl.status_msg = "missing property key"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val next = _editor_markdown_property_content(buffer.to_text(), parsed.key, parsed.value)
+    buffer.push_undo_snapshot()
+    buffer.replace_content(next)
+    buffer.dirty = true
+    buffer.move_cursor(0, 0)
+    ctrl_update_markdown_preview(ctrl, doc, buffer)
+    ctrl.session.update_active_buffer(buffer)
+    ctrl_notify_active_lsp_changed(ctrl)
+    val index = ctrl_wiki_index_open_documents(ctrl)
+    ctrl.wiki_panel = wiki_panel_from_properties(md_wiki_properties_for_path(index, doc.path()))
+    ctrl_show_wiki_panel(ctrl, "property set: " + parsed.key)
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_vault_set_property(ctrl: mut EditorController, payload: text) -> EditorAction:
+    val parsed = _editor_parse_vault_property_payload(payload)
+    if parsed.root == "" or parsed.key == "":
+        ctrl.status_msg = "missing vault root or property key"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.wiki_property_vault_root = parsed.root
+    var changed_count = 0
+    val files = rt_dir_walk(parsed.root)
+    for file in files:
+        if not _editor_is_markdown_path(file):
+            continue
+        if not _editor_vault_property_path_selected(file, parsed.selected_paths):
+            continue
+        val existing = rt_file_read_text(file) ?? ""
+        val next = _editor_markdown_property_content(existing, parsed.key, parsed.value)
+        if next != existing:
+            if rt_file_write_text(file, next):
+                changed_count = changed_count + 1
+                ctrl_refresh_open_document_from_disk_batch(ctrl, file, next)
+    val index = md_wiki_index_documents(_editor_markdown_vault_documents(parsed.root))
+    ctrl.wiki_panel = wiki_panel_from_properties(_editor_wiki_properties_for_key(index, parsed.key))
+    ctrl_show_wiki_panel(ctrl, "vault property set: " + changed_count.to_text())
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_vault_property_review(ctrl: mut EditorController, payload: text) -> EditorAction:
+    val parsed = _editor_parse_vault_property_payload(payload)
+    if parsed.root == "" or parsed.key == "":
+        ctrl.status_msg = "missing vault root or property key"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.wiki_property_vault_root = parsed.root
+    var rows: [WikiPanelRow] = []
+    val files = rt_dir_walk(parsed.root)
+    for file in files:
+        if not _editor_is_markdown_path(file):
+            continue
+        if not _editor_vault_property_path_selected(file, parsed.selected_paths):
+            continue
+        val existing = rt_file_read_text(file) ?? ""
+        val next = _editor_markdown_property_content(existing, parsed.key, parsed.value)
+        if next != existing:
+            rows.push(WikiPanelRow(icon: "review", label: _editor_path_basename(file), detail: parsed.key + " -> " + parsed.value, path: file, line: 0))
+    ctrl.wiki_panel = wiki_panel_with_rows("Property Review", rows)
+    ctrl_show_wiki_panel(ctrl, "vault property review: " + rows.len().to_text())
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_property_diagnostics(ctrl: mut EditorController, payload: text) -> EditorAction:
+    val doc = ctrl.session.active_document()
+    var buffer = ctrl.session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown note open"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val rule = _editor_property_schema_rule_from_payload(payload)
+    if rule.key == "":
+        ctrl.status_msg = "missing property schema"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.wiki_property_schema_payload = payload
+    val diags = md_check_frontmatter_property_schema(buffer.to_text(), doc.path(), [rule])
+    ctrl.diagnostic_store.set_diagnostics(doc.path(), diags)
+    ctrl.diagnostics_panel = diagnostics_panel_from_store(ctrl.diagnostic_store)
+    ctrl_show_diagnostics_panel(ctrl)
+    ctrl.status_msg = "property diagnostics: " + diags.len().to_text()
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_show_tags(ctrl: mut EditorController, tag: text) -> EditorAction:
+    val needle = tag.trim()
+    if needle == "":
+        ctrl.status_msg = "missing wiki tag"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val index = ctrl_wiki_index_open_documents(ctrl)
+    ctrl.wiki_panel = wiki_panel_from_tags(md_wiki_tags(index, needle))
+    ctrl_show_wiki_panel(ctrl, "wiki tags panel")
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_show_graph(ctrl: mut EditorController) -> EditorAction:
+    val doc = ctrl.session.active_document()
+    val path = if doc == nil then "" else: doc.path()
+    val index = ctrl_wiki_index_open_documents(ctrl)
+    ctrl.wiki_panel = wiki_panel_from_graph_edges_with_index(md_wiki_graph_edges(index, path), index)
+    ctrl_show_wiki_panel(ctrl, "wiki graph panel")
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_quick_switch(ctrl: mut EditorController, query: text) -> EditorAction:
+    val needle = query.trim()
+    ctrl.wiki_quick_switch_query = needle
+    val index = ctrl_wiki_index_open_documents(ctrl)
+    ctrl.wiki_panel = wiki_panel_from_documents(md_wiki_quick_switch(index, needle))
+    ctrl_show_wiki_panel(ctrl, "wiki quick switch panel")
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_index_open_documents(ctrl: mut EditorController) -> MdWikiIndex:
+    var docs: [MdWikiDocument] = []
+    for doc in ctrl.session.documents:
+        if doc.language_id == "markdown":
+            if not _editor_wiki_docs_has_path(docs, doc.path()):
+                docs.push(md_wiki_document(doc.path(), doc.buffer.to_text()))
+    if ctrl.vault_search_index.root != "" and not ctrl.vault_search_index.dirty:
+        for vault_doc in ctrl.vault_search_index.documents:
+            if not _editor_wiki_docs_has_path(docs, vault_doc.path):
+                docs.push(vault_doc)
+    md_wiki_index_documents(docs)
+
+fn ctrl_wiki_vault_search(ctrl: mut EditorController, payload: text) -> EditorAction:
+    val root = _editor_payload_part(payload, 0)
+    val query = _editor_payload_part(payload, 1)
+    if root == "" or query == "":
+        ctrl.status_msg = "missing vault root or query"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.wiki_vault_search_root = root
+    ctrl.wiki_vault_search_query = query
+    var index = ctrl.vault_search_index
+    val cache_path = _editor_vault_search_cache_path(root)
+    if index.root != root:
+        val docs = _editor_markdown_vault_documents(root)
+        val loaded = md_vault_search_index_load(cache_path)
+        if loaded.root == root and not loaded.dirty and md_vault_search_index_matches_documents(loaded, docs):
+            index = loaded
+        else:
+            index = md_vault_search_index_new(root, docs)
+            md_vault_search_index_save(index, cache_path)
+    elif index.dirty:
+        index = md_vault_search_index_refresh(index, _editor_markdown_vault_documents(root))
+        md_vault_search_index_save(index, cache_path)
+    ctrl.vault_search_index = index
+    val matches = md_vault_search_index_search(index, query)
+    ctrl.wiki_panel = wiki_panel_from_vault_search(matches)
+    ctrl_show_wiki_panel(ctrl, "wiki vault search: " + matches.len().to_text())
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_show_wiki_panel(ctrl: mut EditorController, message: text):
+    var layout = ctrl.session.dock_layout
+    layout.show_right("wiki-panel")
+    ctrl.session.dock_layout = layout
+    ctrl.status_msg = message
+
+fn ctrl_open_markdown_link_under_cursor(ctrl: mut EditorController) -> EditorAction:
+    val doc = ctrl.session.active_document()
+    var buffer = ctrl.session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "not a markdown file"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val content = md_buffer_content(buffer)
+    val raw_target = md_vim_open_link_under_cursor(content, buffer.cursor_row, buffer.cursor_col)
+    if raw_target == "":
+        ctrl.status_msg = "no link under cursor"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl_open_markdown_link_target(ctrl, raw_target)
+
+fn ctrl_open_markdown_link_target(ctrl: mut EditorController, raw_target: text) -> EditorAction:
+    val doc = ctrl.session.active_document()
+    if doc == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "not a markdown file"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    if raw_target.starts_with("http://") or raw_target.starts_with("https://"):
+        ctrl.status_msg = _editor_open_external_url_status(raw_target)
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val path = _editor_resolve_markdown_link_path(raw_target, doc.path(), ctrl.session)
+    if path == "":
+        ctrl.status_msg = "unresolved link: " + raw_target
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val parsed_target = md_wiki_parse_link_target(raw_target.trim())
+    val title = parsed_target.0.trim()
+    val should_create = _editor_markdown_link_should_create_note(raw_target, path)
+    if should_create:
+        val heading = if title == "" then md_wiki_title_from_path(path) else: title
+        val note_content = "# " + heading + "\n\n"
+        val written = rt_file_write_text(path, note_content)
+        if not written:
+            ctrl.status_msg = "failed to create note: " + path
+            return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+        ctrl.vault_search_index = md_vault_search_index_apply_file_change(ctrl.vault_search_index, path, note_content, 1)
+    var session_link = ctrl.session
+    session_link.open_file(path)
+    ctrl._replace_session(session_link)
+    ctrl_focus_lsp_target_path(ctrl, path)
+    ctrl.status_msg = if should_create then "created note: " + path else: "opened link: " + path
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_wiki_jump_selected(ctrl: mut EditorController) -> EditorAction:
+    if ctrl.wiki_panel.title == "Debug Launch Configs":
+        return ctrl_debug_start_selected_launch_config(ctrl)
+    if ctrl.wiki_panel.title == "Debug Sessions":
+        return ctrl_debug_switch_selected_session(ctrl)
+    if ctrl.wiki_panel.title == "Templates":
+        if ctrl.wiki_panel.rows.len() == 0:
+            ctrl.status_msg = "no template target"
+            return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+        return ctrl_wiki_template_insert(ctrl, ctrl.wiki_panel.rows[ctrl.wiki_panel.selected].detail)
+    if ctrl.wiki_panel.title == "Daily Notes":
+        if ctrl.wiki_panel.rows.len() == 0:
+            ctrl.status_msg = "no daily note target"
+            return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+        return ctrl_wiki_daily_note_create(ctrl, ctrl.wiki_panel.rows[ctrl.wiki_panel.selected].detail)
+    if ctrl.wiki_panel.title == "Attachment Picker":
+        if ctrl.wiki_panel.rows.len() == 0:
+            ctrl.status_msg = "no attachment target"
+            return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+        val picked_payload = ctrl.wiki_panel.rows[ctrl.wiki_panel.selected].detail
+        if _editor_payload_part(picked_payload, 1) != "":
+            return ctrl_wiki_attachment_insert(ctrl, picked_payload)
+    val path = wiki_panel_target_path(ctrl.wiki_panel)
+    if path == "":
+        ctrl.status_msg = "no wiki result target"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val line = wiki_panel_target_line(ctrl.wiki_panel)
+    var session_jump = ctrl.session
+    session_jump.open_file(path)
+    ctrl._replace_session(session_jump)
+    ctrl_focus_lsp_target_path(ctrl, path)
+    var buffer = ctrl.session.active_buffer()
+    if buffer != nil:
+        buffer.move_cursor(line, 0)
+        ctrl.session.update_active_buffer(buffer)
+    ctrl.status_msg = "wiki jump: " + path + ":" + (line + 1).to_text()
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)

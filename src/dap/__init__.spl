@@ -1,0 +1,13 @@
+# DAP Module - Debug Adapter Protocol
+#
+# Debug Adapter Protocol implementation for IDE integration.
+# Provides debugging capabilities through the DAP standard.
+#
+# Public API:
+#   - use app.dap.{start_debug_session, DapServer}
+#   - use app.dap.{Breakpoint, StackFrame, Variable}
+
+# All submodules are automatically available.
+
+# Re-exported from transport.spl
+export read_message, write_message

@@ -1,0 +1,637 @@
+{
+  "name": "simple-rich-editor",
+  "displayName": "Simple Rich Editor",
+  "description": "Rich custom editor for Simple language files with variable line heights, math rendering, and image embedding",
+  "version": "0.1.0",
+  "publisher": "simple-lang",
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.82.0"
+  },
+  "extensionDependencies": [
+    "ms-vscode.wasm-wasi-core"
+  ],
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Testing"
+  ],
+  "activationEvents": [
+    "onLanguage:simple",
+    "onCustomEditor:simple.richSourceEditor",
+    "onCommand:simple.richEditor.open"
+  ],
+  "main": "./out/extension.js",
+  "browser": "./out/browser/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "simple",
+        "extensions": [
+          ".spl"
+        ],
+        "aliases": [
+          "Simple",
+          "simple"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "simple",
+        "scopeName": "source.simple",
+        "path": "./syntaxes/simple.tmLanguage.json"
+      }
+    ],
+    "customEditors": [
+      {
+        "viewType": "simple.richSourceEditor",
+        "displayName": "Simple Rich Source Editor",
+        "selector": [
+          {
+            "filenamePattern": "*.spl"
+          }
+        ],
+        "priority": "option"
+      }
+    ],
+    "commands": [
+      {
+        "command": "simple.richEditor.open",
+        "title": "Open Rich Source Editor",
+        "category": "Simple Rich"
+      },
+      {
+        "command": "simple.richEditor.showOutputChannel",
+        "title": "Show Rich Editor Output",
+        "category": "Simple Rich"
+      },
+      {
+        "command": "simple.lsp.restart",
+        "title": "Restart Simple LSP",
+        "category": "Simple Language"
+      },
+      {
+        "command": "simple.lsp.showOutputChannel",
+        "title": "Show Simple LSP Output",
+        "category": "Simple Language"
+      },
+      {
+        "command": "simple.test.runFile",
+        "title": "Run Simple Test File",
+        "category": "Simple Test"
+      },
+      {
+        "command": "simple.test.runAtCursor",
+        "title": "Run Simple Test At Cursor",
+        "category": "Simple Test"
+      },
+      {
+        "command": "simple.test.runSdoctest",
+        "title": "Run Simple Doctest",
+        "category": "Simple Test"
+      },
+      {
+        "command": "simple.math.togglePreview",
+        "title": "Toggle Simple Math Preview",
+        "category": "Simple Math"
+      },
+      {
+        "command": "simple.math.toggleSyncPanel",
+        "title": "Toggle Simple Synced Math Panel",
+        "category": "Simple Math"
+      },
+      {
+        "command": "simple.math.openCustomEditor",
+        "title": "Open Simple Math Custom Editor",
+        "category": "Simple Math"
+      },
+      {
+        "command": "simple.math.toggleInlineRender",
+        "title": "Toggle Simple Inline Math Rendering",
+        "category": "Simple Math"
+      },
+      {
+        "command": "simple.ai.openChat",
+        "title": "Open Simple AI Chat",
+        "category": "Simple AI"
+      },
+      {
+        "command": "simple.ai.toggleInlineCompletions",
+        "title": "Toggle Simple AI Inline Completions",
+        "category": "Simple AI"
+      },
+      {
+        "command": "simple.ai.explainCode",
+        "title": "Explain Selected Simple Code",
+        "category": "Simple AI"
+      },
+      {
+        "command": "simple.ai.reviewCode",
+        "title": "Review Selected Simple Code",
+        "category": "Simple AI"
+      },
+      {
+        "command": "simple.ai.generateCode",
+        "title": "Generate Simple Code",
+        "category": "Simple AI"
+      },
+      {
+        "command": "simple.test.openWorkspace",
+        "title": "Open Simple Test Workspace",
+        "category": "Simple Test"
+      },
+      {
+        "command": "simple.test.refreshWorkspace",
+        "title": "Refresh Simple Test Workspace",
+        "category": "Simple Test"
+      },
+      {
+        "command": "simple.test.openLatestArtifacts",
+        "title": "Open Latest Test Artifacts",
+        "category": "Simple Test"
+      },
+      {
+        "command": "simple.outline.revealSymbol",
+        "title": "Reveal Simple Symbol",
+        "category": "Simple Rich"
+      },
+      {
+        "command": "simple.editor.toggleBreakpoint",
+        "title": "Toggle Simple Breakpoint",
+        "category": "Simple Editor"
+      },
+      {
+        "command": "simple.editor.toggleBookmark",
+        "title": "Toggle Simple Bookmark",
+        "category": "Simple Editor"
+      },
+      {
+        "command": "simple.editor.togglePointer",
+        "title": "Toggle Simple Execution Pointer",
+        "category": "Simple Editor"
+      },
+      {
+        "command": "simple.editor.clearPointer",
+        "title": "Clear Simple Execution Pointer",
+        "category": "Simple Editor"
+      },
+      {
+        "command": "simple.editor.nextBookmark",
+        "title": "Next Simple Bookmark",
+        "category": "Simple Editor"
+      },
+      {
+        "command": "simple.editor.prevBookmark",
+        "title": "Previous Simple Bookmark",
+        "category": "Simple Editor"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "simple.ai.explainCode",
+          "when": "editorHasSelection && editorLangId == simple",
+          "group": "simple-ai@1"
+        },
+        {
+          "command": "simple.ai.reviewCode",
+          "when": "editorHasSelection && editorLangId == simple",
+          "group": "simple-ai@2"
+        },
+        {
+          "command": "simple.richEditor.open",
+          "when": "editorLangId == simple",
+          "group": "simple-editor@1"
+        },
+        {
+          "command": "simple.math.openCustomEditor",
+          "when": "editorLangId == simple",
+          "group": "simple-editor@2"
+        },
+        {
+          "command": "simple.math.togglePreview",
+          "when": "editorLangId == simple",
+          "group": "simple-math@1"
+        },
+        {
+          "command": "simple.math.toggleSyncPanel",
+          "when": "editorLangId == simple",
+          "group": "simple-math@2"
+        },
+        {
+          "command": "simple.test.openWorkspace",
+          "when": "editorLangId == simple",
+          "group": "simple-test@1"
+        },
+        {
+          "command": "simple.test.openLatestArtifacts",
+          "when": "editorLangId == simple",
+          "group": "simple-test@2"
+        },
+        {
+          "command": "simple.editor.toggleBreakpoint",
+          "when": "editorLangId == simple",
+          "group": "simple-markers@1"
+        },
+        {
+          "command": "simple.editor.toggleBookmark",
+          "when": "editorLangId == simple",
+          "group": "simple-markers@2"
+        },
+        {
+          "command": "simple.editor.togglePointer",
+          "when": "editorLangId == simple",
+          "group": "simple-markers@3"
+        },
+        {
+          "command": "simple.editor.nextBookmark",
+          "when": "editorLangId == simple",
+          "group": "simple-markers@4"
+        },
+        {
+          "command": "simple.editor.prevBookmark",
+          "when": "editorLangId == simple",
+          "group": "simple-markers@5"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "simple.richEditor.open",
+          "when": "resourceExtname == .spl",
+          "group": "navigation@20"
+        },
+        {
+          "command": "simple.math.openCustomEditor",
+          "when": "resourceExtname == .spl",
+          "group": "navigation@21"
+        }
+      ],
+      "editor/lineNumber/context": [
+        {
+          "command": "simple.editor.toggleBreakpoint",
+          "when": "editorLangId == simple",
+          "group": "simple-markers@1"
+        },
+        {
+          "command": "simple.editor.toggleBookmark",
+          "when": "editorLangId == simple",
+          "group": "simple-markers@2"
+        },
+        {
+          "command": "simple.editor.togglePointer",
+          "when": "editorLangId == simple",
+          "group": "simple-markers@3"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "simple.ai.openChat",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.ai.toggleInlineCompletions",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.ai.explainCode",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.ai.reviewCode",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.ai.generateCode",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.lsp.restart",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.lsp.showOutputChannel",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.richEditor.open",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.test.runAtCursor",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.test.runFile",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.test.runSdoctest",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.math.togglePreview",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.math.toggleSyncPanel",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.math.openCustomEditor",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.math.toggleInlineRender",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.test.openWorkspace",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.test.refreshWorkspace",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.test.openLatestArtifacts",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.editor.toggleBreakpoint",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.editor.toggleBookmark",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.editor.togglePointer",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.editor.clearPointer",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.editor.nextBookmark",
+          "when": "editorLangId == simple"
+        },
+        {
+          "command": "simple.editor.prevBookmark",
+          "when": "editorLangId == simple"
+        }
+      ]
+    },
+    "views": {
+      "explorer": [
+        {
+          "id": "simpleOutline",
+          "name": "Simple Outline"
+        }
+      ]
+    },
+    "semanticTokenTypes": [
+      {
+        "id": "keyword",
+        "description": "Language keywords"
+      },
+      {
+        "id": "function",
+        "description": "Function names"
+      },
+      {
+        "id": "type",
+        "description": "Type names"
+      },
+      {
+        "id": "variable",
+        "description": "Variable names"
+      },
+      {
+        "id": "parameter",
+        "description": "Function parameters"
+      },
+      {
+        "id": "property",
+        "description": "Object properties"
+      },
+      {
+        "id": "number",
+        "description": "Numeric literals"
+      },
+      {
+        "id": "string",
+        "description": "String literals"
+      },
+      {
+        "id": "comment",
+        "description": "Comments"
+      },
+      {
+        "id": "operator",
+        "description": "Operators"
+      },
+      {
+        "id": "namespace",
+        "description": "Module and suite names"
+      }
+    ],
+    "semanticTokenModifiers": [
+      {
+        "id": "declaration",
+        "description": "Symbol declaration"
+      },
+      {
+        "id": "definition",
+        "description": "Symbol definition"
+      },
+      {
+        "id": "readonly",
+        "description": "Read-only variable"
+      },
+      {
+        "id": "static",
+        "description": "Static member"
+      },
+      {
+        "id": "deprecated",
+        "description": "Deprecated symbol"
+      },
+      {
+        "id": "abstract",
+        "description": "Abstract member"
+      },
+      {
+        "id": "async",
+        "description": "Async function"
+      },
+      {
+        "id": "modification",
+        "description": "Modifying operation"
+      },
+      {
+        "id": "documentation",
+        "description": "Documentation comment"
+      }
+    ],
+    "configuration": {
+      "title": "Simple Rich Editor",
+      "properties": {
+        "simple.cli.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Simple CLI binary used for native test runs. Leave empty to use PATH or workspace bin/simple."
+        },
+        "simple.lsp.mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "native",
+            "wasm"
+          ],
+          "default": "auto",
+          "description": "LSP server mode. 'auto' uses native on desktop and WASM on web. 'native' forces subprocess. 'wasm' forces in-process WebAssembly."
+        },
+        "simple.lsp.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to Simple LSP server binary. Leave empty to auto-detect from the workspace or PATH."
+        },
+        "simple.lsp.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace LSP communication between VS Code and the Simple server for debugging."
+        },
+        "simple.lsp.enableSemanticTokens": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable semantic syntax highlighting when the Simple LSP server is available."
+        },
+        "simple.lsp.debounceDelay": {
+          "type": "number",
+          "default": 300,
+          "minimum": 0,
+          "maximum": 2000,
+          "description": "Delay in milliseconds before sending LSP document changes."
+        },
+        "simple.lsp.enableInlayHints": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable inlay hints when the Simple LSP server is available."
+        },
+        "simple.lsp.enableCodeActions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable code actions and quick fixes when the Simple LSP server is available."
+        },
+        "simple.lsp.enablePullDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable pull-based diagnostics when the Simple LSP server is available."
+        },
+        "simple.ai.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable AI-powered features for the Simple extension."
+        },
+        "simple.ai.inlineCompletions": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable AI-powered inline code completions."
+        },
+        "simple.ai.chatPanel": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the Simple AI chat panel."
+        },
+        "simple.math.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable native source-editor math helpers for m{}, loss{}, and nograd{} blocks."
+        },
+        "simple.math.renderInline": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show char-based math preview in the native VS Code source editor."
+        },
+        "simple.math.previewOnHover": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show hover details for math blocks in the native source editor."
+        },
+        "simple.math.syncPanel.autoOpen": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically open the synced math panel when the caret enters a math block."
+        },
+        "simple.math.alignment": {
+          "type": "string",
+          "enum": [
+            "center",
+            "bottom"
+          ],
+          "default": "center",
+          "description": "Deprecated compatibility setting. The current char-based math renderer ignores this value.",
+          "markdownDeprecationMessage": "Deprecated: the current char-based math renderer does not use `simple.math.alignment`. This setting only applied to the old SVG inline-render path."
+        },
+        "simple.math.debugLayout": {
+          "type": "boolean",
+          "default": false,
+          "description": "Deprecated compatibility setting. The current char-based math renderer does not emit layout metrics.",
+          "markdownDeprecationMessage": "Deprecated: the current char-based math renderer does not compute SVG layout metrics, so `simple.math.debugLayout` has no effect."
+        },
+        "simple.richEditor.showBlockBorders": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show borders around rendered rich-editor blocks such as math and image widgets."
+        },
+        "simple.richEditor.centerLineNumbers": {
+          "type": "boolean",
+          "default": true,
+          "description": "Experimental line-number alignment option for the rich editor. Current migration work does not depend on it."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile && npm run stage:wasm",
+    "compile": "tsc -p ./ && npm run build:webview",
+    "build:webview": "node ./scripts/build-webview.mjs",
+    "stage:wasm": "node ./scripts/stage-wasm.mjs",
+    "pretest": "npm run compile",
+    "test": "node ./scripts/run-vscode-tests.mjs --label=gui",
+    "test:gui": "node ./scripts/run-vscode-tests.mjs --label=gui",
+    "watch": "tsc -watch -p ./",
+    "watch:webview": "node ./scripts/build-webview.mjs --watch"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.82.0",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
+    "esbuild": "^0.28.0",
+    "mocha": "^10.8.2",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@codemirror/autocomplete": "^6.20.1",
+    "@codemirror/commands": "^6.10.3",
+    "@codemirror/language": "^6.12.3",
+    "@codemirror/search": "^6.6.0",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/view": "^6.41.0",
+    "@lezer/highlight": "^1.2.3",
+    "@vscode/wasm-wasi": "^1.0.2",
+    "@vscode/wasm-wasi-lsp": "^0.1.0-pre.9",
+    "katex": "^0.16.45",
+    "vscode-languageclient": "^10.0.0-next.21"
+  }
+}

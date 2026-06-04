@@ -1,0 +1,660 @@
+# Test Runner File Discovery and Utilities
+#
+# File discovery, filtering, shuffling, and skip feature tracking.
+
+use std.test_runner.test_runner_types.{SkipFeatureInfo, TestExecutionMode, TestLevel, TestOptions, execution_mode_is_composite, execution_mode_target_arch}
+use app.test_cache_shared.{TestCacheEntry}
+use std.io.{path_basename}
+use std.io.{file_read, file_exists}
+use std.io.{dir_walk}
+use std.test_runner.test_manifest.{
+    TestManifest, TestManifestEntry,
+    MANIFEST_PATH, manifest_load, manifest_save, manifest_is_fresh
+}
+use std.test_runner.test_manifest_scanner.{manifest_full_scan, manifest_incremental_update}
+
+extern fn rt_time_now_unix_micros() -> i64
+
+# =========================================================================
+# ANSI Stripping
+# =========================================================================
+
+fn strip_ansi(s: text) -> text:
+    # Strip ANSI escape sequences by scanning for ESC[ ... m patterns.
+    # ESC character is \x1b (27). We detect it by checking for the two-char
+    # sequence that starts ANSI codes: ESC followed by '['.
+    var parts: [text] = []
+    var i = 0
+    var in_escape = false
+    while i < s.len():
+        val ch = s[i:i + 1]
+        if in_escape:
+            # Inside escape sequence - skip until we hit a letter terminator
+            if (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z"):
+                in_escape = false  # End of escape sequence
+            i = i + 1
+            continue
+        # Check for ESC character (appears as a special char in strings)
+        # Since we can't directly check char code, look for the [ after ESC
+        if i + 1 < s.len():
+            val next = s[i + 1:i + 2]
+            if next == "[":
+                # Could be ESC[, check if followed by digits and letter
+                var j = i + 2
+                var looks_like_ansi = false
+                while j < s.len():
+                    val c = s[j:j + 1]
+                    if (c >= "0" and c <= "9") or c == ";" or c == "?":
+                        j = j + 1
+                    elif (c >= "a" and c <= "z") or (c >= "A" and c <= "Z"):
+                        looks_like_ansi = true
+                        j = j + 1
+                        break
+                    else:
+                        break
+                if looks_like_ansi:
+                    i = j
+                    continue
+        parts.push(ch)
+        i = i + 1
+    parts.join("")
+
+# =========================================================================
+# File Type Checking
+# =========================================================================
+
+fn is_test_file(path: text) -> bool:
+    val name = path_basename(path)
+    if not name.ends_with(".spl"):
+        return false
+    name.contains("_spec.") or name.contains("_test.")
+
+fn is_skip_marker_file(path: text) -> bool:
+    val name = path_basename(path)
+    name.ends_with(".spl.skip") and (name.contains("_spec.") or name.contains("_test."))
+
+fn count_skip_marker_cases(path: text) -> i64:
+    val content = read_file_content(path)
+    var count = 0
+    val lines = content.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.starts_with("skip \"") or trimmed.starts_with("skip '"):
+            count = count + 1
+    if count > 0:
+        return count
+    1
+
+fn matches_level(path: text, level: TestLevel) -> bool:
+    match level:
+        case TestLevel.All:
+            true
+        case TestLevel.Unit:
+            path.contains("/unit/") or path.contains("/shared/")
+        case TestLevel.Integration:
+            path.contains("/integration/")
+        case TestLevel.System:
+            path.contains("/system/") or path.contains("/feature/")
+
+# =========================================================================
+# File Content Utilities
+# =========================================================================
+
+fn read_file_content(file_path: text) -> text:
+    val result = file_read(file_path)
+    result ?? ""
+
+fn file_has_slow_test(file_path: text) -> bool:
+    val content = read_file_content(file_path)
+    content.contains("slow_it ")
+
+fn file_has_skip_tag(file_path: text) -> bool:
+    if is_skip_marker_file(file_path):
+        return true
+    val content = read_file_content(file_path)
+    content.contains("tag: \"skip\"") or content.contains("tag: 'skip'")
+
+fn file_has_pending_tag(file_path: text) -> bool:
+    val content = read_file_content(file_path)
+    content.contains("# @pending") or content.contains("tag: \"pending\"") or content.contains("tag: 'pending'")
+
+fn file_has_ignored_test(file_path: text) -> bool:
+    # slow_it now runs (session sharing), so not ignored
+    val content = read_file_content(file_path)
+    content.contains("tag: \"skip\"") or content.contains("tag: 'skip'") or content.contains("# @pending") or content.contains("tag: \"pending\"") or content.contains("tag: 'pending'")
+
+fn file_has_tag(file_path: text, tag: text) -> bool:
+    if tag == "":
+        return true
+    val content = read_file_content(file_path)
+    content.contains("tag: \"{tag}\"") or content.contains("tag: '{tag}'")
+
+fn file_has_di_test_tag(file_path: text) -> bool:
+    """Check if file has # @di_test tag, allowing DI modifications in system tests."""
+    val content = read_file_content(file_path)
+    content.contains("# @di_test")
+
+fn extract_cover_annotations(file_path: text) -> [text]:
+    """Extract # @cover annotations from the first 30 lines of a file."""
+    val content = file_read(file_path)
+    val lines = content.split("\n")
+    var covers: [text] = []
+    var i = 0
+    while i < lines.len() and i < 30:
+        val trimmed = lines[i].trim()
+        if trimmed.starts_with("# @cover "):
+            val target = trimmed[9:].trim()
+            if target != "":
+                covers.push(target)
+        i = i + 1
+    covers
+
+fn validate_system_test_covers(files: [text]) -> [text]:
+    """Return system test files missing required # @cover annotations."""
+    var missing: [text] = []
+    for f in files:
+        if not f.contains("/system/"):
+            continue
+        if f.contains("/helpers/") or f.contains("/fixtures/"):
+            continue
+        val covers = extract_cover_annotations(f)
+        if covers.len() == 0:
+            missing.push(f)
+    missing
+
+# =========================================================================
+# Platform Tag Functions
+# =========================================================================
+
+fn file_get_platform_tags(content: text) -> [text]:
+    """Extract # @platform: tags from file content."""
+    val lines = content.split("\n")
+    var tags: [text] = []
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.starts_with("# @platform:"):
+            val tag = trimmed[12:].trim()
+            if tag != "":
+                tags.push(tag)
+    tags
+
+fn platform_tag_matches(tag: text, mode: TestExecutionMode) -> bool:
+    """Check if a single platform tag matches the current mode."""
+    if tag == "host" or tag == "all":
+        return true
+    match mode:
+        case TestExecutionMode.Interpreter: tag == "interpreter"
+        case TestExecutionMode.Smf: tag == "smf"
+        case TestExecutionMode.Native: tag == "native"
+        case TestExecutionMode.Composite(spec):
+            spec.contains(tag) or tag == "composite"
+
+# =========================================================================
+# Fast Test File Discovery (manifest-based)
+# =========================================================================
+
+fn discover_test_files_fast(base_path: text, options: TestOptions, use_cache: bool) -> [text]:
+    # Normalize path separators for Windows compatibility
+    var base_path = base_path.replace("\\", "/")
+    # Single file — no manifest needed
+    if base_path.ends_with(".spl"):
+        if file_exists(base_path) and is_test_file(base_path):
+            if not options.only_skipped and file_has_pending_tag(base_path):
+                return []
+            return [base_path]
+        return []
+
+    if not use_cache:
+        return discover_test_files_slow(base_path, options)
+
+    # Try loading manifest
+    val manifest = manifest_load(MANIFEST_PATH)
+    if not manifest_is_fresh(manifest):
+        # Manifest missing or stale — fall back to full scan, then save
+        val result = discover_test_files_slow(base_path, options)
+        # Build manifest in background for next run
+        save_manifest_from_discovery(base_path)
+        return result
+
+    # Fast path: filter manifest entries in-memory
+    val start = rt_time_now_unix_micros()
+    var test_files: [text] = []
+
+    for entry in manifest.entries:
+        # Path prefix filter
+        if not entry.path.starts_with(base_path):
+            continue
+
+        # Level filter
+        if not manifest_entry_matches_level(entry, options.level):
+            continue
+
+        # Skip @skip/@pending unless --only-skipped
+        if not options.only_skipped:
+            if entry.skip_tag or entry.pending_tag:
+                continue
+
+        # Advanced directory filters
+        if not options.fuzz_mode and entry.is_fuzz:
+            continue
+        if not options.chaos_mode and entry.is_chaos:
+            continue
+        if not options.deploy_mode and entry.is_deploy:
+            continue
+        if not options.security_mode and entry.is_security:
+            continue
+
+        # Baremetal/remote filtering
+        val explicit_target = base_path.contains("/baremetal") or base_path.contains("/remote")
+        val is_host_mode = not execution_mode_is_composite(options.mode)
+        if is_host_mode and not explicit_target:
+            if entry.is_baremetal or entry.path.contains("/remote/"):
+                continue
+
+        # Platform tag filtering
+        if not explicit_target and entry.platform_tags != "":
+            val ptags = entry.platform_tags.split(",")
+            var tag_matched = false
+            for ptag in ptags:
+                if platform_tag_matches(ptag, options.mode):
+                    tag_matched = true
+            if not tag_matched:
+                continue
+
+        # Content-based filters (from manifest metadata, no file I/O)
+        if options.list_ignored:
+            if not entry.slow_tag and not entry.skip_tag and not entry.pending_tag:
+                continue
+
+        if options.only_slow and not options.run_all:
+            if not entry.slow_tag:
+                continue
+
+        if options.only_skipped:
+            if not entry.skip_tag:
+                continue
+
+        if options.tag != "":
+            if not entry.tags.contains(options.tag):
+                continue
+
+        # Slow tests now run by default (session sharing makes them fast)
+
+        test_files.push(entry.path)
+
+    # Apply seed shuffle
+    if options.seed_set:
+        test_files = shuffle_files(test_files, options.seed)
+
+    val elapsed = rt_time_now_unix_micros() - start
+    val elapsed_ms = elapsed / 1000
+    print "  Discovery: {elapsed_ms}ms (from manifest, {manifest.entries.len()} indexed)"
+
+    test_files
+
+fn manifest_entry_matches_level(entry: TestManifestEntry, level: TestLevel) -> bool:
+    match level:
+        case TestLevel.All: true
+        case TestLevel.Unit: entry.test_level == 1
+        case TestLevel.Integration: entry.test_level == 2
+        case TestLevel.System: entry.test_level == 3
+
+fn save_manifest_from_discovery(base_path: text):
+    # Determine scan directories based on base_path
+    var dirs: [text] = []
+    if base_path == "test/" or base_path == "test":
+        dirs = ["test/"]
+    else:
+        dirs = [base_path]
+    # Use incremental update when an existing manifest is available —
+    # only re-reads files whose size or mtime changed.
+    val old = manifest_load(MANIFEST_PATH)
+    var manifest = old
+    if old.entries.len() > 0:
+        manifest = manifest_incremental_update(old, dirs)
+    else:
+        manifest = manifest_full_scan(dirs)
+    manifest_save(manifest, MANIFEST_PATH)
+
+# =========================================================================
+# Test File Discovery (original full-scan path)
+# =========================================================================
+
+fn discover_test_files(base_path: text, options: TestOptions) -> [text]:
+    return discover_test_files_fast(base_path, options, true)
+
+fn discover_test_files_slow(base_path: text, options: TestOptions) -> [text]:
+    # Normalize path separators for Windows compatibility
+    var base_path = base_path.replace("\\", "/")
+    # If path is a single file, use it directly
+    if base_path.ends_with(".spl"):
+        if file_exists(base_path) and is_test_file(base_path):
+            return [base_path]
+        return []
+    val all_files = dir_walk(base_path)
+    # Check if we need content-based filtering at all
+    # Always need content if filtering slow tests (default behavior)
+    val needs_content = options.list_ignored or options.only_slow or options.only_skipped or options.tag != "" or not options.run_all
+    var test_files: [text] = []
+    for f in all_files:
+        if not is_test_file(f):
+            continue
+        if not matches_level(f, options.level):
+            continue
+        # Read file content once for @skip check and content-based filters
+        val content = read_file_content(f)
+        # Skip files with # @skip or # @pending unless running --only-skipped
+        if not options.only_skipped:
+            if content.contains("# @skip") or content.contains("# @pending"):
+                continue
+        # Skip advanced test directories unless their mode flag is set
+        if not options.fuzz_mode and f.contains("/fuzz/"):
+            continue
+        if not options.chaos_mode and f.contains("/resilience/"):
+            continue
+        if not options.deploy_mode and f.contains("/deploy/"):
+            continue
+        if not options.security_mode and f.contains("/security/"):
+            continue
+        # Option C: Directory convention filtering
+        # Skip if user explicitly targeted baremetal/remote directory
+        val explicit_target = base_path.contains("/baremetal") or base_path.contains("/remote")
+        val is_host_mode = not execution_mode_is_composite(options.mode)
+        if is_host_mode and not explicit_target:
+            if f.contains("/baremetal/") or f.contains("/remote/"):
+                continue
+        elif not is_host_mode:
+            # Composite mode: filter arch-specific baremetal dirs
+            val arch = execution_mode_target_arch(options.mode)
+            if f.contains("/baremetal/riscv32/") and arch != "riscv32":
+                continue
+            if f.contains("/baremetal/arm32/") and arch != "arm32":
+                continue
+            if f.contains("/baremetal/x86/") and arch != "x86":
+                continue
+        # Option B: Platform tag filtering (skip when user explicitly targets dir)
+        if not explicit_target:
+            val ptags = file_get_platform_tags(content)
+            if ptags.len() > 0:
+                var tag_matched = false
+                for ptag in ptags:
+                    if platform_tag_matches(ptag, options.mode):
+                        tag_matched = true
+                if not tag_matched:
+                    continue
+        # Content-based filters
+        if needs_content:
+            # --list-ignored: only show files with ignored tests
+            if options.list_ignored:
+                val has_ignored = content.contains("slow_it ") or content.contains("tag: \"skip\"") or content.contains("tag: 'skip'") or content.contains("# @pending") or content.contains("tag: \"pending\"") or content.contains("tag: 'pending'")
+                if not has_ignored:
+                    continue
+            # Filter by --only-slow (unless --all)
+            if options.only_slow and not options.run_all:
+                if not content.contains("slow_it "):
+                    continue
+            # Filter by --only-skipped
+            if options.only_skipped:
+                if not (content.contains("tag: \"skip\"") or content.contains("tag: 'skip'")):
+                    continue
+            # Filter by --tag
+            if options.tag != "":
+                if not (content.contains("tag: \"{options.tag}\"") or content.contains("tag: '{options.tag}'")):
+                    continue
+
+        # Slow tests now run by default (session sharing makes them fast)
+
+        test_files.push(f)
+
+    # Apply seed shuffle
+    if options.seed_set:
+        test_files = shuffle_files(test_files, options.seed)
+
+    test_files
+
+# =========================================================================
+# Deterministic Shuffle (hash-based, matches Rust runner)
+# =========================================================================
+
+fn simple_hash(s: text, seed: i64) -> i64:
+    # Simple hash using small multipliers to avoid overflow
+    var hash = seed * 31 + 7
+    var i = 0
+    while i < s.len():
+        val ch = s[i:i + 1]
+        var byte_val = 0
+        if ch >= "a" and ch <= "z":
+            byte_val = 97
+        elif ch >= "A" and ch <= "Z":
+            byte_val = 65
+        elif ch >= "0" and ch <= "9":
+            byte_val = 48
+        elif ch == "/":
+            byte_val = 47
+        elif ch == "_":
+            byte_val = 95
+        elif ch == ".":
+            byte_val = 46
+        else:
+            byte_val = 42
+        hash = (hash * 31 + byte_val) % 1000000007
+        i = i + 1
+    hash
+
+fn shuffle_files(files: [text], seed: i64) -> [text]:
+    # Compute hashes for each file
+    var hashes: [i64] = []
+    for f in files:
+        hashes.push(simple_hash(f, seed))
+
+    # Build index array
+    var n = files.len()
+    var idx: [i64] = []
+    var j = 0
+    while j < n:
+        idx.push(j)
+        j = j + 1
+
+    # Shell sort by hash - O(n log²n) instead of O(n²)
+    var gap = n / 2
+    while gap > 0:
+        var i = gap
+        while i < n:
+            val tmp_idx = idx[i]
+            val tmp_hash = hashes[tmp_idx]
+            var k = i
+            while k >= gap and hashes[idx[k - gap]] > tmp_hash:
+                idx[k] = idx[k - gap]
+                k = k - gap
+            idx[k] = tmp_idx
+            i = i + 1
+        gap = gap / 2
+
+    var result: [text] = []
+    var k = 0
+    while k < n:
+        result.push(files[idx[k]])
+        k = k + 1
+    result
+
+# =========================================================================
+# Skip Features
+# =========================================================================
+
+fn extract_skip_feature_info(file_path: text) -> SkipFeatureInfo:
+    val content = read_file_content(file_path)
+    val lines = content.split("\n")
+    var title = ""
+    var feature_ids = ""
+    var category = ""
+    var status = "Unknown"
+
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.starts_with("# ") and title == "":
+            title = trimmed.replace("# ", "")
+        elif trimmed.starts_with("**Feature IDs:**"):
+            feature_ids = trimmed.replace("**Feature IDs:**", "").trim()
+        elif trimmed.starts_with("**Category:**"):
+            category = trimmed.replace("**Category:**", "").trim()
+        elif trimmed.starts_with("**Status:**"):
+            status = trimmed.replace("**Status:**", "").trim()
+
+    SkipFeatureInfo(
+        file_path: file_path,
+        title: title,
+        feature_ids: feature_ids,
+        category: category,
+        status: status
+    )
+
+fn print_skip_features(files: [text], planned_only: bool):
+    var features: [SkipFeatureInfo] = []
+    for f in files:
+        val info = extract_skip_feature_info(f)
+        if planned_only:
+            val s = info.status.lower()
+            if s.contains("planned") or s.contains("tbd") or s == "unknown":
+                features.push(info)
+        else:
+            features.push(info)
+
+    var label = "Skipped Features"
+    if planned_only:
+        label = "Planned Features"
+    print ""
+    print "{label} ({features.len()} of {files.len()} files)"
+    print "==============================================================="
+    print ""
+
+    for feat in features:
+        var line = "  {feat.title}"
+        if feat.feature_ids != "":
+            line = line + " ({feat.feature_ids})"
+        print line
+        print "    File:     {feat.file_path}"
+        if feat.category != "":
+            print "    Category: {feat.category}"
+        print "    Status:   {feat.status}"
+        print ""
+
+    print "Total: {features.len()} features"
+
+# =========================================================================
+# Smart Test Ordering (Longest-First)
+# =========================================================================
+
+fn order_tests_by_duration(files: [text], entries: {text: TestCacheEntry}) -> [text]:
+    """Sort test files by last known duration (longest first).
+    Files with no cached duration get median estimated duration.
+    This prevents a single slow test from being a tail blocker in parallel mode."""
+    if files.len() <= 1:
+        return files
+
+    # Collect durations from cache
+    var durations: [i64] = []
+    var known_durations: [i64] = []
+    var i = 0
+    while i < files.len():
+        val path = files[i]
+        val entry = entries[path]
+        if entry.?:
+            val dur = entry.result_duration_ms
+            durations.push(dur)
+            known_durations.push(dur)
+        else:
+            durations.push(-1)
+        i = i + 1
+
+    # Compute median for files without cached duration
+    var median_duration = 500
+    if known_durations.len() > 0:
+        known_durations = _sort_i64(known_durations)
+        median_duration = known_durations[known_durations.len() / 2]
+
+    # Replace unknowns with median
+    i = 0
+    while i < durations.len():
+        if durations[i] == -1:
+            durations[i] = median_duration
+        i = i + 1
+
+    # Shell sort by duration descending (longest first)
+    var n = files.len()
+    var idx: [i64] = []
+    var j = 0
+    while j < n:
+        idx.push(j)
+        j = j + 1
+
+    var gap = n / 2
+    while gap > 0:
+        i = gap
+        while i < n:
+            val tmp_idx = idx[i]
+            val tmp_dur = durations[tmp_idx]
+            var k = i
+            while k >= gap and durations[idx[k - gap]] < tmp_dur:
+                idx[k] = idx[k - gap]
+                k = k - gap
+            idx[k] = tmp_idx
+            i = i + 1
+        gap = gap / 2
+
+    var result: [text] = []
+    var k = 0
+    while k < n:
+        result.push(files[idx[k]])
+        k = k + 1
+    result
+
+fn _sort_i64(arr: [i64]) -> [i64]:
+    """Simple shell sort for i64 array (ascending)."""
+    var n = arr.len()
+    var result = arr
+    var gap = n / 2
+    while gap > 0:
+        var i = gap
+        while i < n:
+            val tmp = result[i]
+            var k = i
+            while k >= gap and result[k - gap] > tmp:
+                result[k] = result[k - gap]
+                k = k - gap
+            result[k] = tmp
+            i = i + 1
+        gap = gap / 2
+    result
+
+# =========================================================================
+# Discovery Summary / List Mode
+# =========================================================================
+
+fn print_discovery_summary(files: [text], options: TestOptions):
+    if options.list_skip_features:
+        print_skip_features(files, options.planned_only)
+        return
+
+    print "Discovered {files.len()} test file(s)"
+    for f in files:
+        if options.show_tags:
+            # Read file content ONCE for all tag checks
+            val content = read_file_content(f)
+            var tags: [text] = []
+            if content.contains("slow_it "):
+                tags.push("slow")
+            if content.contains("tag: \"skip\"") or content.contains("tag: 'skip'"):
+                tags.push("skip")
+            if content.contains("# @pending") or content.contains("tag: \"pending\"") or content.contains("tag: 'pending'"):
+                tags.push("pending")
+            if tags.len() > 0:
+                val tag_str = tags.join(", ")
+                print "  {f}  [{tag_str}]"
+            else:
+                print "  {f}"
+        else:
+            print "  {f}"
+
+# =========================================================================
+# Exports
+# =========================================================================

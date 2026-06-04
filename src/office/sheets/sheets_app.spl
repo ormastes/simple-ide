@@ -1,0 +1,287 @@
+# Simple Sheets Application
+#
+# Spreadsheet app with cell grid, formula bar, and formatting toolbar.
+
+use common.ui.builder.{column, row, panel, label, text_widget, tabs, statusbar, scroll, table_widget, button}
+use common.ui.ios.builder.{navigation_bar, search_bar}
+use common.ui.widget.{UITree, UIEvent, WidgetNode}
+use common.ui.builder.{build_tree_with_title, with_flex}
+use common.ui.theme_registry.{ThemeId, theme_id_key}
+use app.office.sheets.spreadsheet.{Workbook, Sheet}
+use app.office.sheets.cell.{Cell, CellValue, CellRef, CellStyle, cell_ref_to_string, col_to_letter, cell_display_text, parse_cell_ref}
+use app.office.sheets.formula.{evaluate_formula}
+
+# =========================================================================
+# Application State
+# =========================================================================
+
+class SheetsApp:
+    workbook: Workbook
+    active_cell: CellRef
+    editing: bool
+    formula_text: text
+    scroll_row: i32
+    scroll_col: i32
+    visible_rows: i32
+    visible_cols: i32
+    modified: bool
+    file_path: text
+
+impl SheetsApp:
+
+    static fn new() -> SheetsApp:
+        """Create a new Sheets application with an empty workbook."""
+        SheetsApp(
+            workbook: Workbook.new("Untitled Spreadsheet"),
+            active_cell: CellRef(col: 0, row: 0),
+            editing: false,
+            formula_text: "",
+            scroll_row: 0,
+            scroll_col: 0,
+            visible_rows: 30,
+            visible_cols: 20,
+            modified: false,
+            file_path: ""
+        )
+
+    me build_ui() -> UITree:
+        """Build the full spreadsheet UI tree."""
+        val active_ref_str = cell_ref_to_string(me.active_cell)
+
+        # Navigation bar with save button
+        val save_btn = button("btn_save", "Save", "save")
+        val nav = navigation_bar("nav", "Simple Sheets", [], [save_btn])
+
+        # Formula bar: cell reference label + formula input
+        val ref_label = label("cell_ref_label", active_ref_str)
+        val formula_display = text_widget("formula_input", _formula_bar_text(me))
+        val formula_bar = row("formula_bar", [ref_label, with_flex(formula_display, 1)])
+
+        # Grid
+        val headers = me.build_grid_headers()
+        val rows = me.build_grid_rows()
+        val grid_widget = table_widget("cell_grid", headers, rows)
+        val grid_children: [WidgetNode] = [grid_widget]
+        val grid_scroll = scroll("grid_scroll", 600, grid_children)
+
+        # Sheet tabs
+        var tab_names: [text] = []
+        for sheet in me.workbook.sheets:
+            tab_names.push(sheet.name)
+        val sheet_tabs = tabs("sheet_tabs", tab_names)
+
+        # Status bar with summary
+        val status_text = _build_status_text(me)
+
+        val status = statusbar("status", status_text, "Simple Sheets v1.0")
+
+        # Root layout
+        val root = column("root", [
+            nav,
+            formula_bar,
+            grid_scroll,
+            sheet_tabs,
+            status
+        ])
+
+        build_tree_with_title(root, "Simple Sheets", theme_id_key(ThemeId.IOSLight))
+
+    me build_grid_headers() -> [text]:
+        """Build column headers: ['', 'A', 'B', 'C', ...] for visible columns."""
+        var headers: [text] = [""]  # Empty header for row number column
+        var c = 0
+        while c < me.visible_cols:
+            val col_idx = me.scroll_col + c
+            headers.push(col_to_letter(col_idx))
+            c = c + 1
+        headers
+
+    me build_grid_rows() -> [[text]]:
+        """Build grid row data: [[row_num, cell_text, ...], ...] for visible rows."""
+        var rows: [[text]] = []
+        val sheet = me.workbook.active()
+        var r = 0
+        while r < me.visible_rows:
+            val row_idx = me.scroll_row + r
+            var row_data: [text] = ["{row_idx + 1}"]
+            var c = 0
+            while c < me.visible_cols:
+                val col_idx = me.scroll_col + c
+                val ref_val = CellRef(col: col_idx, row: row_idx)
+                val ref_str = cell_ref_to_string(ref_val)
+                val cell = sheet.get_cell(ref_str)
+                val display = cell_display_text(cell)
+                row_data.push(display)
+                c = c + 1
+            rows.push(row_data)
+            r = r + 1
+        rows
+
+    me handle_event(event: UIEvent):
+        """Handle a UI event."""
+        match event:
+            UIEvent.Action(name):
+                if name == "save":
+                    me.modified = false
+                elif name == "confirm_edit":
+                    me.confirm_edit()
+                elif name == "cancel_edit":
+                    me.cancel_edit()
+                elif name.starts_with("cell_click:"):
+                    val ref_str = name.substring(11)
+                    val ref_val = parse_cell_ref(ref_str)
+                    if ref_val != nil:
+                        me.navigate_to(ref_val.col, ref_val.row)
+            UIEvent.KeyPress(key):
+                if key == "Enter":
+                    if me.editing:
+                        me.confirm_edit()
+                    else:
+                        me.enter_edit_mode()
+                elif key == "Escape":
+                    if me.editing:
+                        me.cancel_edit()
+                elif key == "Tab":
+                    me.navigate_to(me.active_cell.col + 1, me.active_cell.row)
+                elif key == "ArrowUp":
+                    if me.active_cell.row > 0:
+                        me.navigate_to(me.active_cell.col, me.active_cell.row - 1)
+                elif key == "ArrowDown":
+                    me.navigate_to(me.active_cell.col, me.active_cell.row + 1)
+                elif key == "ArrowLeft":
+                    if me.active_cell.col > 0:
+                        me.navigate_to(me.active_cell.col - 1, me.active_cell.row)
+                elif key == "ArrowRight":
+                    me.navigate_to(me.active_cell.col + 1, me.active_cell.row)
+            _:
+                pass_do_nothing("non-keyboard UI events do not affect sheet navigation")
+
+    me navigate_to(col: i32, row: i32):
+        """Change the active cell and update scroll position if needed."""
+        var c = col
+        var r = row
+        if c < 0:
+            c = 0
+        if r < 0:
+            r = 0
+        me.active_cell = CellRef(col: c, row: r)
+        # Update formula text to the cell's current value
+        val ref_str = cell_ref_to_string(me.active_cell)
+        val cell = me.workbook.active().get_cell(ref_str)
+        match cell.value:
+            CellValue.FormulaVal(expr, cached_display):
+                me.formula_text = "={expr}"
+            CellValue.NumberVal(value):
+                me.formula_text = "{value}"
+            CellValue.TextVal(value):
+                me.formula_text = value
+            CellValue.BoolVal(value):
+                me.formula_text = if value: "TRUE" else: "FALSE"
+            _:
+                me.formula_text = ""
+        # Adjust scroll to keep active cell visible
+        if c < me.scroll_col:
+            me.scroll_col = c
+        if c >= me.scroll_col + me.visible_cols:
+            me.scroll_col = c - me.visible_cols + 1
+        if r < me.scroll_row:
+            me.scroll_row = r
+        if r >= me.scroll_row + me.visible_rows:
+            me.scroll_row = r - me.visible_rows + 1
+
+    me enter_edit_mode():
+        """Start editing the formula bar for the active cell."""
+        me.editing = true
+        val ref_str = cell_ref_to_string(me.active_cell)
+        val cell = me.workbook.active().get_cell(ref_str)
+        match cell.value:
+            CellValue.FormulaVal(expr, cached_display):
+                me.formula_text = "={expr}"
+            CellValue.NumberVal(value):
+                me.formula_text = "{value}"
+            CellValue.TextVal(value):
+                me.formula_text = value
+            CellValue.BoolVal(value):
+                me.formula_text = if value: "TRUE" else: "FALSE"
+            _:
+                me.formula_text = ""
+
+    me confirm_edit():
+        """Apply the formula bar value to the active cell and recalculate formulas."""
+        me.editing = false
+        val ref_str = cell_ref_to_string(me.active_cell)
+        me.workbook.active().set_value(ref_str, me.formula_text)
+        # Recalculate formulas in the active sheet
+        _recalculate_formulas(me.workbook.active())
+        me.modified = true
+
+    me cancel_edit():
+        """Discard formula bar changes and exit edit mode."""
+        me.editing = false
+        # Reset formula text to current cell value
+        val ref_str = cell_ref_to_string(me.active_cell)
+        val cell = me.workbook.active().get_cell(ref_str)
+        match cell.value:
+            CellValue.FormulaVal(expr, cached_display):
+                me.formula_text = "={expr}"
+            CellValue.NumberVal(value):
+                me.formula_text = "{value}"
+            CellValue.TextVal(value):
+                me.formula_text = value
+            _:
+                me.formula_text = ""
+
+# =========================================================================
+# Internal Helpers
+# =========================================================================
+
+fn _build_status_text(app: SheetsApp) -> text:
+    """Build the status bar text showing cell count and selection summary."""
+    val sheet = app.workbook.active()
+    val count = sheet.cell_count()
+    val ref_str = cell_ref_to_string(app.active_cell)
+    val cell = sheet.get_cell(ref_str)
+    val display = cell_display_text(cell)
+    var status = "Ready"
+    if app.editing:
+        status = "Editing"
+    if app.modified:
+        status = "{status} *"
+    "{status} | Cells: {count} | {ref_str}: {display}"
+
+fn _formula_bar_text(app: SheetsApp) -> text:
+    if app.formula_text != "":
+        return app.formula_text
+    "Enter value or formula..."
+
+fn _recalculate_formulas(sheet: Sheet):
+    """Recalculate all formula cells in the sheet, updating their cached display."""
+    for key in sheet.cells.keys():
+        val cell = sheet.get_cell(key)
+        match cell.value:
+            CellValue.FormulaVal(expr, cached_display):
+                val result = evaluate_formula(expr, sheet)
+                var display = ""
+                match result:
+                    CellValue.NumberVal(value):
+                        val int_val = value.to_i64()
+                        val diff = value - int_val.to_f64()
+                        if diff == 0.0:
+                            display = "{int_val}"
+                        else:
+                            display = "{value}"
+                    CellValue.BoolVal(value):
+                        display = if value: "TRUE" else: "FALSE"
+                    CellValue.TextVal(value):
+                        display = value
+                    CellValue.ErrorVal(message):
+                        display = "#ERR: {message}"
+                    _:
+                        display = ""
+                val updated_cell = Cell(
+                    value: CellValue.FormulaVal(expr: expr, cached_display: display),
+                    style: cell.style
+                )
+                sheet.set_cell(key, updated_cell)
+            _:
+                pass_do_nothing("non-formula cells do not need cached formula display updates")

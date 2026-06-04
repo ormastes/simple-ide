@@ -1,0 +1,340 @@
+# Terminal Panel
+#
+# Terminal WebSocket handler for the unified LLM dashboard.
+# Ported from web_dashboard/terminal_ws.spl — provides live tmux
+# terminal I/O over WebSocket (capture pane content, forward keystrokes).
+
+use std.nogc_sync_mut.io.tcp.{TcpStream}
+use std.tmux.{
+    tmux_capture_pane, tmux_send_keys, tmux_send_text, tmux_send_enter,
+    tmux_server_running, tmux_list_sessions, tmux_list_panes
+}
+use app.ui.web.ws_handler.{extract_ws_key, compute_ws_accept, send_ws_text, escape_json_string}
+use std.text.{to_int_or}
+
+# =========================================================================
+# Terminal Target
+# =========================================================================
+
+struct TerminalTarget:
+    session: text
+    window_index: i64
+    pane_index: i64
+
+# =========================================================================
+# Terminal WebSocket Handler
+# =========================================================================
+
+fn handle_terminal_ws(stream: TcpStream, headers: text, query: text):
+    """Upgrade to WebSocket and relay tmux pane I/O to the browser."""
+    val key = extract_ws_key(headers)
+    if key == "":
+        return
+
+    val accept = compute_ws_accept(key)
+
+    # Send upgrade response
+    var response = "HTTP/1.1 101 Switching Protocols\r\n"
+    response = "{response}Upgrade: websocket\r\n"
+    response = "{response}Connection: Upgrade\r\n"
+    response = "{response}Sec-WebSocket-Accept: {accept}\r\n"
+    response = "{response}\r\n"
+    stream.write_all(response)
+
+    # Parse target from query string: ?session=X&window=Y&pane=Z
+    val target = parse_terminal_query(query)
+
+    if not tmux_server_running():
+        val err_msg = "{\"type\": \"error\", \"message\": \"tmux server not running\"}"
+        send_ws_text(stream, err_msg)
+        return
+
+    # Send initial capture
+    val initial = tmux_capture_pane(target.session, target.window_index, target.pane_index)
+    val escaped = escape_json_string(initial.content)
+    val init_msg = "{\"type\": \"output\", \"content\": \"{escaped}\", \"rows\": {initial.rows}}"
+    send_ws_text(stream, init_msg)
+
+    # Send session info
+    val info_msg = "{\"type\": \"info\", \"session\": \"{target.session}\", \"window\": {target.window_index}, \"pane\": {target.pane_index}}"
+    send_ws_text(stream, info_msg)
+
+    # Read loop: receive keystrokes from browser, send to tmux
+    var last_content = initial.content
+    loop:
+        match stream.read_ws_frame():
+            Ok(frame_data):
+                if frame_data == "":
+                    break
+                val msg_type = _extract_field(frame_data, "type")
+
+                if msg_type == "key":
+                    val key_val = _extract_field(frame_data, "key")
+                    if key_val != "":
+                        tmux_send_keys(target.session, target.window_index, target.pane_index, key_val)
+
+                elif msg_type == "text":
+                    val text_val = _extract_field(frame_data, "text")
+                    if text_val != "":
+                        tmux_send_text(target.session, target.window_index, target.pane_index, text_val)
+
+                elif msg_type == "enter":
+                    tmux_send_enter(target.session, target.window_index, target.pane_index)
+
+                elif msg_type == "refresh":
+                    pass_dn
+
+                # After any input, capture and send updated content
+                val updated = tmux_capture_pane(target.session, target.window_index, target.pane_index)
+                if updated.content != last_content:
+                    last_content = updated.content
+                    val esc = escape_json_string(updated.content)
+                    val update_msg = "{\"type\": \"output\", \"content\": \"{esc}\", \"rows\": {updated.rows}}"
+                    send_ws_text(stream, update_msg)
+
+            Err(_):
+                break
+
+# =========================================================================
+# Terminal Panel HTML
+# =========================================================================
+
+fn generate_terminal_panel_html() -> text:
+    """Generate the HTML fragment for an embedded terminal panel."""
+    var h: [text] = []
+    h.push("<div class=\"terminal-container\">")
+    h.push("  <div class=\"terminal-toolbar\">")
+    h.push("    <label>Session:</label>")
+    h.push("    <select id=\"tmux-session\" onchange=\"tmuxSessionChanged()\"><option>--</option></select>")
+    h.push("    <label>Window:</label>")
+    h.push("    <select id=\"tmux-window\" onchange=\"tmuxWindowChanged()\"><option>0</option></select>")
+    h.push("    <label>Pane:</label>")
+    h.push("    <select id=\"tmux-pane\" onchange=\"tmuxPaneChanged()\"><option>0</option></select>")
+    h.push("    <button onclick=\"tmuxRefresh()\">Refresh</button>")
+    h.push("    <button onclick=\"tmuxConnect()\">Connect WS</button>")
+    h.push("    <div class=\"terminal-status\">")
+    h.push("      <span id=\"term-status\">Disconnected</span>")
+    h.push("      <span id=\"term-size\">--</span>")
+    h.push("    </div>")
+    h.push("  </div>")
+    h.push("  <div class=\"terminal-output\" id=\"terminal-output\" tabindex=\"0\"></div>")
+    h.push("  <div class=\"terminal-input-bar\">")
+    h.push("    <span class=\"prompt\">$</span>")
+    h.push("    <input type=\"text\" id=\"terminal-input\" placeholder=\"Type command and press Enter...\" autocomplete=\"off\" spellcheck=\"false\">")
+    h.push("  </div>")
+    h.push("</div>")
+    h.join("\n")
+
+fn generate_terminal_css() -> text:
+    """Generate CSS for the terminal panel."""
+    var c: [text] = []
+    c.push(".terminal-container { display: flex; flex-direction: column; height: calc(100vh - 100px); }")
+    c.push(".terminal-toolbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #161b22; border: 1px solid #30363d; border-radius: 8px 8px 0 0; }")
+    c.push(".terminal-toolbar select, .terminal-toolbar button { background: #0d1117; color: #e6edf3; border: 1px solid #30363d; padding: 4px 10px; border-radius: 4px; font-size: 13px; cursor: pointer; }")
+    c.push(".terminal-toolbar button:hover { background: rgba(88,166,255,0.1); border-color: #58a6ff; }")
+    c.push(".terminal-toolbar label { font-size: 12px; color: #8b949e; }")
+    c.push(".terminal-output { flex: 1; background: #000; color: #0f0; font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace; font-size: 14px; line-height: 1.4; padding: 12px; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word; border: 1px solid #30363d; border-top: none; }")
+    c.push(".terminal-input-bar { display: flex; align-items: center; background: #111; border: 1px solid #30363d; border-top: none; border-radius: 0 0 8px 8px; padding: 6px 12px; }")
+    c.push(".terminal-input-bar .prompt { color: #3fb950; margin-right: 8px; font-family: monospace; font-size: 14px; }")
+    c.push(".terminal-input-bar input { flex: 1; background: transparent; color: #e6edf3; border: none; outline: none; font-family: monospace; font-size: 14px; }")
+    c.push(".terminal-status { display: flex; align-items: center; gap: 12px; margin-left: auto; font-size: 11px; color: #8b949e; }")
+    c.join("\n")
+
+fn generate_terminal_js() -> text:
+    """Generate JavaScript for the terminal panel (tmux WS + HTTP fallback)."""
+    var j: [text] = []
+
+    j.push("let termWs = null;")
+    j.push("async function loadTmuxSessions() {")
+    j.push("  try {")
+    j.push("    const sessions = await fetch('/api/tmux/sessions').then(r => r.json());")
+    j.push("    const sel = document.getElementById('tmux-session');")
+    j.push("    sel.innerHTML = sessions.map(s => '<option value=\"' + s.name + '\">' + s.name + ' (' + s.windows + ' windows)' + (s.attached ? ' *' : '') + '</option>').join('');")
+    j.push("    if (sessions.length > 0) tmuxSessionChanged();")
+    j.push("  } catch(e) { console.error('tmux sessions error', e); }")
+    j.push("}")
+
+    j.push("async function tmuxSessionChanged() {")
+    j.push("  const session = document.getElementById('tmux-session').value;")
+    j.push("  try {")
+    j.push("    const res = await fetch('/api/tmux/windows?session=' + encodeURIComponent(session));")
+    j.push("    const windows = await res.json();")
+    j.push("    const sel = document.getElementById('tmux-window');")
+    j.push("    sel.innerHTML = windows.map(w => '<option value=\"' + w.index + '\">' + w.index + ': ' + w.name + (w.active ? ' *' : '') + '</option>').join('');")
+    j.push("    tmuxWindowChanged();")
+    j.push("  } catch(e) {}")
+    j.push("}")
+
+    j.push("async function tmuxWindowChanged() {")
+    j.push("  const session = document.getElementById('tmux-session').value;")
+    j.push("  const win = document.getElementById('tmux-window').value;")
+    j.push("  try {")
+    j.push("    const res = await fetch('/api/tmux/panes?session=' + encodeURIComponent(session) + '&window=' + win);")
+    j.push("    const panes = await res.json();")
+    j.push("    const sel = document.getElementById('tmux-pane');")
+    j.push("    sel.innerHTML = panes.map(p => '<option value=\"' + p.index + '\">' + p.index + ': ' + p.command + ' (' + p.width + 'x' + p.height + ')' + (p.active ? ' *' : '') + '</option>').join('');")
+    j.push("    document.getElementById('term-size').textContent = panes.length > 0 ? panes[0].width + 'x' + panes[0].height : '--';")
+    j.push("  } catch(e) {}")
+    j.push("}")
+
+    j.push("function tmuxPaneChanged() { tmuxRefresh(); }")
+
+    j.push("async function tmuxRefresh() {")
+    j.push("  const session = document.getElementById('tmux-session').value;")
+    j.push("  const win = document.getElementById('tmux-window').value;")
+    j.push("  const pane = document.getElementById('tmux-pane').value;")
+    j.push("  try {")
+    j.push("    const res = await fetch('/api/tmux/capture?session=' + encodeURIComponent(session) + '&window=' + win + '&pane=' + pane);")
+    j.push("    const data = await res.json();")
+    j.push("    document.getElementById('terminal-output').textContent = data.content;")
+    j.push("    document.getElementById('terminal-output').scrollTop = document.getElementById('terminal-output').scrollHeight;")
+    j.push("  } catch(e) { console.error('capture error', e); }")
+    j.push("}")
+
+    j.push("function tmuxConnect() {")
+    j.push("  if (termWs) { termWs.close(); termWs = null; }")
+    j.push("  const session = document.getElementById('tmux-session').value;")
+    j.push("  const win = document.getElementById('tmux-window').value;")
+    j.push("  const pane = document.getElementById('tmux-pane').value;")
+    j.push("  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';")
+    j.push("  const url = proto + '//' + location.host + '/ws/terminal?session=' + encodeURIComponent(session) + '&window=' + win + '&pane=' + pane;")
+    j.push("  termWs = new WebSocket(url);")
+    j.push("  document.getElementById('term-status').textContent = 'Connecting...';")
+    j.push("  termWs.onopen = () => { document.getElementById('term-status').textContent = 'Connected'; };")
+    j.push("  termWs.onclose = () => { document.getElementById('term-status').textContent = 'Disconnected'; termWs = null; };")
+    j.push("  termWs.onerror = () => { document.getElementById('term-status').textContent = 'Error'; };")
+    j.push("  termWs.onmessage = (ev) => {")
+    j.push("    try {")
+    j.push("      const msg = JSON.parse(ev.data);")
+    j.push("      if (msg.type === 'output') {")
+    j.push("        document.getElementById('terminal-output').textContent = msg.content;")
+    j.push("        document.getElementById('terminal-output').scrollTop = document.getElementById('terminal-output').scrollHeight;")
+    j.push("      } else if (msg.type === 'error') {")
+    j.push("        document.getElementById('terminal-output').textContent = 'Error: ' + msg.message;")
+    j.push("      }")
+    j.push("    } catch(e) {}")
+    j.push("  };")
+    j.push("}")
+
+    # Terminal input handling
+    j.push("document.addEventListener('DOMContentLoaded', () => {")
+    j.push("  const termInput = document.getElementById('terminal-input');")
+    j.push("  if (!termInput) return;")
+    j.push("  termInput.addEventListener('keydown', (e) => {")
+    j.push("    if (e.key === 'Enter') {")
+    j.push("      const cmd = termInput.value;")
+    j.push("      termInput.value = '';")
+    j.push("      if (termWs && termWs.readyState === 1) {")
+    j.push("        termWs.send(JSON.stringify({type: 'text', text: cmd}));")
+    j.push("        setTimeout(() => termWs.send(JSON.stringify({type: 'enter'})), 50);")
+    j.push("        setTimeout(() => termWs.send(JSON.stringify({type: 'refresh'})), 300);")
+    j.push("      } else {")
+    j.push("        sendTermCommandHttp(cmd);")
+    j.push("      }")
+    j.push("    }")
+    j.push("  });")
+
+    # Direct key capture on terminal output
+    j.push("  const termOut = document.getElementById('terminal-output');")
+    j.push("  if (!termOut) return;")
+    j.push("  termOut.addEventListener('keydown', (e) => {")
+    j.push("    if (termWs && termWs.readyState === 1) {")
+    j.push("      e.preventDefault();")
+    j.push("      let key = e.key;")
+    j.push("      if (key === 'Enter') key = 'Enter';")
+    j.push("      else if (key === 'Backspace') key = 'BSpace';")
+    j.push("      else if (key === 'Escape') key = 'Escape';")
+    j.push("      else if (key === 'Tab') key = 'Tab';")
+    j.push("      else if (key === 'ArrowUp') key = 'Up';")
+    j.push("      else if (key === 'ArrowDown') key = 'Down';")
+    j.push("      else if (key === 'ArrowLeft') key = 'Left';")
+    j.push("      else if (key === 'ArrowRight') key = 'Right';")
+    j.push("      else if (e.ctrlKey) key = 'C-' + key;")
+    j.push("      else if (key.length > 1) return;")
+    j.push("      termWs.send(JSON.stringify({type: 'key', key: key}));")
+    j.push("      setTimeout(() => termWs.send(JSON.stringify({type: 'refresh'})), 100);")
+    j.push("    }")
+    j.push("  });")
+    j.push("});")
+
+    # HTTP fallback for command sending
+    j.push("async function sendTermCommandHttp(cmd) {")
+    j.push("  const session = document.getElementById('tmux-session').value;")
+    j.push("  const win = document.getElementById('tmux-window').value;")
+    j.push("  const pane = document.getElementById('tmux-pane').value;")
+    j.push("  try {")
+    j.push("    await fetch('/api/tmux/send-command', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({session: session, window: win, pane: pane, command: cmd}) });")
+    j.push("    setTimeout(() => tmuxRefresh(), 500);")
+    j.push("  } catch(e) { console.error('send error', e); }")
+    j.push("}")
+
+    j.join("\n")
+
+# =========================================================================
+# Query Parsing
+# =========================================================================
+
+fn parse_terminal_query(query: text) -> TerminalTarget:
+    var session = ""
+    var window_index: i64 = 0
+    var pane_index: i64 = 0
+
+    # Strip leading ?
+    val q = if query.starts_with("?"): query[1:] else: query
+
+    val pairs = q.split("&")
+    for pair in pairs:
+        val kv = pair.split("=")
+        if kv.len() >= 2:
+            match kv[0]:
+                "session" => session = kv[1]
+                "window" => window_index = to_int_or(kv[1], 0)
+                "pane" => pane_index = to_int_or(kv[1], 0)
+                _ => pass_dn
+
+    # Default to first available session
+    if session == "":
+        val sessions = tmux_list_sessions()
+        if sessions.len() > 0:
+            session = sessions[0].name
+
+    TerminalTarget(
+        session: session,
+        window_index: window_index,
+        pane_index: pane_index
+    )
+
+# =========================================================================
+# JSON Field Extraction (internal)
+# =========================================================================
+
+fn _extract_field(json: text, field: text) -> text:
+    val search = "\"{field}\""
+    val idx = json.find(search)
+    if idx < 0:
+        return ""
+
+    var pos = idx + search.len()
+    while pos < json.len() and json[pos] != ":":
+        pos = pos + 1
+    pos = pos + 1
+
+    while pos < json.len() and (json[pos] == " " or json[pos] == "\t"):
+        pos = pos + 1
+
+    if pos >= json.len() or json[pos] != "\"":
+        return ""
+    pos = pos + 1
+
+    var value = ""
+    while pos < json.len() and json[pos] != "\"":
+        val ch = json[pos]
+        if ch == "\\":
+            pos = pos + 1
+            if pos < json.len():
+                value = "{value}{json[pos]}"
+        else:
+            value = "{value}{ch}"
+        pos = pos + 1
+
+    return value

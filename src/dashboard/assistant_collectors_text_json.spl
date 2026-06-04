@@ -1,0 +1,276 @@
+use std.nogc_sync_mut.io.file_ops.{file_exists, file_read}
+use std.json.parser.{json_parse}
+use std.json.types.{json_get_type, json_to_string, json_to_number, json_to_boolean}
+use std.json.object_ops.{json_object_get}
+use std.json.array_ops.{json_array_get, json_array_length}
+use std.json.path_ops.{json_path_get}
+use app.dashboard.assistant_collectors.*
+
+fn assistant_record_is_transcript(record: any) -> bool:
+    if json_text_at(record, "type") != "":
+        return true
+    if json_text_at(record, "message") != "":
+        return true
+    if json_text_at(record, "content") != "":
+        return true
+    if json_text_at(record, "subtype") != "":
+        return true
+    if json_text_at(record, "error") != "":
+        return true
+    if json_text_at(record, "data.hookEvent") != "":
+        return true
+    if json_text_at(record, "data.hook_event_name") != "":
+        return true
+    if json_text_at(record, "data.hookName") != "":
+        return true
+    false
+
+fn assistant_is_history_path(path: text) -> bool:
+    path == assistant_history_path()
+
+fn assistant_history_file_has_transcripts(path: text) -> bool:
+    if path == "" or not file_exists(path):
+        return false
+    for raw in file_read(path).split("\n"):
+        val line = raw.trim()
+        if line == "":
+            continue
+        val record = json_parse(line)
+        if record == nil:
+            continue
+        if assistant_record_has_transcript_fields(record):
+            return true
+    false
+
+fn assistant_file_has_transcripts(path: text) -> bool:
+    if path == "":
+        return false
+    if assistant_is_history_path(path):
+        return assistant_history_file_has_transcripts(path)
+    if not file_exists(path):
+        return false
+    for raw in file_read(path).split("\n"):
+        val line = raw.trim()
+        if line == "":
+            continue
+        val record = json_parse(line)
+        if record == nil:
+            continue
+        if assistant_record_is_transcript(record):
+            return true
+    false
+
+fn assistant_record_has_transcript_fields(record: any) -> bool:
+    if json_object_get(record, "type") != nil:
+        return true
+    if json_object_get(record, "message") != nil:
+        return true
+    if json_object_get(record, "content") != nil:
+        return true
+    if json_object_get(record, "subtype") != nil:
+        return true
+    if json_object_get(record, "error") != nil:
+        return true
+    false
+
+fn first_message_text(message_payload: any) -> text:
+    val content = json_object_get(message_payload, "content")
+    if json_get_type(content) == "string":
+        val raw = json_text_at(message_payload, "content").trim()
+        if raw != "":
+            return raw
+    if not json_is_array(content):
+        return ""
+    var i = 0
+    val content_len = json_array_length_safe(content)
+    while i < content_len:
+        val item = json_array_get(content, i)
+        val item_type = json_text_at(item, "type")
+        if item_type == "output_text" or item_type == "input_text" or item_type == "text":
+            val text = json_text_at(item, "text").trim()
+            if text != "":
+                return text
+        i = i + 1
+    ""
+
+fn assistant_provider_from_model(model: text) -> text:
+    val lower = model.lower()
+    if lower.contains("claude") or lower.contains("anthropic"):
+        return "Claude"
+    if lower.contains("codex") or lower.contains("gpt") or lower.contains("openai"):
+        return "Codex"
+    if lower.contains("gemini") or lower.contains("google"):
+        return "Gemini"
+    if model != "":
+        return model
+    "Claude"
+
+fn assistant_session_title(path: text) -> text:
+    val name = path.split("/")
+    if name.len() == 0:
+        return "assistant session"
+    val leaf = name[name.len() - 1]
+    if leaf.ends_with(".jsonl"):
+        return leaf.slice(0, leaf.len() - 6)
+    leaf
+
+fn assistant_project_name(path: text) -> text:
+    val parts = path.split("/")
+    if parts.len() < 2:
+        return ""
+    parts[parts.len() - 2]
+
+fn assistant_session_id(path: text) -> text:
+    val parts = path.split("/")
+    if parts.len() == 0:
+        return "assistant-session"
+    val leaf = parts[parts.len() - 1]
+    if leaf.ends_with(".jsonl"):
+        return leaf.slice(0, leaf.len() - 6)
+    leaf
+
+fn assistant_clock_from_iso(ts: text) -> text:
+    if ts == "":
+        return ""
+    val t_idx = ts.index_of("T")
+    if t_idx < 0:
+        return ts
+    val after = ts.slice(t_idx + 1, ts.len())
+    val dot_idx = after.index_of(".")
+    if dot_idx >= 0:
+        return after.slice(0, dot_idx)
+    val z_idx = after.index_of("Z")
+    if z_idx >= 0:
+        return after.slice(0, z_idx)
+    after
+
+fn assistant_clock_label(now_secs: i64) -> text:
+    val seconds = now_secs % 60
+    val minutes = (now_secs / 60) % 60
+    val hours = (now_secs / 3600) % 24
+    var hh = "{hours}"
+    var mm = "{minutes}"
+    var ss = "{seconds}"
+    if hours < 10:
+        hh = "0{hours}"
+    if minutes < 10:
+        mm = "0{minutes}"
+    if seconds < 10:
+        ss = "0{seconds}"
+    "{hh}:{mm}:{ss}"
+
+fn assistant_clock_label_from_millis(now_millis: i64) -> text:
+    if now_millis <= 0:
+        return ""
+    assistant_clock_label(now_millis / 1000)
+
+fn assistant_store_root() -> text:
+    ASSISTANT_STORE_ROOT
+
+fn assistant_store_session_path(session_id: text) -> text:
+    ASSISTANT_STORE_SESSIONS + "/" + session_id + ".json"
+
+fn assistant_store_timeline_path(session_id: text) -> text:
+    ASSISTANT_STORE_TIMELINES + "/" + session_id + ".jsonl"
+
+fn assistant_store_notifications_path(session_id: text) -> text:
+    ASSISTANT_STORE_NOTIFICATIONS + "/" + session_id + ".jsonl"
+
+fn assistant_is_store_session_path(path: text) -> bool:
+    path.starts_with(ASSISTANT_STORE_SESSIONS) and path.ends_with(".json")
+
+fn assistant_is_store_timeline_path(path: text) -> bool:
+    path.starts_with(ASSISTANT_STORE_TIMELINES) and path.ends_with(".jsonl")
+
+fn assistant_store_session_id(path: text) -> text:
+    val parts = path.split("/")
+    if parts.len() == 0:
+        return "assistant-session"
+    val leaf = parts[parts.len() - 1]
+    if leaf.ends_with(".json"):
+        return leaf.slice(0, leaf.len() - 5)
+    leaf
+
+fn assistant_extract_between(text: text, start: text, finish: text) -> text:
+    val start_idx = text.index_of(start)
+    if start_idx < 0:
+        return ""
+    val after = start_idx + start.len()
+    val end_idx = text.index_of(finish)
+    if end_idx < 0 or end_idx <= after:
+        return ""
+    text.slice(after, end_idx).trim()
+
+fn assistant_strip_tags(text: text) -> text:
+    var out = text.replace("<command-name>", "")
+    out = out.replace("</command-name>", "")
+    out = out.replace("<command-message>", "")
+    out = out.replace("</command-message>", "")
+    out = out.replace("<command-args>", "")
+    out = out.replace("</command-args>", "")
+    out = out.replace("<local-command-caveat>", "")
+    out = out.replace("</local-command-caveat>", "")
+    val normalized = out.replace("\n", " ")
+    short_text(normalized, 96)
+
+fn short_text(value: text, max_len: i64) -> text:
+    val trimmed = value.trim()
+    val normalized = trimmed.replace("\n", " ")
+    if normalized.len() <= max_len:
+        return normalized
+    if max_len <= 3:
+        return normalized.slice(0, max_len)
+    normalized.slice(0, max_len - 3) + "..."
+
+fn first_non_empty(values: [text]) -> text:
+    for value in values:
+        if value.trim() != "":
+            return value.trim()
+    ""
+
+fn json_text_at(value: any, path: text) -> text:
+    var target = value
+    if path != "":
+        target = json_path_get(value, path)
+    if target == nil:
+        return ""
+    val target_type = json_get_type(target)
+    if target_type == "string":
+        val s = json_to_string(target)
+        if s == nil:
+            return ""
+        return s
+    if target_type == "number":
+        val n = json_to_number(target)
+        if n == nil:
+            return ""
+        return "{n as i64}"
+    if target_type == "boolean":
+        val b = json_to_boolean(target)
+        if b == nil:
+            return ""
+        if b:
+            return "true"
+        return "false"
+    ""
+
+fn json_number_at(value: any, path: text) -> i64:
+    var target = value
+    if path != "":
+        target = json_path_get(value, path)
+    if target == nil:
+        return 0
+    if json_get_type(target) != "number":
+        return 0
+    val n = json_to_number(target)
+    if n == nil:
+        return 0
+    n as i64
+
+fn json_is_array(value: any) -> bool:
+    json_get_type(value) == "array"
+
+fn json_array_length_safe(value: any) -> i64:
+    if not json_is_array(value):
+        return 0
+    json_array_length(value)

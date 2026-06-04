@@ -1,0 +1,49 @@
+# Native runtime helpers for process-backed editor debug adapters.
+
+extern fn rt_process_spawn_piped(cmd: text, args: [text]) -> i64
+extern fn rt_process_write_stdin(pid: i64, data: text) -> bool
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_editor_spawn_simple_dap() -> i64
+extern fn rt_editor_start_simple_dap(pid: i64) -> bool
+extern fn rt_editor_poll_simple_dap_stopped(pid: i64) -> bool
+extern fn rt_editor_wait_simple_dap_stopped(pid: i64) -> bool
+
+fn editor_debug_process_find_simple_binary() -> text:
+    if rt_file_exists("bin/simple"):
+        return "bin/simple"
+    if rt_file_exists("bin/release/linux-x86_64/simple"):
+        return "bin/release/linux-x86_64/simple"
+    if rt_file_exists("bin/release/macos-arm64/simple"):
+        return "bin/release/macos-arm64/simple"
+    if rt_file_exists("bin/release/macos-x86_64/simple"):
+        return "bin/release/macos-x86_64/simple"
+    "bin/simple"
+
+fn editor_debug_process_spawn_simple_adapter() -> i64:
+    rt_editor_spawn_simple_dap()
+
+fn editor_debug_process_spawn_adapter(adapter_program: text) -> i64:
+    rt_process_spawn_piped(editor_debug_process_find_simple_binary(), ["run", adapter_program])
+
+fn editor_debug_process_write_frame(pid: i64, json: text) -> bool:
+    # BUG-3 fix: guard against invalid pids (spawn failure returns 0 or -1).
+    # Forwarding a bad pid to rt_process_write_stdin writes to an invalid fd
+    # which can SIGSEGV in the kernel pipe handler.
+    if pid <= 0:
+        return false
+    rt_process_write_stdin(pid, "Content-Length: " + str(json.len()) + "\r\n\r\n" + json)
+
+fn editor_debug_process_start_simple_adapter(pid: i64) -> bool:
+    if pid <= 0:
+        return false
+    rt_editor_start_simple_dap(pid)
+
+fn editor_debug_process_poll_simple_stopped(pid: i64) -> bool:
+    if pid <= 0:
+        return false
+    rt_editor_poll_simple_dap_stopped(pid)
+
+fn editor_debug_process_wait_simple_stopped(pid: i64) -> bool:
+    if pid <= 0:
+        return false
+    rt_editor_wait_simple_dap_stopped(pid)

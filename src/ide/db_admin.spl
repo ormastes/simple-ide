@@ -1,0 +1,43 @@
+# IDE DB admin capability surface.
+#
+# Reuses editor session DB and existing Simple portal content DB ownership as
+# admin targets. This remains an IDE adapter; it does not create a new DB engine.
+
+use std.editor.core.session_db.{SessionDb}
+
+struct IdeDbAdminSurface:
+    app_id: text
+    owner_modules: [text]
+    supported_targets: [text]
+    simple_db_contracts: [text]
+    default_state_mode: text
+    default_group_count: i64
+    probe_summary: text
+
+fn ide_db_admin_probe_summary() -> text:
+    # Keep the IDE feature-check closure in the editor runtime family. The
+    # low-level simple_db_if contracts are covered by dedicated storage specs.
+    "contracts=Rel/BlkNo/Lsn/TxnId/PhysPtr/PageBuf page-size=4096"
+
+fn ide_db_admin_surface() -> IdeDbAdminSurface:
+    val session_db = SessionDb.new(":memory:ide-session", ":memory:ide-session-wal")
+    val state = session_db.load_editor_state()
+    IdeDbAdminSurface(
+        app_id: "db-admin",
+        owner_modules: [
+            "std.editor.core.session_db",
+            "app.simple_portal.content_db",
+            "src/app/portal/db/migrations.spl",
+            "std.simple_db_if.types",
+            "std.simple_db_if.storage_api"
+        ],
+        supported_targets: ["embedded-db", "simple-db", "portal-db", "session-db"],
+        simple_db_contracts: ["Rel", "BlkNo", "Lsn", "TxnId", "PhysPtr", "PageBuf"],
+        default_state_mode: state.mode,
+        default_group_count: state.group_count,
+        probe_summary: ide_db_admin_probe_summary()
+    )
+
+fn ide_db_admin_summary() -> text:
+    val surface = ide_db_admin_surface()
+    "db-admin: {surface.owner_modules.join(\",\")} targets={surface.supported_targets.join(\",\")} contracts={surface.simple_db_contracts.join(\",\")} state={surface.default_state_mode}/{surface.default_group_count} {surface.probe_summary}"

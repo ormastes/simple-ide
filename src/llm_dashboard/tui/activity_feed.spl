@@ -1,0 +1,148 @@
+# Activity Feed
+#
+# Scrollable activity log with filtering by room, agent, or tool.
+
+use app.llm_dashboard.data.types.{ActivityEntry, RoomKind, room_name, format_timestamp, truncate_text}
+use app.llm_dashboard.tui.colors.{room_color, provider_color}
+use app.ui.render.ansi.{RESET, DIM, BOLD}
+
+# =========================================================================
+# Feed State
+# =========================================================================
+
+class FeedState:
+    scroll_offset: i32
+    filter_room: RoomKind?
+    filter_agent: text?
+    filter_text: text
+
+    static fn new() -> FeedState:
+        return FeedState(
+            scroll_offset: 0,
+            filter_room: nil,
+            filter_agent: nil,
+            filter_text: ""
+        )
+
+impl FeedState:
+
+    me scroll_up(amount: i32):
+        self.scroll_offset = self.scroll_offset + amount
+        if self.scroll_offset < 0:
+            self.scroll_offset = 0
+
+    me scroll_down(amount: i32):
+        self.scroll_offset = self.scroll_offset - amount
+        if self.scroll_offset < 0:
+            self.scroll_offset = 0
+
+    me set_room_filter(room: RoomKind?):
+        self.filter_room = room
+        self.scroll_offset = 0
+
+    me set_agent_filter(agent_id: text?):
+        self.filter_agent = agent_id
+        self.scroll_offset = 0
+
+    me set_text_filter(text_filter: text):
+        self.filter_text = text_filter
+        self.scroll_offset = 0
+
+    me clear_filters():
+        self.filter_room = nil
+        self.filter_agent = nil
+        self.filter_text = ""
+        self.scroll_offset = 0
+
+# =========================================================================
+# Feed Rendering
+# =========================================================================
+
+fn render_feed(entries: [ActivityEntry], state: FeedState, max_lines: i32) -> [text]:
+    """Render activity feed entries as formatted lines."""
+    val filtered = filter_entries(entries, state)
+    var lines: [text] = []
+
+    if filtered.len() == 0:
+        lines.push("{DIM} No activity yet{RESET}")
+        return lines
+
+    # Apply scroll offset — show from end minus offset
+    val start_idx = if filtered.len() > max_lines + state.scroll_offset:
+        filtered.len() - max_lines - state.scroll_offset
+    else:
+        0
+    val end_idx = if filtered.len() > state.scroll_offset:
+        filtered.len() - state.scroll_offset
+    else:
+        filtered.len()
+
+    var i = start_idx
+    while i < end_idx and lines.len() < max_lines:
+        val entry = filtered[i]
+        lines.push(format_entry(entry))
+        i = i + 1
+
+    return lines
+
+fn format_entry(entry: ActivityEntry) -> text:
+    """Format a single activity entry as a display line."""
+    val time = format_timestamp(entry.timestamp)
+    val rcolor = room_color(entry.room)
+    val rname = room_name(entry.room)
+
+    val summary = truncate_text(entry.summary, 50)
+    val agent = truncate_text(entry.agent_id, 12)
+
+    return " {DIM}{time}{RESET} [{agent}] {summary} {rcolor}({rname}){RESET}"
+
+# =========================================================================
+# Filtering
+# =========================================================================
+
+fn filter_entries(entries: [ActivityEntry], state: FeedState) -> [ActivityEntry]:
+    """Apply filters to activity entries."""
+    var result: [ActivityEntry] = []
+    for entry in entries:
+        if matches_filter(entry, state):
+            result.push(entry)
+    return result
+
+fn matches_filter(entry: ActivityEntry, state: FeedState) -> bool:
+    """Check if an entry matches the current filters."""
+    # Room filter
+    if state.filter_room != nil:
+        if room_name(entry.room) != room_name(state.filter_room):
+            return false
+
+    # Agent filter
+    if state.filter_agent != nil:
+        if entry.agent_id != state.filter_agent:
+            return false
+
+    # Text filter
+    if state.filter_text != "":
+        val lower_summary = entry.summary.lower()
+        val lower_filter = state.filter_text.lower()
+        if not lower_summary.contains(lower_filter):
+            return false
+
+    return true
+
+# =========================================================================
+# Feed Summary
+# =========================================================================
+
+fn feed_status(entries: [ActivityEntry], state: FeedState) -> text:
+    """Status line showing filter state and entry count."""
+    val filtered = filter_entries(entries, state)
+    var status = "{filtered.len()}/{entries.len()} entries"
+
+    if state.filter_room != nil:
+        status = "{status} [room:{room_name(state.filter_room)}]"
+    if state.filter_agent != nil:
+        status = "{status} [agent:{state.filter_agent}]"
+    if state.filter_text != "":
+        status = "{status} [/{state.filter_text}]"
+
+    return "{DIM}{status}{RESET}"

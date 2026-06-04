@@ -1,0 +1,955 @@
+# Editor Controller LSP Methods
+#
+# LSP requests, responses, code actions, formatting, rename, and result panel management.
+
+use app.editor.editor_controller_types.*
+use app.editor.editor_controller.*
+use std.editor.buffer.buffer.*
+use std.editor.common.types.*
+use std.editor.services.diagnostics.*
+use std.editor.services.lsp_client.*
+use std.editor.services.simple_lsp_config.*
+use std.editor.services.md_lsp_config.*
+use std.editor.view.lsp_result_panel.*
+use std.editor.view.outline_panel.*
+use std.editor.view.markdown_state.*
+use app.editor.editor_lsp_helpers.*
+use app.editor.editor_json_helpers.*
+use app.editor.editor_path_text_helpers.*
+use app.editor.editor_workspace_symbols.*
+
+fn ctrl_set_lsp_result_panel_from_response(ctrl: mut EditorController, kind: text, response: LspResponse):
+    if kind == "code-action" and response.ok and response.result_json != "":
+        ctrl.code_actions = _editor_code_actions_from_response(response.result_json)
+        ctrl.lsp_result_panel = ctrl_code_action_result_panel(ctrl, response.id)
+        return
+    if kind == "code-action" and response.ok and response.result_json == "":
+        ctrl.lsp_result_panel = lsp_result_panel_pending(kind, response.id)
+        return
+    var panel = lsp_result_panel_from_response(kind, response)
+    if kind == "call-hierarchy" or kind == "call-hierarchy-incoming" or kind == "call-hierarchy-outgoing":
+        val title = lsp_result_title(kind)
+        if panel.pending:
+            if ctrl.lsp_result_panel.title == title:
+                ctrl.lsp_call_hierarchy_state = lsp_result_panel_call_state(ctrl.lsp_result_panel)
+                ctrl.lsp_call_hierarchy_state_title = title
+        else:
+            if ctrl.lsp_result_panel.title == title and ctrl.lsp_call_hierarchy_state_title == title:
+                panel = lsp_result_panel_restore_call_state(panel, ctrl.lsp_call_hierarchy_state)
+            if (kind == "call-hierarchy-incoming" or kind == "call-hierarchy-outgoing") and ctrl.lsp_call_hierarchy_merge_index >= 0 and ctrl.lsp_call_hierarchy_merge_panel.title == "Call Hierarchy":
+                panel = lsp_result_panel_with_call_children(ctrl.lsp_call_hierarchy_merge_panel, ctrl.lsp_call_hierarchy_merge_index, panel)
+                ctrl.lsp_call_hierarchy_merge_index = -1
+                ctrl.lsp_call_hierarchy_merge_panel = lsp_result_panel_new("")
+            ctrl.lsp_call_hierarchy_state = lsp_result_panel_call_state(panel)
+            ctrl.lsp_call_hierarchy_state_title = panel.title
+    ctrl.lsp_result_panel = panel
+
+fn ctrl_request_active_lsp_action(ctrl: mut EditorController, kind: text) -> EditorAction:
+    val response = ctrl_request_active_lsp(ctrl, kind)
+    if not response.ok:
+        ctrl.status_msg = response.error_text
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    if _editor_lsp_kind_has_panel(kind):
+        ctrl_set_lsp_result_panel_from_response(ctrl, kind, response)
+        if kind == "code-action":
+            if response.ok and response.result_json != "":
+                ctrl.code_actions = _editor_code_actions_from_response(response.result_json)
+                ctrl.lsp_result_panel = ctrl_code_action_result_panel(ctrl, response.id)
+            elif response.ok:
+                ctrl.lsp_result_panel = lsp_result_panel_pending(kind, response.id)
+        if kind == "document-symbols" and response.ok and response.result_json != "":
+            ctrl_apply_lsp_document_symbols_outline(ctrl)
+        ctrl_refresh_lsp_hover_popup(ctrl, kind)
+        ctrl_show_lsp_result_panel(ctrl, kind + " results")
+        ctrl.status_msg = kind + " results"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    if kind == "formatting":
+        ctrl.pending_workspace_edit_title = "formatting"
+    if kind == "range-formatting":
+        ctrl.pending_workspace_edit_title = "range formatting"
+    ctrl.status_msg = kind + " requested"
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_request_workspace_symbols(ctrl: mut EditorController, query: text) -> EditorAction:
+    val response = ctrl_request_active_lsp_with_payload(ctrl, "workspace-symbols", query)
+    if not response.ok:
+        ctrl.status_msg = response.error_text
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.lsp_result_panel = lsp_result_panel_from_response("workspace-symbols", response)
+    val indexed_rows = ctrl._workspace_symbol_index_rows(query)
+    if indexed_rows.len() > 0:
+        ctrl.lsp_result_panel = LspResultPanel(
+            title: "Workspace Symbols",
+            rows: indexed_rows,
+            selected: 0,
+            scroll_offset: 0,
+            pending: false,
+            request_id: response.id
+        )
+    ctrl_refresh_lsp_hover_popup(ctrl, "workspace-symbols")
+    ctrl_show_lsp_result_panel(ctrl, "workspace-symbols results")
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_rebuild_workspace_symbol_index(ctrl: mut EditorController, root: text) -> EditorAction:
+    ctrl.workspace_symbol_index_root = root
+    ctrl.workspace_symbol_index = _editor_workspace_symbol_index(root)
+    ctrl.status_msg = "workspace symbols indexed: " + ctrl.workspace_symbol_index.len().to_text()
+    EditorAction(redraw: false, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_workspace_symbol_index_rows(ctrl: mut EditorController, query: text) -> [LspResultRow]:
+    var rows: [LspResultRow] = []
+    val clean_query = query.trim().lower()
+    if clean_query == "":
+        return rows
+    for row in ctrl.workspace_symbol_index:
+        if row.label.lower().contains(clean_query):
+            rows.push(row)
+            if rows.len() >= 100:
+                return rows
+    rows
+
+fn ctrl_dismiss_lsp_hover_popup(ctrl: mut EditorController) -> EditorAction:
+    ctrl.lsp_hover_popup = lsp_hover_popup_hidden()
+    ctrl.status_msg = "hover dismissed"
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_dismiss_lsp_signature_popup(ctrl: mut EditorController) -> EditorAction:
+    ctrl.lsp_signature_popup = lsp_signature_popup_hidden()
+    ctrl.status_msg = "signature dismissed"
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_select_signature_overload(ctrl: mut EditorController, delta: i64) -> EditorAction:
+    if ctrl.lsp_result_panel.title != "Signature Help" or ctrl.lsp_result_panel.rows.len() == 0:
+        ctrl.status_msg = "no signature overload"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    var selected = ctrl.lsp_result_panel.selected + delta
+    if selected < 0:
+        selected = ctrl.lsp_result_panel.rows.len() - 1
+    if selected >= ctrl.lsp_result_panel.rows.len():
+        selected = 0
+    ctrl.lsp_result_panel = lsp_result_panel_select(ctrl.lsp_result_panel, selected)
+    ctrl_refresh_lsp_hover_popup(ctrl, "signature-help")
+    ctrl.status_msg = "signature overload " + (ctrl.lsp_result_panel.selected + 1).to_text() + "/" + ctrl.lsp_result_panel.rows.len().to_text()
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_request_active_formatting_preview(ctrl: mut EditorController, kind: text) -> EditorAction:
+    val response = ctrl_request_active_lsp(ctrl, kind)
+    if not response.ok:
+        ctrl.status_msg = response.error_text
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val title = if kind == "range-formatting" then "range formatting" else: "formatting"
+    ctrl.pending_workspace_edit_json = ""
+    ctrl.pending_workspace_edit_title = title
+    if response.result_json != "":
+        ctrl_show_workspace_edit_preview(ctrl, response.result_json, title)
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val pending_kind = if kind == "range-formatting" then "range-formatting-preview" else: "formatting-preview"
+    ctrl.lsp_result_panel = lsp_result_panel_pending(pending_kind, response.id)
+    ctrl_show_lsp_result_panel(ctrl, title + " preview requested")
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_request_active_formatting_save(ctrl: mut EditorController, kind: text) -> EditorAction:
+    val response = ctrl_request_active_lsp(ctrl, kind)
+    if not response.ok:
+        ctrl.status_msg = response.error_text
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val title = if kind == "range-formatting" then "range formatting" else: "formatting"
+    ctrl.format_save_request_id = response.id
+    ctrl.format_save_title = title
+    if response.result_json != "":
+        ctrl_apply_workspace_edit_result(ctrl, response.result_json, title)
+        ctrl.format_save_request_id = 0
+        ctrl.format_save_title = ""
+        return ctrl_save_active_after_format(ctrl, title)
+    ctrl.status_msg = title + " save requested"
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_save_active_after_format(ctrl: mut EditorController, title: text) -> EditorAction:
+    val saved = ctrl.session.save_active()
+    if saved:
+        ctrl.status_msg = "applied and saved: " + title
+    else:
+        ctrl.status_msg = "applied: " + title + " (save failed)"
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_rename_active_symbol(ctrl: mut EditorController, new_name: text) -> EditorAction:
+    val name = new_name.trim()
+    if name == "":
+        ctrl.status_msg = "missing rename target"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val response = ctrl_request_active_rename(ctrl, name)
+    if not response.ok:
+        ctrl.status_msg = response.error_text
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    if response.result_json != "":
+        return ctrl_apply_workspace_edit_result(ctrl, response.result_json, "rename")
+    ctrl.pending_workspace_edit_title = "rename"
+    ctrl.status_msg = "rename requested: " + name
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_rename_active_symbol_preview(ctrl: mut EditorController, new_name: text) -> EditorAction:
+    val name = new_name.trim()
+    if name == "":
+        ctrl.status_msg = "missing rename target"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val response = ctrl_request_active_rename(ctrl, name)
+    if not response.ok:
+        ctrl.status_msg = response.error_text
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.pending_workspace_edit_json = ""
+    ctrl.pending_workspace_edit_title = "rename"
+    if response.result_json != "":
+        ctrl_show_workspace_edit_preview(ctrl, response.result_json, "rename")
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.lsp_result_panel = lsp_result_panel_pending("rename-preview", response.id)
+    ctrl_show_lsp_result_panel(ctrl, "rename preview requested: " + name)
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_show_workspace_edit_preview(ctrl: mut EditorController, edit_json: text, title: text):
+    ctrl.pending_workspace_edit_json = edit_json
+    ctrl.pending_workspace_edit_title = title
+    ctrl.lsp_result_panel = lsp_result_panel_workspace_edit_preview(title, edit_json, 0)
+    ctrl_mark_workspace_edit_preview_conflicts(ctrl)
+    ctrl_refresh_lsp_hover_popup(ctrl, "workspace-edit-preview")
+    ctrl_show_lsp_result_panel(ctrl, title + " preview: " + ctrl.lsp_result_panel.rows.len().to_text() + " edits")
+
+fn ctrl_mark_workspace_edit_preview_conflicts(ctrl: mut EditorController):
+    var rows: [LspResultRow] = []
+    for row in ctrl.lsp_result_panel.rows:
+        if row.path != "" and not rt_file_exists(row.path):
+            rows.push(LspResultRow(
+                icon: "conflict",
+                label: row.label,
+                detail: row.detail + " [conflict: missing file]",
+                path: row.path,
+                line: row.line,
+                col: row.col,
+                command_name: row.command_name,
+                command_payload: row.command_payload,
+                depth: row.depth,
+                expanded: row.expanded
+            ))
+        else:
+            rows.push(row)
+    ctrl.lsp_result_panel = LspResultPanel(
+        title: ctrl.lsp_result_panel.title,
+        rows: rows,
+        selected: ctrl.lsp_result_panel.selected,
+        scroll_offset: ctrl.lsp_result_panel.scroll_offset,
+        pending: ctrl.lsp_result_panel.pending,
+        request_id: ctrl.lsp_result_panel.request_id
+    )
+
+fn ctrl_confirm_pending_workspace_edit(ctrl: mut EditorController) -> EditorAction:
+    if ctrl.pending_workspace_edit_json == "":
+        ctrl.status_msg = "no pending workspace edit"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val edit_json = ctrl.pending_workspace_edit_json
+    val title = ctrl.pending_workspace_edit_title
+    ctrl.pending_workspace_edit_json = ""
+    ctrl.pending_workspace_edit_title = ""
+    ctrl_apply_workspace_edit_result(ctrl, edit_json, title)
+
+fn ctrl_cancel_pending_workspace_edit(ctrl: mut EditorController) -> EditorAction:
+    if ctrl.pending_workspace_edit_json == "":
+        ctrl.status_msg = "no pending workspace edit"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.pending_workspace_edit_json = ""
+    ctrl.pending_workspace_edit_title = ""
+    ctrl.lsp_result_panel = lsp_result_panel_new("LSP Results")
+    ctrl_refresh_lsp_hover_popup(ctrl, "workspace-edit-cancel")
+    ctrl_show_lsp_result_panel(ctrl, "workspace edit cancelled")
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_request_active_call_hierarchy_direction(ctrl: mut EditorController, direction: text, item_json: text) -> EditorAction:
+    val payload = item_json.trim()
+    if payload == "":
+        ctrl.status_msg = "missing call hierarchy item"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val response = ctrl_request_call_hierarchy_direction(ctrl, direction, payload)
+    if not response.ok:
+        ctrl.lsp_call_hierarchy_merge_index = -1
+        ctrl.lsp_call_hierarchy_merge_panel = lsp_result_panel_new("")
+        ctrl.status_msg = response.error_text
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val kind = if direction == "outgoing" then "call-hierarchy-outgoing" else: "call-hierarchy-incoming"
+    ctrl_set_lsp_result_panel_from_response(ctrl, kind, response)
+    ctrl_refresh_lsp_hover_popup(ctrl, kind)
+    ctrl_show_lsp_result_panel(ctrl, kind + " results")
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_request_selected_call_hierarchy_direction(ctrl: mut EditorController, direction: text) -> EditorAction:
+    if ctrl.lsp_result_panel.rows.len() == 0:
+        ctrl.status_msg = "missing call hierarchy item"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val row = ctrl.lsp_result_panel.rows[ctrl.lsp_result_panel.selected]
+    if row.icon != "call":
+        ctrl.status_msg = "missing call hierarchy item"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    if ctrl.lsp_result_panel.title == "Call Hierarchy":
+        ctrl.lsp_call_hierarchy_merge_panel = ctrl.lsp_result_panel
+        ctrl.lsp_call_hierarchy_merge_index = ctrl.lsp_result_panel.selected
+    return ctrl_request_active_call_hierarchy_direction(ctrl, direction, row.command_payload)
+
+fn ctrl_request_active_code_lens_resolve(ctrl: mut EditorController, item_json: text) -> EditorAction:
+    val payload = item_json.trim()
+    if payload == "":
+        ctrl.status_msg = "missing code lens item"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val response = ctrl_request_code_lens_resolve(ctrl, payload)
+    if not response.ok:
+        ctrl.status_msg = response.error_text
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.lsp_result_panel = lsp_result_panel_from_response("code-lens-resolve", response)
+    ctrl_refresh_lsp_hover_popup(ctrl, "code-lens-resolve")
+    ctrl_show_lsp_result_panel(ctrl, "code-lens-resolve results")
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_run_selected_code_lens(ctrl: mut EditorController) -> EditorAction:
+    val command_name = lsp_result_panel_target_command(ctrl.lsp_result_panel)
+    if command_name == "":
+        ctrl.status_msg = "no code lens command"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val payload = lsp_result_panel_target_command_payload(ctrl.lsp_result_panel)
+    val action = ctrl_execute_palette_command(ctrl, command_name, payload)
+    if action.status_msg == "":
+        ctrl.status_msg = "ran code lens: " + command_name
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    action
+
+fn ctrl_show_lsp_result_panel(ctrl: mut EditorController, message: text):
+    var layout = ctrl.session.dock_layout
+    layout.show_right("lsp-panel")
+    ctrl.session.dock_layout = layout
+    ctrl.status_msg = message
+
+fn ctrl_code_action_result_panel(ctrl: mut EditorController, request_id: i64) -> LspResultPanel:
+    var rows: [LspResultRow] = []
+    var last_group = ""
+    var i = 0
+    while i < ctrl.code_actions.len():
+        val action = ctrl.code_actions[i]
+        if _editor_code_action_matches_filter(action, ctrl.code_action_filter):
+            if ctrl.code_action_group_by_kind and action.kind != last_group:
+                last_group = action.kind
+                val group_label = if last_group == "" then "Other" else: last_group
+                rows.push(LspResultRow(icon: "group", label: group_label, detail: _editor_code_action_group_count(ctrl.code_actions, ctrl.code_action_filter, action.kind).to_text() + " actions", path: "", line: 0, col: 0, command_name: "", command_payload: "", depth: 0, expanded: true))
+            var detail = action.kind
+            if action.edit_json != "":
+                detail = if detail == "" then "edit" else: detail + " edit"
+            if action.command != "":
+                detail = if detail == "" then "command" else: detail + " command"
+            val depth = if ctrl.code_action_group_by_kind then 1 else: 0
+            rows.push(LspResultRow(icon: "action", label: action.title, detail: detail, path: "", line: 0, col: 0, command_name: "quickfix-apply", command_payload: i.to_text(), depth: depth, expanded: false))
+        i = i + 1
+    if rows.len() == 0:
+        rows.push(LspResultRow(icon: "empty", label: "No code actions", detail: "", path: "", line: 0, col: 0, command_name: "", command_payload: "", depth: 0, expanded: false))
+    LspResultPanel(title: "Code Actions", rows: rows, selected: 0, scroll_offset: 0, pending: false, request_id: request_id)
+
+fn ctrl_filter_code_actions(ctrl: mut EditorController, filter: text) -> EditorAction:
+    ctrl.code_action_filter = if filter == "" then "all" else: filter
+    ctrl.lsp_result_panel = ctrl_code_action_result_panel(ctrl, ctrl.lsp_result_panel.request_id)
+    ctrl.status_msg = "code actions filtered: " + ctrl.code_action_filter
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_group_code_actions_by_kind(ctrl: mut EditorController) -> EditorAction:
+    ctrl.code_action_group_by_kind = true
+    ctrl.lsp_result_panel = ctrl_code_action_result_panel(ctrl, ctrl.lsp_result_panel.request_id)
+    ctrl.status_msg = "code actions grouped: kind"
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_refresh_lsp_hover_popup(ctrl: mut EditorController, kind: text):
+    val buffer = ctrl.session.active_buffer()
+    val line = if buffer == nil then 0 else: buffer.cursor_row
+    val col = if buffer == nil then 0 else: buffer.cursor_col
+    if kind == "hover":
+        ctrl.lsp_hover_popup = lsp_hover_popup_from_panel(ctrl.lsp_result_panel, line, col)
+    else:
+        ctrl.lsp_hover_popup = lsp_hover_popup_hidden()
+    if kind == "signature-help":
+        ctrl.lsp_signature_popup = lsp_signature_popup_from_panel(ctrl.lsp_result_panel, line, col)
+    else:
+        ctrl.lsp_signature_popup = lsp_signature_popup_hidden()
+
+fn ctrl_lsp_jump_selected(ctrl: mut EditorController) -> EditorAction:
+    val path = lsp_result_panel_target_path(ctrl.lsp_result_panel)
+    if path == "":
+        ctrl.status_msg = "no lsp result target"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val line = lsp_result_panel_target_line(ctrl.lsp_result_panel)
+    val col = lsp_result_panel_target_col(ctrl.lsp_result_panel)
+    ctrl_lsp_push_current_location(ctrl)
+    var session_jump = ctrl.session
+    session_jump.open_file(path)
+    ctrl.session = session_jump
+    ctrl_focus_lsp_target_path(ctrl, path)
+    val buffer = ctrl.session.active_buffer()
+    if buffer != nil:
+        buffer.move_cursor(line, col)
+        ctrl.session.update_active_buffer(buffer)
+    ctrl.status_msg = "lsp jump: " + path + ":" + (line + 1).to_text()
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_apply_selected_lsp_selection_range(ctrl: mut EditorController) -> EditorAction:
+    if ctrl.lsp_result_panel.rows.len() == 0:
+        ctrl.status_msg = "no selection range"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    if ctrl.lsp_result_panel.selected < 0 or ctrl.lsp_result_panel.selected >= ctrl.lsp_result_panel.rows.len():
+        ctrl.status_msg = "no selection range"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val row = ctrl.lsp_result_panel.rows[ctrl.lsp_result_panel.selected]
+    if row.icon != "selection":
+        ctrl.status_msg = "no selection range"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val buffer = ctrl.session.active_buffer()
+    if buffer == nil:
+        ctrl.status_msg = "no file open"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val end_line = _editor_parse_i64(_editor_payload_part(row.command_payload, 0), row.line)
+    val end_col = _editor_parse_i64(_editor_payload_part(row.command_payload, 1), row.col)
+    buffer.set_primary_selection_range(row.line, row.col, end_line, end_col)
+    buffer.move_cursor(row.line, row.col)
+    ctrl.session.update_active_buffer(buffer)
+    ctrl.status_msg = "selection range: " + (row.line + 1).to_text() + ":" + (row.col + 1).to_text() + "-" + (end_line + 1).to_text() + ":" + (end_col + 1).to_text()
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_apply_all_lsp_selection_ranges(ctrl: mut EditorController) -> EditorAction:
+    if ctrl.lsp_result_panel.title != "Selection Ranges" or ctrl.lsp_result_panel.rows.len() == 0:
+        ctrl.status_msg = "no selection range"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val buffer = ctrl.session.active_buffer()
+    if buffer == nil:
+        ctrl.status_msg = "no file open"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    buffer.clear_selection_range()
+    var applied = 0
+    var i = 0
+    while i < ctrl.lsp_result_panel.rows.len():
+        val row = ctrl.lsp_result_panel.rows[i]
+        if row.icon == "selection":
+            val end_line = _editor_parse_i64(_editor_payload_part(row.command_payload, 0), row.line)
+            val end_col = _editor_parse_i64(_editor_payload_part(row.command_payload, 1), row.col)
+            buffer.add_selection_range(row.line, row.col, end_line, end_col)
+            applied = applied + 1
+        i = i + 1
+    ctrl.session.update_active_buffer(buffer)
+    ctrl.status_msg = "selection ranges applied: " + applied.to_text()
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_expand_lsp_selection_range(ctrl: mut EditorController) -> EditorAction:
+    if ctrl.lsp_result_panel.title == "Selection Ranges" and ctrl.lsp_result_panel.rows.len() > 0:
+        val buffer = ctrl.session.active_buffer()
+        if buffer != nil and buffer.has_active_selection_range() and ctrl.lsp_result_panel.selected < ctrl.lsp_result_panel.rows.len() - 1:
+            ctrl.lsp_result_panel = lsp_result_panel_select(ctrl.lsp_result_panel, ctrl.lsp_result_panel.selected + 1)
+        return ctrl_apply_selected_lsp_selection_range(ctrl)
+    return ctrl_request_active_lsp_action(ctrl, "selection-ranges")
+
+fn ctrl_shrink_lsp_selection_range(ctrl: mut EditorController) -> EditorAction:
+    if ctrl.lsp_result_panel.title != "Selection Ranges" or ctrl.lsp_result_panel.rows.len() == 0:
+        ctrl.status_msg = "no selection range"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    if ctrl.lsp_result_panel.selected > 0:
+        ctrl.lsp_result_panel = lsp_result_panel_select(ctrl.lsp_result_panel, ctrl.lsp_result_panel.selected - 1)
+    return ctrl_apply_selected_lsp_selection_range(ctrl)
+
+fn ctrl_lsp_push_current_location(ctrl: mut EditorController):
+    val doc = ctrl.session.active_document()
+    val buffer = ctrl.session.active_buffer()
+    if doc == nil or buffer == nil:
+        return
+    ctrl.lsp_location_stack.push(EditorLocation(path: doc.path(), line: buffer.cursor_row, col: buffer.cursor_col))
+
+fn ctrl_lsp_back(ctrl: mut EditorController) -> EditorAction:
+    if ctrl.lsp_location_stack.len() == 0:
+        ctrl.status_msg = "lsp location stack empty"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val location = ctrl.lsp_location_stack[ctrl.lsp_location_stack.len() - 1]
+    var next_stack: [EditorLocation] = []
+    var i = 0
+    while i < ctrl.lsp_location_stack.len() - 1:
+        next_stack.push(ctrl.lsp_location_stack[i])
+        i = i + 1
+    ctrl.lsp_location_stack = next_stack
+    var session_back = ctrl.session
+    session_back.open_file(location.path)
+    ctrl.session = session_back
+    ctrl_focus_lsp_target_path(ctrl, location.path)
+    val buffer = ctrl.session.active_buffer()
+    if buffer != nil:
+        buffer.move_cursor(location.line, location.col)
+        ctrl.session.update_active_buffer(buffer)
+    ctrl.status_msg = "lsp back: " + location.path + ":" + (location.line + 1).to_text()
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_request_active_completion(ctrl: mut EditorController) -> LspResponse:
+    ctrl_request_active_lsp(ctrl, "completion")
+
+fn ctrl_request_active_hover(ctrl: mut EditorController) -> LspResponse:
+    ctrl_request_active_lsp(ctrl, "hover")
+
+fn ctrl_request_active_definition(ctrl: mut EditorController) -> LspResponse:
+    ctrl_request_active_lsp(ctrl, "definition")
+
+fn ctrl_request_active_code_action(ctrl: mut EditorController) -> LspResponse:
+    ctrl_request_active_lsp(ctrl, "code-action")
+
+fn ctrl_notify_lsp_file_changed(ctrl: mut EditorController, path: text, change_type: i64) -> EditorAction:
+    ctrl.vault_search_index = md_vault_search_index_apply_file_change(ctrl.vault_search_index, path, rt_file_read_text(path) ?? "", change_type)
+    var notified = false
+    if ctrl.md_lsp_state.running:
+        ctrl.md_lsp_state = md_lsp_notify_watched_file(ctrl.md_lsp_state, path, change_type)
+        notified = true
+    if ctrl.simple_lsp_state.running:
+        ctrl.simple_lsp_state = simple_lsp_notify_watched_file(ctrl.simple_lsp_state, path, change_type)
+        notified = true
+    if notified:
+        ctrl.status_msg = "lsp file change notified"
+    else:
+        ctrl.status_msg = "no active language server"
+    EditorAction(redraw: false, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_notify_lsp_workspace_folder(ctrl: mut EditorController, path: text, name: text, added: bool) -> EditorAction:
+    var notified = false
+    if ctrl.md_lsp_state.running:
+        ctrl.md_lsp_state = md_lsp_notify_workspace_folder(ctrl.md_lsp_state, path, name, added)
+        notified = true
+    if ctrl.simple_lsp_state.running:
+        ctrl.simple_lsp_state = simple_lsp_notify_workspace_folder(ctrl.simple_lsp_state, path, name, added)
+        notified = true
+    if added:
+        ctrl_rebuild_workspace_symbol_index(ctrl, path)
+    if notified:
+        ctrl.status_msg = "lsp workspace folder notified"
+    else:
+        ctrl.status_msg = "no active language server"
+    EditorAction(redraw: false, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_request_active_rename(ctrl: mut EditorController, new_name: text) -> LspResponse:
+    val doc = ctrl.session.active_document()
+    val buffer = ctrl.session.active_buffer()
+    if doc == nil or buffer == nil:
+        return LspResponse(id: 0, ok: false, result_json: "", error_text: "no file open")
+    val content = md_buffer_content(buffer)
+    if doc.language_id == "markdown" or md_lsp_is_markdown_file(doc.path()):
+        if not ctrl.md_lsp_state.running:
+            ctrl.md_lsp_state = md_lsp_ensure_open(ctrl.md_lsp_state, doc.path(), content)
+        val result = md_lsp_request(ctrl.md_lsp_state, "rename", new_name, doc.path(), buffer.cursor_row, buffer.cursor_col)
+        ctrl.md_lsp_state = result.0
+        return result.1
+    if doc.language_id == "simple" or doc.language_id == "shell" or simple_lsp_is_simple_file(doc.path()):
+        if not ctrl.simple_lsp_state.running:
+            ctrl.simple_lsp_state = simple_lsp_ensure_open(ctrl.simple_lsp_state, doc.path(), content)
+        val simple_result = simple_lsp_request(ctrl.simple_lsp_state, "rename", new_name, doc.path(), buffer.cursor_row, buffer.cursor_col)
+        ctrl.simple_lsp_state = simple_result.0
+        return simple_result.1
+    LspResponse(id: 0, ok: false, result_json: "", error_text: "no active language server")
+
+fn ctrl_request_active_lsp(ctrl: mut EditorController, kind: text) -> LspResponse:
+    ctrl_request_active_lsp_with_payload(ctrl, kind, "")
+
+fn ctrl_request_active_lsp_with_payload(ctrl: mut EditorController, kind: text, payload: text) -> LspResponse:
+    val doc = ctrl.session.active_document()
+    val buffer = ctrl.session.active_buffer()
+    if doc == nil or buffer == nil:
+        return LspResponse(id: 0, ok: false, result_json: "", error_text: "no file open")
+    val content = md_buffer_content(buffer)
+    if doc.language_id == "markdown" or md_lsp_is_markdown_file(doc.path()):
+        if not ctrl.md_lsp_state.running:
+            ctrl.md_lsp_state = md_lsp_ensure_open(ctrl.md_lsp_state, doc.path(), content)
+        val result = md_lsp_request(ctrl.md_lsp_state, kind, payload, doc.path(), buffer.cursor_row, buffer.cursor_col)
+        ctrl.md_lsp_state = result.0
+        return result.1
+    if doc.language_id == "simple" or doc.language_id == "shell" or simple_lsp_is_simple_file(doc.path()):
+        if not ctrl.simple_lsp_state.running:
+            ctrl.simple_lsp_state = simple_lsp_ensure_open(ctrl.simple_lsp_state, doc.path(), content)
+        val simple_result = simple_lsp_request(ctrl.simple_lsp_state, kind, payload, doc.path(), buffer.cursor_row, buffer.cursor_col)
+        ctrl.simple_lsp_state = simple_result.0
+        return simple_result.1
+    LspResponse(id: 0, ok: false, result_json: "", error_text: "no active language server")
+
+fn ctrl_cancel_pending_inlay_hint_refresh(ctrl: mut EditorController):
+    ctrl.pending_inlay_hint_refresh = false
+    ctrl.inlay_hint_refresh_elapsed_ms = 0
+
+fn ctrl_start_markdown_lsp_for_active(ctrl: mut EditorController, path: text, content: text):
+    if not md_lsp_is_markdown_file(path):
+        return
+    ctrl.md_lsp_state = md_lsp_ensure_open(ctrl.md_lsp_state, path, content)
+
+fn ctrl_start_simple_lsp_for_active(ctrl: mut EditorController, path: text, content: text):
+    if not simple_lsp_is_simple_file(path):
+        return
+    ctrl.simple_lsp_state = simple_lsp_ensure_open(ctrl.simple_lsp_state, path, content)
+
+fn ctrl_poll_lsp_diagnostics(ctrl: mut EditorController):
+    var changed = false
+    if ctrl.md_lsp_state.running:
+        val md_result = md_lsp_poll_all_notifications(ctrl.md_lsp_state)
+        ctrl.md_lsp_state = md_result.0
+        val md_notifications: [LspNotification] = md_result.1
+        for n in md_notifications:
+            if n.method == "textDocument/publishDiagnostics":
+                ctrl.diagnostic_store = diagnostics_store_with_publish(ctrl.diagnostic_store, n.params_json)
+                changed = true
+    if ctrl.simple_lsp_state.running:
+        val simple_result = simple_lsp_poll_all_notifications(ctrl.simple_lsp_state)
+        ctrl.simple_lsp_state = simple_result.0
+        val simple_notifications: [LspNotification] = simple_result.1
+        for sn in simple_notifications:
+            if sn.method == "textDocument/publishDiagnostics":
+                ctrl.diagnostic_store = diagnostics_store_with_publish(ctrl.diagnostic_store, sn.params_json)
+                changed = true
+    if changed:
+        ctrl_refresh_diagnostics_panel_view(ctrl)
+
+fn ctrl_poll_lsp_results(ctrl: mut EditorController) -> EditorAction:
+    val updated = ctrl_refresh_lsp_results(ctrl)
+    if updated:
+        ctrl.status_msg = "lsp results updated"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.status_msg = "no lsp results"
+    EditorAction(redraw: false, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_refresh_lsp_results(ctrl: mut EditorController) -> bool:
+    var updated = false
+    if ctrl.md_lsp_state.running:
+        var md_client = ctrl.md_lsp_state.client
+        val md_poll = ctrl_lsp_drain_completed_responses(md_client)
+        md_client = md_poll.0
+        val md_responses = md_poll.1
+        ctrl.md_lsp_state = MdLspState(client: md_client, running: ctrl.md_lsp_state.running, version: ctrl.md_lsp_state.version)
+        for response in md_responses:
+            if ctrl_hydrate_lsp_result_response(ctrl, response):
+                updated = true
+    if ctrl.simple_lsp_state.running:
+        var simple_client = ctrl.simple_lsp_state.client
+        val simple_poll = ctrl_lsp_drain_completed_responses(simple_client)
+        simple_client = simple_poll.0
+        val simple_responses = simple_poll.1
+        ctrl.simple_lsp_state = SimpleLspState(client: simple_client, running: ctrl.simple_lsp_state.running, version: ctrl.simple_lsp_state.version)
+        for simple_response in simple_responses:
+            if ctrl_hydrate_lsp_result_response(ctrl, simple_response):
+                updated = true
+    updated
+
+fn ctrl_lsp_drain_completed_responses(client: LspClient) -> (LspClient, [LspCompletedResponse]):
+    var next = client
+    var responses: [LspCompletedResponse] = []
+    var remaining_messages: [text] = []
+    for json in client.transport.recv_buffer:
+        if lsp_is_response(json):
+            val response = lsp_response_from_json(json)
+            val method = ctrl_lsp_pending_method_for_id(client, response.id)
+            responses.push(LspCompletedResponse(method: method, id: response.id, ok: response.ok, result_json: response.result_json, error_text: response.error_text, raw_json: json))
+        else:
+            remaining_messages.push(json)
+    var transport = next.transport
+    transport.recv_buffer = remaining_messages
+    next.transport = transport
+    var pending: [LspPendingRequest] = []
+    for request in next.pending_requests:
+        var completed = false
+        for response in responses:
+            if response.id == request.id:
+                completed = true
+        if not completed:
+            pending.push(request)
+    next.pending_requests = pending
+    (next, responses)
+
+fn ctrl_lsp_pending_method_for_id(client: LspClient, id: i64) -> text:
+    for request in client.pending_requests:
+        if request.id == id:
+            return request.method
+    ""
+
+fn ctrl_hydrate_lsp_result_json(ctrl: mut EditorController, method: text, json: text) -> bool:
+    val response = lsp_response_from_json(json)
+    if not ctrl.lsp_result_panel.pending:
+        return false
+    if response.id != ctrl.lsp_result_panel.request_id:
+        return false
+    val kind = _editor_lsp_method_to_kind(method)
+    if not _editor_lsp_kind_has_panel(kind):
+        return false
+    if kind == "code-action":
+        if response.ok and response.result_json != "":
+            ctrl.code_actions = _editor_code_actions_from_response(response.result_json)
+            ctrl.lsp_result_panel = ctrl_code_action_result_panel(ctrl, response.id)
+            ctrl_refresh_lsp_hover_popup(ctrl, kind)
+            return true
+        if response.ok:
+            ctrl.lsp_result_panel = lsp_result_panel_pending(kind, response.id)
+            ctrl_refresh_lsp_hover_popup(ctrl, kind)
+            return false
+    ctrl_set_lsp_result_panel_from_response(ctrl, kind, response)
+    if kind == "folding-ranges" and response.ok and response.result_json != "":
+        ctrl_apply_lsp_folding_ranges_result(ctrl, response.result_json)
+    if kind == "inlay-hints" and response.ok and response.result_json != "":
+        ctrl_apply_lsp_inlay_hints_result(ctrl, response.result_json)
+    if kind == "semantic-tokens" and response.ok and response.result_json != "":
+        ctrl_apply_lsp_semantic_tokens_result(ctrl, response.result_json)
+    if (kind == "code-lens" or kind == "code-lens-resolve") and response.ok and response.result_json != "":
+        ctrl_apply_lsp_code_lens_panel(ctrl)
+    if kind == "document-symbols" and response.ok and response.result_json != "":
+        ctrl_apply_lsp_document_symbols_outline(ctrl)
+    ctrl_refresh_lsp_hover_popup(ctrl, kind)
+    not ctrl.lsp_result_panel.pending
+
+fn ctrl_hydrate_lsp_result_response(ctrl: mut EditorController, completed: LspCompletedResponse) -> bool:
+    var method = completed.method
+    if method == "":
+        method = ctrl_infer_lsp_completed_method(ctrl, completed.id)
+    if method == "textDocument/rename":
+        var response = LspResponse(id: completed.id, ok: completed.ok, result_json: completed.result_json, error_text: completed.error_text)
+        if response.result_json == "" and completed.raw_json != "":
+            response = lsp_response_from_json(completed.raw_json)
+        if not response.ok:
+            ctrl.status_msg = response.error_text
+            return true
+        if response.result_json == "":
+            return false
+        if ctrl.lsp_result_panel.pending and ctrl.lsp_result_panel.request_id == completed.id and ctrl.lsp_result_panel.title == "Rename Preview":
+            ctrl_show_workspace_edit_preview(ctrl, response.result_json, "rename")
+            return true
+        ctrl_apply_workspace_edit_result(ctrl, response.result_json, "rename")
+        return true
+    if method == "textDocument/formatting" or method == "textDocument/rangeFormatting":
+        var response = LspResponse(id: completed.id, ok: completed.ok, result_json: completed.result_json, error_text: completed.error_text)
+        if response.result_json == "" and completed.raw_json != "":
+            response = lsp_response_from_json(completed.raw_json)
+        if not response.ok:
+            ctrl.status_msg = response.error_text
+            return true
+        if response.result_json == "":
+            return false
+        val title = if method == "textDocument/rangeFormatting" then "range formatting" else: "formatting"
+        val preview_title = if method == "textDocument/rangeFormatting" then "Range Formatting Preview" else: "Formatting Preview"
+        if ctrl.lsp_result_panel.pending and ctrl.lsp_result_panel.request_id == completed.id and ctrl.lsp_result_panel.title == preview_title:
+            ctrl_show_workspace_edit_preview(ctrl, response.result_json, title)
+            return true
+        if ctrl.format_save_request_id == completed.id:
+            ctrl_apply_workspace_edit_result(ctrl, response.result_json, title)
+            ctrl.format_save_request_id = 0
+            ctrl.format_save_title = ""
+            ctrl_save_active_after_format(ctrl, title)
+            return true
+        ctrl_apply_workspace_edit_result(ctrl, response.result_json, title)
+        return true
+    if not ctrl.lsp_result_panel.pending:
+        return false
+    if completed.id != ctrl.lsp_result_panel.request_id:
+        return false
+    var kind = _editor_lsp_method_to_kind(method)
+    if kind == "":
+        kind = _editor_lsp_kind_from_panel_title(ctrl.lsp_result_panel.title)
+    if not _editor_lsp_kind_has_panel(kind):
+        return false
+    var response = LspResponse(id: completed.id, ok: completed.ok, result_json: completed.result_json, error_text: completed.error_text)
+    if response.result_json == "" and completed.raw_json != "":
+        response = lsp_response_from_json(completed.raw_json)
+    if kind == "code-action":
+        if response.ok and response.result_json != "":
+            ctrl.code_actions = _editor_code_actions_from_response(response.result_json)
+            ctrl.lsp_result_panel = ctrl_code_action_result_panel(ctrl, response.id)
+            ctrl_refresh_lsp_hover_popup(ctrl, kind)
+            return true
+        if response.ok:
+            ctrl.lsp_result_panel = lsp_result_panel_pending(kind, response.id)
+            ctrl_refresh_lsp_hover_popup(ctrl, kind)
+            return false
+    ctrl_set_lsp_result_panel_from_response(ctrl, kind, response)
+    if kind == "folding-ranges" and response.ok and response.result_json != "":
+        ctrl_apply_lsp_folding_ranges_result(ctrl, response.result_json)
+    if kind == "inlay-hints" and response.ok and response.result_json != "":
+        ctrl_apply_lsp_inlay_hints_result(ctrl, response.result_json)
+    if kind == "semantic-tokens" and response.ok and response.result_json != "":
+        ctrl_apply_lsp_semantic_tokens_result(ctrl, response.result_json)
+    if (kind == "code-lens" or kind == "code-lens-resolve") and response.ok and response.result_json != "":
+        ctrl_apply_lsp_code_lens_panel(ctrl)
+    if kind == "document-symbols" and response.ok and response.result_json != "":
+        ctrl_apply_lsp_document_symbols_outline(ctrl)
+    ctrl_refresh_lsp_hover_popup(ctrl, kind)
+    true
+
+fn ctrl_infer_lsp_completed_method(ctrl: mut EditorController, id: i64) -> text:
+    if ctrl.format_save_request_id == id:
+        if ctrl.format_save_title == "range formatting":
+            return "textDocument/rangeFormatting"
+        return "textDocument/formatting"
+    if ctrl.lsp_result_panel.pending and ctrl.lsp_result_panel.request_id == id:
+        val kind = _editor_lsp_kind_from_panel_title(ctrl.lsp_result_panel.title)
+        if kind == "rename-preview":
+            return "textDocument/rename"
+        if kind == "formatting-preview":
+            return "textDocument/formatting"
+        if kind == "range-formatting-preview":
+            return "textDocument/rangeFormatting"
+        return _editor_lsp_kind_to_method(kind)
+    if ctrl.pending_workspace_edit_title == "rename":
+        return "textDocument/rename"
+    if ctrl.pending_workspace_edit_title == "formatting":
+        return "textDocument/formatting"
+    if ctrl.pending_workspace_edit_title == "range formatting":
+        return "textDocument/rangeFormatting"
+    ""
+
+fn _editor_lsp_kind_to_method(kind: text) -> text:
+    if kind == "signature-help":
+        return "textDocument/signatureHelp"
+    if kind == "selection-ranges":
+        return "textDocument/selectionRange"
+    if kind == "folding-ranges":
+        return "textDocument/foldingRange"
+    if kind == "document-links":
+        return "textDocument/documentLink"
+    if kind == "call-hierarchy":
+        return "textDocument/prepareCallHierarchy"
+    if kind == "call-hierarchy-incoming":
+        return "callHierarchy/incomingCalls"
+    if kind == "call-hierarchy-outgoing":
+        return "callHierarchy/outgoingCalls"
+    if kind == "semantic-tokens":
+        return "textDocument/semanticTokens/full"
+    if kind == "inlay-hints":
+        return "textDocument/inlayHint"
+    if kind == "code-lens":
+        return "textDocument/codeLens"
+    if kind == "code-lens-resolve":
+        return "codeLens/resolve"
+    if kind == "hover":
+        return "textDocument/hover"
+    if kind == "code-action":
+        return "textDocument/codeAction"
+    ""
+
+fn _editor_lsp_kind_from_panel_title(title: text) -> text:
+    if title == "Code Actions":
+        return "code-action"
+    if title == "Rename Preview":
+        return "rename-preview"
+    if title == "Formatting Preview":
+        return "formatting-preview"
+    if title == "Range Formatting Preview":
+        return "range-formatting-preview"
+    if title == "Signature Help":
+        return "signature-help"
+    if title == "Selection Ranges":
+        return "selection-ranges"
+    if title == "Folding Ranges":
+        return "folding-ranges"
+    if title == "Document Links":
+        return "document-links"
+    if title == "Call Hierarchy":
+        return "call-hierarchy"
+    if title == "Incoming Calls":
+        return "call-hierarchy-incoming"
+    if title == "Outgoing Calls":
+        return "call-hierarchy-outgoing"
+    if title == "Semantic Tokens":
+        return "semantic-tokens"
+    if title == "Inlay Hints":
+        return "inlay-hints"
+    if title == "Code Lens":
+        return "code-lens"
+    if title == "Resolved Code Lens":
+        return "code-lens-resolve"
+    if title == "Hover":
+        return "hover"
+    ""
+
+fn ctrl_apply_lsp_document_symbols_outline(ctrl: mut EditorController):
+    val active_id = ctrl.session.active_doc_id()
+    var docs: [EditorDocument] = []
+    var changed = false
+    var i = 0
+    while i < ctrl.session.documents.len():
+        var doc = ctrl.session.documents[i]
+        if doc.doc_id().int_value() == active_id.int_value():
+            var items: [OutlineItem] = []
+            for row in ctrl.lsp_result_panel.rows:
+                if row.icon == "symbol":
+                    items.push(OutlineItem(kind: "symbol", label: row.label, line: row.line, depth: row.depth))
+            if items.len() > 0:
+                doc.set_markdown_outline_panel(outline_panel_from_items(items))
+                var layout = ctrl.session.dock_layout
+                layout.show_right("md-outline")
+                ctrl.session.dock_layout = layout
+                changed = true
+        docs.push(doc)
+        i = i + 1
+    if changed:
+        ctrl.session.documents = docs
+        return
+
+fn ctrl_apply_lsp_folding_ranges_result(ctrl: mut EditorController, result_json: text):
+    val buffer = ctrl.session.active_buffer()
+    if buffer == nil:
+        return
+    buffer.clear_folds()
+    var cursor = 0
+    while cursor < result_json.len():
+        val slice = result_json.slice(cursor, result_json.len())
+        val relative = _editor_find_text(slice, "\"startLine\"")
+        if relative < 0:
+            ctrl.session.update_active_buffer(buffer)
+            return
+        val range_json = result_json.slice(cursor + relative, result_json.len())
+        val start_line = _editor_json_number_field(range_json, "\"startLine\"")
+        val end_line = _editor_json_number_field(range_json, "\"endLine\"")
+        buffer.fold_range(start_line, end_line)
+        cursor = cursor + relative + 11
+    ctrl.session.update_active_buffer(buffer)
+
+fn ctrl_apply_lsp_semantic_tokens_result(ctrl: mut EditorController, result_json: text):
+    val buffer = ctrl.session.active_buffer()
+    if buffer == nil:
+        return
+    buffer.clear_semantic_tokens()
+    val data = _editor_json_numbers_in_array_field(result_json, "\"data\"")
+    var i = 0
+    var line = 0
+    var col = 0
+    while i + 4 < data.len():
+        val delta_line = data[i]
+        val delta_start = data[i + 1]
+        val length = data[i + 2]
+        val token_type = data[i + 3]
+        line = line + delta_line
+        if delta_line == 0:
+            col = col + delta_start
+        else:
+            col = delta_start
+        buffer.add_semantic_token(line, col, length, token_type)
+        i = i + 5
+    ctrl.session.update_active_buffer(buffer)
+
+fn ctrl_apply_lsp_inlay_hints_result(ctrl: mut EditorController, result_json: text):
+    val buffer = ctrl.session.active_buffer()
+    if buffer == nil:
+        return
+    buffer.clear_inlay_hints()
+    var cursor = 0
+    while cursor < result_json.len():
+        val slice = result_json.slice(cursor, result_json.len())
+        val relative = _editor_find_text(slice, "\"position\"")
+        if relative < 0:
+            ctrl.session.update_active_buffer(buffer)
+            return
+        val hint_json = result_json.slice(cursor + relative, result_json.len())
+        val line = _editor_json_number_field(hint_json, "\"line\"")
+        val col = _editor_json_number_field(hint_json, "\"character\"")
+        val label = _editor_json_string_field(hint_json, "\"label\"")
+        buffer.add_inlay_hint(line, col, label)
+        cursor = cursor + relative + 10
+    ctrl.session.update_active_buffer(buffer)
+
+fn ctrl_apply_lsp_code_lens_panel(ctrl: mut EditorController):
+    val buffer = ctrl.session.active_buffer()
+    if buffer == nil:
+        return
+    buffer.clear_code_lenses()
+    for row in ctrl.lsp_result_panel.rows:
+        if row.icon == "lens":
+            buffer.add_code_lens(row.line, row.label, row.command_name, row.command_payload)
+    ctrl.session.update_active_buffer(buffer)

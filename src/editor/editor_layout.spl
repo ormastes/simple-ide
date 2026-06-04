@@ -1,0 +1,45 @@
+# Editor Layout
+#
+# Layout zone computation for editor panels (sidebar, editor area, status bar).
+
+use app.editor.editor_controller_types.*
+use app.editor.editor_controller.*
+
+fn ctrl_compute_zones(ctrl: EditorController, total_w: i64, total_h: i64) -> LayoutZones:
+    val raw_sidebar_w = if ctrl.file_tree_visible then ctrl.session.dock_layout.left_width_value() else: 0
+    val raw_right_w = if ctrl.session.dock_layout.is_right_visible() then ctrl.session.dock_layout.right_width_value() else: 0
+    val safe_total_w = if total_w > 1 then total_w else: 1
+    val safe_total_h = if total_h > 3 then total_h else: 4
+    val sidebar_w = _ctrl_clamp_zone_width(raw_sidebar_w, 0, safe_total_w - 1)
+    val right_w = _ctrl_clamp_zone_width(raw_right_w, 0, safe_total_w - sidebar_w - 1)
+    val editor_area_h = safe_total_h - 3
+    val ew = safe_total_w - sidebar_w - right_w
+    LayoutZones(
+        tab_bar_y: 0,
+        tab_bar_h: 1,
+        sidebar_x: 0,
+        sidebar_y: 1,
+        sidebar_w: sidebar_w,
+        sidebar_h: editor_area_h,
+        editor_x: sidebar_w,
+        editor_y: 1,
+        editor_w: ew,
+        editor_h: editor_area_h,
+        status_y: safe_total_h - 2,
+        command_y: safe_total_h - 1
+    )
+
+fn ctrl_right_zone(ctrl: EditorController, zones: LayoutZones) -> LayoutZonesRight:
+    val raw_right_w = if ctrl.session.dock_layout.is_right_visible() then ctrl.session.dock_layout.right_width_value() else: 0
+    val right_w = _ctrl_clamp_zone_width(raw_right_w, 0, zones.editor_w)
+    LayoutZonesRight(
+        x: zones.editor_x + zones.editor_w,
+        w: right_w
+    )
+
+fn _ctrl_clamp_zone_width(value: i64, min_value: i64, max_value: i64) -> i64:
+    if value < min_value:
+        return min_value
+    if value > max_value:
+        return max_value
+    value

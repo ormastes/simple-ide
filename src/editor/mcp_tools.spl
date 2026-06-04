@@ -1,0 +1,636 @@
+# Editor MCP Tools
+#
+# MCP tool entries for AI-assisted editing.
+# Provides tools for file operations, buffer reading, editing, and navigation.
+
+use std.editor.services.md_search.*
+use app.editor.mcp_tools_helpers.*
+
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_file_write_text(path: text, content: text) -> bool
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_file_read_bytes(path: text) -> [u8]?
+extern fn rt_file_write_bytes(path: text, data: [u8]) -> bool
+extern fn rt_dir_create_all(path: text) -> bool
+extern fn rt_dir_walk(path: text) -> [text]
+
+struct McpToolDef:
+    name: text
+    description: text
+    params: [McpToolParam]
+
+struct McpToolParam:
+    name: text
+    param_type: text
+    required: bool
+
+struct McpToolResult:
+    ok: bool
+    content: text
+
+fn editor_mcp_tools() -> [McpToolDef]:
+    [
+        McpToolDef(
+            name: "editor.open_file",
+            description: "Open a file in the editor",
+            params: [McpToolParam(name: "path", param_type: "text", required: true)]
+        ),
+        McpToolDef(
+            name: "editor.read_buffer",
+            description: "Read the current buffer content",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.edit",
+            description: "Edit text at cursor position",
+            params: [McpToolParam(name: "text", param_type: "text", required: true)]
+        ),
+        McpToolDef(
+            name: "editor.search",
+            description: "Search for text in current buffer",
+            params: [McpToolParam(name: "query", param_type: "text", required: true)]
+        ),
+        McpToolDef(
+            name: "editor.diagnostics",
+            description: "Get diagnostics for current file",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.goto_definition",
+            description: "Go to definition of symbol at cursor",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_references",
+            description: "Find references for symbol at cursor",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_selection_ranges",
+            description: "Request selection ranges at cursor",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_document_symbols",
+            description: "List document symbols for the active file",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_prepare_rename",
+            description: "Request rename range validation for the active symbol",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_formatting",
+            description: "Request formatting edits for the active file",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_range_formatting",
+            description: "Request range formatting edits from start of file to cursor",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_signature_help",
+            description: "Request signature help at cursor",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_document_links",
+            description: "Request document links for the active file",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_folding_ranges",
+            description: "Request folding ranges for the active file",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_workspace_symbols",
+            description: "Request workspace symbols from the active language server",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_semantic_tokens",
+            description: "Request semantic tokens for the active file",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_inlay_hints",
+            description: "Request inlay hints for the active file",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_code_lens",
+            description: "Request code lens entries for the active file",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_code_lens_resolve",
+            description: "Resolve a code lens item JSON payload",
+            params: [McpToolParam(name: "item_json", param_type: "text", required: true)]
+        ),
+        McpToolDef(
+            name: "editor.lsp_call_hierarchy",
+            description: "Request call hierarchy roots for the active symbol",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.lsp_call_hierarchy_incoming",
+            description: "Request incoming calls for a call hierarchy item JSON payload",
+            params: [McpToolParam(name: "item_json", param_type: "text", required: true)]
+        ),
+        McpToolDef(
+            name: "editor.lsp_call_hierarchy_outgoing",
+            description: "Request outgoing calls for a call hierarchy item JSON payload",
+            params: [McpToolParam(name: "item_json", param_type: "text", required: true)]
+        ),
+        McpToolDef(
+            name: "editor.lsp_rename",
+            description: "Request rename edits for the symbol at cursor",
+            params: [McpToolParam(name: "new_name", param_type: "text", required: true)]
+        ),
+        McpToolDef(
+            name: "editor.list_open_files",
+            description: "List all open files in the editor",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.run_command",
+            description: "Execute an editor command by name",
+            params: [McpToolParam(name: "command", param_type: "text", required: true)]
+        ),
+        McpToolDef(
+            name: "editor.wiki_backlinks",
+            description: "List Markdown wiki backlinks for the active or provided note path",
+            params: [McpToolParam(name: "path", param_type: "text", required: false)]
+        ),
+        McpToolDef(
+            name: "editor.wiki_unresolved",
+            description: "List unresolved Markdown wiki links in open notes",
+            params: []
+        ),
+        McpToolDef(
+            name: "editor.wiki_tags",
+            description: "List Markdown notes containing a tag",
+            params: [McpToolParam(name: "tag", param_type: "text", required: true)]
+        ),
+        McpToolDef(
+            name: "editor.wiki_properties",
+            description: "List frontmatter properties for the active or provided Markdown note",
+            params: [McpToolParam(name: "path", param_type: "text", required: false)]
+        ),
+        McpToolDef(
+            name: "editor.wiki_set_property",
+            description: "Set a frontmatter property in a Markdown note on disk",
+            params: [
+                McpToolParam(name: "path", param_type: "text", required: true),
+                McpToolParam(name: "key", param_type: "text", required: true),
+                McpToolParam(name: "value", param_type: "text", required: true)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_tasks",
+            description: "List open or checked Markdown tasks in open notes",
+            params: [McpToolParam(name: "checked", param_type: "bool", required: false)]
+        ),
+        McpToolDef(
+            name: "editor.wiki_quick_switch",
+            description: "Search open Markdown note titles and paths",
+            params: [McpToolParam(name: "query", param_type: "text", required: true)]
+        ),
+        McpToolDef(
+            name: "editor.wiki_vault_quick_switch",
+            description: "Search Markdown note titles and paths across a vault root",
+            params: [
+                McpToolParam(name: "root", param_type: "text", required: true),
+                McpToolParam(name: "query", param_type: "text", required: true)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_vault_search",
+            description: "Search Markdown content across a vault root",
+            params: [
+                McpToolParam(name: "root", param_type: "text", required: true),
+                McpToolParam(name: "query", param_type: "text", required: true)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_vault_unresolved",
+            description: "List unresolved Markdown wiki links across a vault root",
+            params: [McpToolParam(name: "root", param_type: "text", required: true)]
+        ),
+        McpToolDef(
+            name: "editor.wiki_vault_tags",
+            description: "List Markdown vault notes containing a tag",
+            params: [
+                McpToolParam(name: "root", param_type: "text", required: true),
+                McpToolParam(name: "tag", param_type: "text", required: true)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_vault_properties",
+            description: "List frontmatter properties for a Markdown note in a vault root",
+            params: [
+                McpToolParam(name: "root", param_type: "text", required: true),
+                McpToolParam(name: "path", param_type: "text", required: true)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_vault_tasks",
+            description: "List open or checked Markdown tasks across a vault root",
+            params: [
+                McpToolParam(name: "root", param_type: "text", required: true),
+                McpToolParam(name: "checked", param_type: "bool", required: false)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_vault_backlinks",
+            description: "List Markdown wiki backlinks across a vault root",
+            params: [
+                McpToolParam(name: "root", param_type: "text", required: true),
+                McpToolParam(name: "path", param_type: "text", required: true)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_vault_graph_edges",
+            description: "List wiki graph edges across a vault root",
+            params: [
+                McpToolParam(name: "root", param_type: "text", required: true),
+                McpToolParam(name: "path", param_type: "text", required: false)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_vault_embeds",
+            description: "List Obsidian-style embeds across a vault root",
+            params: [
+                McpToolParam(name: "root", param_type: "text", required: true),
+                McpToolParam(name: "path", param_type: "text", required: false)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_vault_callouts",
+            description: "List Obsidian-style callouts across a vault root",
+            params: [
+                McpToolParam(name: "root", param_type: "text", required: true),
+                McpToolParam(name: "path", param_type: "text", required: false)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_vault_attachments",
+            description: "List image and attachment embeds across a vault root",
+            params: [
+                McpToolParam(name: "root", param_type: "text", required: true),
+                McpToolParam(name: "path", param_type: "text", required: false)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_create_note",
+            description: "Create and open a Markdown wiki note",
+            params: [
+                McpToolParam(name: "path", param_type: "text", required: true),
+                McpToolParam(name: "title", param_type: "text", required: false)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_embeds",
+            description: "List Obsidian-style note embeds and transclusions in open notes",
+            params: [McpToolParam(name: "path", param_type: "text", required: false)]
+        ),
+        McpToolDef(
+            name: "editor.wiki_callouts",
+            description: "List Obsidian-style callout blocks in open notes",
+            params: [McpToolParam(name: "path", param_type: "text", required: false)]
+        ),
+        McpToolDef(
+            name: "editor.wiki_attachments",
+            description: "List image and attachment embeds in open notes",
+            params: [McpToolParam(name: "path", param_type: "text", required: false)]
+        ),
+        McpToolDef(
+            name: "editor.wiki_attachment_insert",
+            description: "Append an attachment embed to a Markdown note",
+            params: [
+                McpToolParam(name: "target_path", param_type: "text", required: true),
+                McpToolParam(name: "attachment_path", param_type: "text", required: true),
+                McpToolParam(name: "label", param_type: "text", required: false),
+                McpToolParam(name: "storage_dir", param_type: "text", required: false)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_graph_edges",
+            description: "List wiki graph edges from links and embeds in open notes",
+            params: [McpToolParam(name: "path", param_type: "text", required: false)]
+        ),
+        McpToolDef(
+            name: "editor.wiki_template_preview",
+            description: "Preview a Markdown wiki template with title, date, and custom variables",
+            params: [
+                McpToolParam(name: "template", param_type: "text", required: true),
+                McpToolParam(name: "title", param_type: "text", required: true),
+                McpToolParam(name: "date", param_type: "text", required: true),
+                McpToolParam(name: "vars", param_type: "text", required: false)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_template_list",
+            description: "List Markdown templates in a template folder",
+            params: [McpToolParam(name: "folder", param_type: "text", required: true)]
+        ),
+        McpToolDef(
+            name: "editor.wiki_template_insert",
+            description: "Render a Markdown template file and append it to a target note",
+            params: [
+                McpToolParam(name: "template_path", param_type: "text", required: true),
+                McpToolParam(name: "target_path", param_type: "text", required: true),
+                McpToolParam(name: "title", param_type: "text", required: true),
+                McpToolParam(name: "date", param_type: "text", required: true),
+                McpToolParam(name: "vars", param_type: "text", required: false)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_daily_note",
+            description: "Preview daily note path and content for a date and workspace daily-note config",
+            params: [
+                McpToolParam(name: "date", param_type: "text", required: true),
+                McpToolParam(name: "folder", param_type: "text", required: false),
+                McpToolParam(name: "template", param_type: "text", required: false),
+                McpToolParam(name: "title_format", param_type: "text", required: false),
+                McpToolParam(name: "extension", param_type: "text", required: false)
+            ]
+        ),
+        McpToolDef(
+            name: "editor.wiki_daily_note_create",
+            description: "Create and open a daily note for a date and workspace daily-note config",
+            params: [
+                McpToolParam(name: "date", param_type: "text", required: true),
+                McpToolParam(name: "folder", param_type: "text", required: false),
+                McpToolParam(name: "template", param_type: "text", required: false),
+                McpToolParam(name: "title_format", param_type: "text", required: false),
+                McpToolParam(name: "extension", param_type: "text", required: false)
+            ]
+        )
+    ]
+
+fn editor_mcp_dispatch(session: EditSession, tool_name: text, args: [text]) -> McpToolResult:
+    if tool_name == "editor.open_file":
+        if args.len() > 0:
+            session.open_file(args[0])
+            return McpToolResult(ok: true, content: "opened {args[0]}")
+        return McpToolResult(ok: false, content: "missing path argument")
+    if tool_name == "editor.read_buffer":
+        val buffer = session.active_buffer()
+        if buffer == nil:
+            return McpToolResult(ok: false, content: "no active buffer")
+        return McpToolResult(ok: true, content: buffer.to_text())
+    if tool_name == "editor.list_open_files":
+        var listing = ""
+        var i = 0
+        while i < session.documents.len():
+            val doc = session.documents[i]
+            listing = listing + doc.path() + "\n"
+            i = i + 1
+        return McpToolResult(ok: true, content: listing)
+    if tool_name == "editor.goto_definition":
+        val doc = session.active_document()
+        val buffer = session.active_buffer()
+        if doc == nil or buffer == nil:
+            return McpToolResult(ok: false, content: "no active buffer")
+        var ctrl = EditorController.new(session)
+        val response = ctrl._request_active_definition()
+        if response.ok:
+            return McpToolResult(ok: true, content: response.result_json)
+        return McpToolResult(ok: false, content: response.error_text)
+    if tool_name == "editor.lsp_references":
+        return editor_mcp_active_lsp(session, "references", "")
+    if tool_name == "editor.lsp_selection_ranges":
+        return editor_mcp_active_lsp(session, "selection-ranges", "")
+    if tool_name == "editor.lsp_document_symbols":
+        return editor_mcp_active_lsp(session, "document-symbols", "")
+    if tool_name == "editor.lsp_prepare_rename":
+        return editor_mcp_active_lsp(session, "prepare-rename", "")
+    if tool_name == "editor.lsp_formatting":
+        return editor_mcp_active_lsp(session, "formatting", "")
+    if tool_name == "editor.lsp_range_formatting":
+        return editor_mcp_active_lsp(session, "range-formatting", "")
+    if tool_name == "editor.lsp_signature_help":
+        return editor_mcp_active_lsp(session, "signature-help", "")
+    if tool_name == "editor.lsp_document_links":
+        return editor_mcp_active_lsp(session, "document-links", "")
+    if tool_name == "editor.lsp_folding_ranges":
+        return editor_mcp_active_lsp(session, "folding-ranges", "")
+    if tool_name == "editor.lsp_workspace_symbols":
+        val query = if args.len() > 0 then args[0] else: ""
+        return editor_mcp_active_lsp(session, "workspace-symbols", query)
+    if tool_name == "editor.lsp_semantic_tokens":
+        return editor_mcp_active_lsp(session, "semantic-tokens", "")
+    if tool_name == "editor.lsp_inlay_hints":
+        return editor_mcp_active_lsp(session, "inlay-hints", "")
+    if tool_name == "editor.lsp_code_lens":
+        return editor_mcp_active_lsp(session, "code-lens", "")
+    if tool_name == "editor.lsp_code_lens_resolve":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing item_json argument")
+        return editor_mcp_active_lsp(session, "code-lens-resolve", args[0])
+    if tool_name == "editor.lsp_call_hierarchy":
+        return editor_mcp_active_lsp(session, "call-hierarchy", "")
+    if tool_name == "editor.lsp_call_hierarchy_incoming":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing item_json argument")
+        return editor_mcp_active_lsp(session, "call-hierarchy-incoming", args[0])
+    if tool_name == "editor.lsp_call_hierarchy_outgoing":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing item_json argument")
+        return editor_mcp_active_lsp(session, "call-hierarchy-outgoing", args[0])
+    if tool_name == "editor.lsp_rename":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing new_name argument")
+        return editor_mcp_active_lsp(session, "rename", args[0])
+    if tool_name == "editor.run_command":
+        if args.len() > 0:
+            var ctrl_cmd = EditorController.new(session)
+            val action = ctrl_cmd._execute_palette_command(args[0], "")
+            return McpToolResult(ok: true, content: action.status_msg)
+        return McpToolResult(ok: false, content: "missing command argument")
+    if tool_name == "editor.wiki_backlinks":
+        val index = editor_mcp_wiki_index(session)
+        val target = if args.len() > 0 and args[0] != "" then args[0] else: editor_mcp_active_path(session)
+        if target == "":
+            return McpToolResult(ok: false, content: "missing path argument")
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_links(md_wiki_backlinks(index, target)))
+    if tool_name == "editor.wiki_unresolved":
+        val unresolved = md_wiki_unresolved_links(editor_mcp_wiki_index(session))
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_links(unresolved))
+    if tool_name == "editor.wiki_tags":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing tag argument")
+        val tags = md_wiki_tags(editor_mcp_wiki_index(session), args[0])
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_tags(tags))
+    if tool_name == "editor.wiki_properties":
+        val index = editor_mcp_wiki_index(session)
+        val path = if args.len() > 0 and args[0] != "" then args[0] else: editor_mcp_active_path(session)
+        if path == "":
+            return McpToolResult(ok: false, content: "missing path argument")
+        val props = md_wiki_properties_for_path(index, path)
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_properties(props))
+    if tool_name == "editor.wiki_set_property":
+        if args.len() < 3:
+            return McpToolResult(ok: false, content: "missing path key or value argument")
+        if args[1].trim() == "":
+            return McpToolResult(ok: false, content: "missing key argument")
+        val updated = editor_mcp_set_markdown_property(args[0], args[1], args[2])
+        if not updated:
+            return McpToolResult(ok: false, content: "failed to set property")
+        return McpToolResult(ok: true, content: "set " + args[1] + " in " + args[0])
+    if tool_name == "editor.wiki_tasks":
+        val checked = args.len() > 0 and (args[0] == "true" or args[0] == "checked" or args[0] == "done")
+        val tasks = md_wiki_tasks(editor_mcp_wiki_index(session), checked)
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_tasks(tasks))
+    if tool_name == "editor.wiki_quick_switch":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing query argument")
+        val docs = md_wiki_quick_switch(editor_mcp_wiki_index(session), args[0])
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_documents(docs))
+    if tool_name == "editor.wiki_vault_quick_switch":
+        if args.len() < 2:
+            return McpToolResult(ok: false, content: "missing root or query argument")
+        val docs = md_wiki_quick_switch(editor_mcp_wiki_vault_index(args[0]), args[1])
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_documents(docs))
+    if tool_name == "editor.wiki_vault_search":
+        if args.len() < 2:
+            return McpToolResult(ok: false, content: "missing root or query argument")
+        val index = editor_mcp_vault_search_index(args[0])
+        val matches = md_vault_search_index_search(index, args[1])
+        return McpToolResult(ok: true, content: editor_mcp_format_vault_search(matches))
+    if tool_name == "editor.wiki_vault_unresolved":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing root argument")
+        val unresolved = md_wiki_unresolved_links(editor_mcp_wiki_vault_index(args[0]))
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_links(unresolved))
+    if tool_name == "editor.wiki_vault_tags":
+        if args.len() < 2:
+            return McpToolResult(ok: false, content: "missing root or tag argument")
+        val tags = md_wiki_tags(editor_mcp_wiki_vault_index(args[0]), args[1])
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_tags(tags))
+    if tool_name == "editor.wiki_vault_properties":
+        if args.len() < 2:
+            return McpToolResult(ok: false, content: "missing root or path argument")
+        val props = md_wiki_properties_for_path(editor_mcp_wiki_vault_index(args[0]), args[1])
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_properties(props))
+    if tool_name == "editor.wiki_vault_tasks":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing root argument")
+        val checked = args.len() > 1 and (args[1] == "true" or args[1] == "checked" or args[1] == "done")
+        val tasks = md_wiki_tasks(editor_mcp_wiki_vault_index(args[0]), checked)
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_tasks(tasks))
+    if tool_name == "editor.wiki_vault_backlinks":
+        if args.len() < 2:
+            return McpToolResult(ok: false, content: "missing root or path argument")
+        val links = md_wiki_backlinks(editor_mcp_wiki_vault_index(args[0]), args[1])
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_links(links))
+    if tool_name == "editor.wiki_vault_graph_edges":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing root argument")
+        val path = if args.len() > 1 then args[1] else: ""
+        val edges = md_wiki_graph_edges(editor_mcp_wiki_vault_index(args[0]), path)
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_graph_edges(edges))
+    if tool_name == "editor.wiki_vault_embeds":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing root argument")
+        val path = if args.len() > 1 then args[1] else: ""
+        val embeds = md_wiki_embeds(editor_mcp_wiki_vault_index(args[0]), path)
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_embeds(embeds))
+    if tool_name == "editor.wiki_vault_callouts":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing root argument")
+        val path = if args.len() > 1 then args[1] else: ""
+        val callouts = md_wiki_callouts(editor_mcp_wiki_vault_index(args[0]), path)
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_callouts(callouts))
+    if tool_name == "editor.wiki_vault_attachments":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing root argument")
+        val path = if args.len() > 1 then args[1] else: ""
+        val attachments = md_wiki_attachments(editor_mcp_wiki_vault_index(args[0]), path)
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_attachments(attachments))
+    if tool_name == "editor.wiki_create_note":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing path argument")
+        val title = if args.len() > 1 and args[1] != "" then args[1] else: md_wiki_title_from_path(args[0])
+        val content = "# " + title + "\n\n"
+        val written = rt_file_write_text(args[0], content)
+        if not written:
+            return McpToolResult(ok: false, content: "failed to create note")
+        session.open_file(args[0])
+        return McpToolResult(ok: true, content: "created " + args[0])
+    if tool_name == "editor.wiki_embeds":
+        val path = if args.len() > 0 then args[0] else: ""
+        val embeds = md_wiki_embeds(editor_mcp_wiki_index(session), path)
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_embeds(embeds))
+    if tool_name == "editor.wiki_callouts":
+        val path = if args.len() > 0 then args[0] else: ""
+        val callouts = md_wiki_callouts(editor_mcp_wiki_index(session), path)
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_callouts(callouts))
+    if tool_name == "editor.wiki_attachments":
+        val path = if args.len() > 0 then args[0] else: ""
+        val attachments = md_wiki_attachments(editor_mcp_wiki_index(session), path)
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_attachments(attachments))
+    if tool_name == "editor.wiki_attachment_insert":
+        if args.len() < 2:
+            return McpToolResult(ok: false, content: "missing target or attachment argument")
+        val label = if args.len() > 2 then args[2] else: ""
+        val storage_dir = if args.len() > 3 then args[3] else: ""
+        val inserted = editor_mcp_insert_attachment(args[0], args[1], label, storage_dir)
+        if not inserted:
+            return McpToolResult(ok: false, content: "failed to insert attachment")
+        val stored_path = editor_mcp_attachment_storage_path(args[0], args[1], storage_dir)
+        return McpToolResult(ok: true, content: "inserted attachment " + stored_path + " into " + args[0])
+    if tool_name == "editor.wiki_graph_edges":
+        val path = if args.len() > 0 then args[0] else: ""
+        val edges = md_wiki_graph_edges(editor_mcp_wiki_index(session), path)
+        return McpToolResult(ok: true, content: editor_mcp_format_wiki_graph_edges(edges))
+    if tool_name == "editor.wiki_template_preview":
+        if args.len() < 3:
+            return McpToolResult(ok: false, content: "missing template title or date argument")
+        val rendered = md_wiki_apply_template_vars(md_wiki_template("preview", args[0]), args[1], args[2], editor_mcp_template_vars(args, 3))
+        return McpToolResult(ok: true, content: rendered)
+    if tool_name == "editor.wiki_template_list":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing folder argument")
+        return McpToolResult(ok: true, content: editor_mcp_template_list(args[0]))
+    if tool_name == "editor.wiki_template_insert":
+        if args.len() < 4:
+            return McpToolResult(ok: false, content: "missing template target title or date argument")
+        val rendered = md_wiki_apply_template_vars(md_wiki_template(md_wiki_title_from_path(args[0]), rt_file_read_text(args[0]) ?? ""), args[2], args[3], editor_mcp_template_vars(args, 4))
+        val existing = rt_file_read_text(args[1]) ?? ""
+        val sep = if existing == "" or existing.ends_with("\n") then "" else: "\n"
+        val written = rt_file_write_text(args[1], existing + sep + rendered)
+        if not written:
+            return McpToolResult(ok: false, content: "failed to insert template")
+        return McpToolResult(ok: true, content: "inserted " + args[0] + " into " + args[1])
+    if tool_name == "editor.wiki_daily_note":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing date argument")
+        val folder = if args.len() > 1 then args[1] else: "Daily"
+        val template_body = if args.len() > 2 then args[2] else: "# {{title}}\n\n"
+        val title_format = if args.len() > 3 then args[3] else: "{{date}}"
+        val extension = if args.len() > 4 then args[4] else: ".md"
+        val config = md_wiki_daily_note_config_with_title(folder, title_format, extension, template_body)
+        val path = md_wiki_daily_note_path(config, args[0])
+        val content = md_wiki_daily_note_content(config, args[0])
+        return McpToolResult(ok: true, content: path + "\n" + content)
+    if tool_name == "editor.wiki_daily_note_create":
+        if args.len() == 0:
+            return McpToolResult(ok: false, content: "missing date argument")
+        val folder = if args.len() > 1 then args[1] else: "Daily"
+        val template_body = if args.len() > 2 then args[2] else: "# {{title}}\n\n"
+        val title_format = if args.len() > 3 then args[3] else: "{{date}}"
+        val extension = if args.len() > 4 then args[4] else: ".md"
+        val config = md_wiki_daily_note_config_with_title(folder, title_format, extension, template_body)
+        val path = md_wiki_daily_note_path(config, args[0])
+        val content = md_wiki_daily_note_content(config, args[0])
+        val written = rt_file_write_text(path, content)
+        if not written:
+            return McpToolResult(ok: false, content: "failed to create daily note")
+        session.open_file(path)
+        return McpToolResult(ok: true, content: "created " + path)
+    McpToolResult(ok: false, content: "unknown tool: {tool_name}")

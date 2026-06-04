@@ -1,0 +1,343 @@
+# DAP Protocol Types
+# Debug Adapter Protocol message definitions
+# Based on DAP Specification 1.51
+
+import core.json as json
+
+# Source reference for a stack frame
+class Source:
+    name: Option<String>
+    path: Option<String>
+
+    fn new(path: String) -> Source:
+        Source(name: nil, path: Some(path))
+
+    fn to_json() -> Dict:
+        var result = {}
+
+        match self.name:
+            case Some(n):
+                result["name"] = n
+            case nil:
+                pass
+
+        match self.path:
+            case Some(p):
+                result["path"] = p
+            case nil:
+                pass
+
+        result
+
+# Breakpoint
+class Breakpoint:
+    id: Int
+    verified: Bool
+    line: Option<Int>
+    message: Option<String>
+
+    fn new(id: Int, verified: Bool, line: Int) -> Breakpoint:
+        Breakpoint(
+            id: id,
+            verified: verified,
+            line: Some(line),
+            message: nil
+        )
+
+    fn to_json() -> Dict:
+        var result = {
+            "id": self.id,
+            "verified": self.verified
+        }
+
+        match self.line:
+            case Some(l):
+                result["line"] = l
+            case nil:
+                pass
+
+        match self.message:
+            case Some(m):
+                result["message"] = m
+            case nil:
+                pass
+
+        result
+
+# Source breakpoint (user request)
+class SourceBreakpoint:
+    line: Int
+    condition: Option<String>
+    hit_condition: Option<String>
+    log_message: Option<String>
+
+    fn from_json(data: Dict) -> Result<SourceBreakpoint, String>:
+        val line = data.get("line")?
+        val condition = data.get_optional("condition")
+        val hit_condition = data.get_optional("hitCondition")
+        val log_message = data.get_optional("logMessage")
+
+        Ok(SourceBreakpoint(
+            line: line,
+            condition: condition,
+            hit_condition: hit_condition,
+            log_message: log_message
+        ))
+
+# Stack frame
+class StackFrame:
+    id: Int
+    name: String
+    source: Option<Source>
+    line: Int
+    column: Int
+
+    fn new(id: Int, name: String, line: Int, column: Int) -> StackFrame:
+        StackFrame(
+            id: id,
+            name: name,
+            source: nil,
+            line: line,
+            column: column
+        )
+
+    fn with_source(source: Source) -> StackFrame:
+        StackFrame(
+            id: self.id,
+            name: self.name,
+            source: Some(source),
+            line: self.line,
+            column: self.column
+        )
+
+    fn to_json() -> Dict:
+        var result = {
+            "id": self.id,
+            "name": self.name,
+            "line": self.line,
+            "column": self.column
+        }
+
+        match self.source:
+            case Some(src):
+                result["source"] = src.to_json()
+            case nil:
+                pass
+
+        result
+
+# Thread
+class Thread:
+    id: Int
+    name: String
+
+    fn new(id: Int, name: String) -> Thread:
+        Thread(id: id, name: name)
+
+    fn to_json() -> Dict:
+        {
+            "id": self.id,
+            "name": self.name
+        }
+
+# Scope (local, global, etc.)
+class Scope:
+    name: String
+    variables_reference: Int
+    expensive: Bool
+
+    fn new(name: String, variables_reference: Int) -> Scope:
+        Scope(
+            name: name,
+            variables_reference: variables_reference,
+            expensive: false
+        )
+
+    fn to_json() -> Dict:
+        {
+            "name": self.name,
+            "variablesReference": self.variables_reference,
+            "expensive": self.expensive
+        }
+
+# Variable
+class Variable:
+    name: String
+    value: String
+    type_name: Option<String>
+    variables_reference: Int
+
+    fn new(name: String, value: String) -> Variable:
+        Variable(
+            name: name,
+            value: value,
+            type_name: nil,
+            variables_reference: 0
+        )
+
+    fn with_type(type_name: String) -> Variable:
+        Variable(
+            name: self.name,
+            value: self.value,
+            type_name: Some(type_name),
+            variables_reference: self.variables_reference
+        )
+
+    fn to_json() -> Dict:
+        var result = {
+            "name": self.name,
+            "value": self.value,
+            "variablesReference": self.variables_reference
+        }
+
+        match self.type_name:
+            case Some(t):
+                result["type"] = t
+            case nil:
+                pass
+
+        result
+
+# Capabilities
+class Capabilities:
+    static fn default() -> Dict:
+        {
+            "supportsConfigurationDoneRequest": true,
+            "supportsTerminateRequest": true,
+            "supportsSingleThreadExecutionRequests": true,
+            "supportsConditionalBreakpoints": true,
+            "supportsHitConditionalBreakpoints": true,
+            "supportsFunctionBreakpoints": false,
+            "supportsExceptionBreakpointFilters": false,
+            "supportsStepBack": true,
+            "supportsSetVariable": true,
+            "supportsRestartFrame": false,
+            "supportsGotoTargetsRequest": false,
+            "supportsStepInTargetsRequest": false,
+            "supportsCompletionsRequest": false,
+            "supportsModulesRequest": false,
+            "supportsValueFormattingOptions": false,
+            "supportsExceptionInfoRequest": false,
+            "supportsDelayedStackTraceLoading": false,
+            "supportsLoadedSourcesRequest": false,
+            "supportsLogPoints": false,
+            "supportsTerminateThreadsRequest": false,
+            "supportsSetExpression": false,
+            "supportsDataBreakpoints": true,
+            "supportsReadMemoryRequest": false,
+            "supportsDisassembleRequest": false,
+            "supportsCancelRequest": false,
+            "supportsBreakpointLocationsRequest": false,
+            "supportsClipboardContext": false
+        }
+
+# Stop reason
+enum StopReason:
+    Step
+    Breakpoint
+    Exception
+    Pause
+    Entry
+    Goto
+    FunctionBreakpoint
+    DataBreakpoint
+    InstructionBreakpoint
+
+    fn to_string(self) -> String:
+        match self:
+            case Step: "step"
+            case Breakpoint: "breakpoint"
+            case Exception: "exception"
+            case Pause: "pause"
+            case Entry: "entry"
+            case Goto: "goto"
+            case FunctionBreakpoint: "function breakpoint"
+            case DataBreakpoint: "data breakpoint"
+            case InstructionBreakpoint: "instruction breakpoint"
+
+# DAP Request
+class DapRequest:
+    id: Int
+    command: String
+    arguments: Option<Dict>
+
+    fn from_json(data: Dict) -> Result<DapRequest, String>:
+        val id = data.get("seq")?  # DAP uses 'seq' instead of 'id'
+        val command = data.get("command")?
+        val arguments = data.get_optional("arguments")
+
+        Ok(DapRequest(
+            id: id,
+            command: command,
+            arguments: arguments
+        ))
+
+# DAP Response
+class DapResponse:
+    request_seq: Int
+    success: Bool
+    command: String
+    message: Option<String>
+    body: Option<Dict>
+
+    fn new_success(request_seq: Int, command: String, body: Dict) -> DapResponse:
+        DapResponse(
+            request_seq: request_seq,
+            success: true,
+            command: command,
+            message: nil,
+            body: Some(body)
+        )
+
+    fn new_error(request_seq: Int, command: String, message: String) -> DapResponse:
+        DapResponse(
+            request_seq: request_seq,
+            success: false,
+            command: command,
+            message: Some(message),
+            body: nil
+        )
+
+    fn to_json() -> Dict:
+        var result = {
+            "type": "response",
+            "request_seq": self.request_seq,
+            "success": self.success,
+            "command": self.command
+        }
+
+        match self.message:
+            case Some(msg):
+                result["message"] = msg
+            case nil:
+                pass
+
+        match self.body:
+            case Some(b):
+                result["body"] = b
+            case nil:
+                pass
+
+        result
+
+# DAP Event
+class DapEvent:
+    event: String
+    body: Option<Dict>
+
+    fn new(event: String, body: Dict) -> DapEvent:
+        DapEvent(event: event, body: Some(body))
+
+    fn to_json() -> Dict:
+        var result = {
+            "type": "event",
+            "event": self.event
+        }
+
+        match self.body:
+            case Some(b):
+                result["body"] = b
+            case nil:
+                pass
+
+        result

@@ -1,0 +1,6 @@
+# LLM Dashboard TUI
+#
+# Terminal-based rendering for the LLM Agent Dashboard.
+# Room-based layout with agent sprites, hierarchy tree, and activity feed.
+
+export run_tui_dashboard

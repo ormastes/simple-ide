@@ -1,0 +1,60 @@
+"""
+LSP Client Configuration for the Simple VSCode Extension.
+
+Declares server binary path, language selector, and capability flags
+that the TypeScript extension host uses to launch `bin/simple_lsp_server`.
+"""
+
+struct LspClientConfig:
+    server_path: text
+    args: [text]
+    language_selector: [text]
+    server_ready: bool
+
+struct ServerCapabilities:
+    text_document_sync: i64
+    completion_provider: bool
+    definition_provider: bool
+    hover_provider: bool
+    references_provider: bool
+    semantic_tokens_provider: bool
+    diagnostic_provider: bool
+    code_action_provider: bool
+    document_formatting_provider: bool
+    code_lens_provider: bool
+    workspace_symbol_provider: bool
+    debug_adapter_support: bool
+
+fn lsp_client_config_server_path() -> text:
+    "bin/simple_lsp_server"
+
+fn lsp_client_config_language_selector() -> [text]:
+    var langs: [text] = []
+    langs.push("simple")
+    langs.push("spl")
+    langs.push("shs")
+    langs
+
+fn lsp_client_config_capabilities() -> ServerCapabilities:
+    ServerCapabilities(
+        text_document_sync: 1,
+        completion_provider: true,
+        definition_provider: true,
+        hover_provider: true,
+        references_provider: true,
+        semantic_tokens_provider: true,
+        diagnostic_provider: true,
+        code_action_provider: true,
+        document_formatting_provider: true,
+        code_lens_provider: true,
+        workspace_symbol_provider: true,
+        debug_adapter_support: true
+    )
+
+fn lsp_client_config_create() -> LspClientConfig:
+    LspClientConfig(
+        server_path: lsp_client_config_server_path(),
+        args: [],
+        language_selector: lsp_client_config_language_selector(),
+        server_ready: false
+    )

@@ -1,0 +1,12 @@
+# Editor Extension Roots
+#
+# Extension discovery path resolution.
+
+use std.editor.extensions.roots.{editor_extension_roots_from_inputs}
+
+extern fn rt_env_get(key: text) -> text
+
+fn editor_extension_roots() -> [text]:
+    val configured = rt_env_get("SIMPLE_EDITOR_EXTENSION_PATH") ?? ""
+    val home = rt_env_get("HOME") ?? ""
+    editor_extension_roots_from_inputs(configured, home)

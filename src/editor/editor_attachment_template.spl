@@ -1,0 +1,86 @@
+# Editor Attachment and Template Helpers
+#
+# Note embedding, attachment storage, attachment/template picker row helpers.
+
+use std.editor.services.md_wiki_index.*
+use std.editor.view.wiki_panel.*
+use std.editor.core.path_text.*
+
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_file_read_text(path: text) -> text?
+extern fn rt_dir_create_all(path: text) -> bool
+extern fn rt_dir_walk(path: text) -> [text]
+
+fn _editor_attachment_embed(attachment_path: text, label: text) -> text:
+    if label != "":
+        return "![" + label + "](" + attachment_path + ")"
+    "![[" + attachment_path + "]]"
+
+fn _editor_wiki_note_embed(target: text, alias: text) -> text:
+    if alias != "" and alias != target:
+        return "![[" + target + "|" + alias + "]]"
+    "![[" + target + "]]"
+
+fn _editor_note_embed_target(path: text) -> text:
+    var name = editor_path_basename(path)
+    if name.ends_with(".markdown"):
+        name = name.slice(0, name.len() - 9)
+    elif name.ends_with(".md"):
+        name = name.slice(0, name.len() - 3)
+    name
+
+fn _editor_store_attachment_for_note(target_path: text, source_path: text, storage_dir: text) -> text:
+    val data = rt_file_read_text(source_path) ?? ""
+    if data == "" and not rt_file_exists(source_path):
+        return ""
+    val note_dir = editor_dirname(target_path)
+    val clean_dir = editor_clean_relative_dir(storage_dir)
+    if clean_dir == "":
+        return ""
+    val dest_dir = if note_dir == "" then clean_dir else: note_dir + "/" + clean_dir
+    if not rt_dir_create_all(dest_dir):
+        return ""
+    val name = editor_path_basename(source_path)
+    if name == "":
+        return ""
+    val unique_name = _editor_unique_attachment_name(dest_dir, name)
+    val dest_path = dest_dir + "/" + unique_name
+    if not rt_file_write_text(dest_path, data):
+        return ""
+    clean_dir + "/" + unique_name
+
+fn _editor_unique_attachment_name(dest_dir: text, name: text) -> text:
+    val dot = editor_last_dot(name)
+    val base = if dot > 0 then name.slice(0, dot) else: name
+    val ext = if dot > 0 then name.slice(dot, name.len()) else: ""
+    var candidate = name
+    var idx = 1
+    while rt_file_exists(dest_dir + "/" + candidate):
+        candidate = base + "-" + idx.to_text() + ext
+        idx = idx + 1
+    candidate
+
+fn _editor_attachment_picker_rows(root: text, query: text, target_path: text, storage_dir: text) -> [WikiPanelRow]:
+    var rows: [WikiPanelRow] = []
+    val files = rt_dir_walk(root)
+    for file in files:
+        if not md_wiki_is_attachment_target(file):
+            continue
+        if query != "" and editor_find_text(file.to_lower(), query) < 0:
+            continue
+        val label = editor_path_basename(file)
+        val detail = if target_path == "" then file else: target_path + "|" + file + "|" + label + "|" + storage_dir
+        rows.push(WikiPanelRow(icon: "attachment", label: label, detail: detail, path: file, line: 0))
+    rows
+
+fn _editor_template_picker_rows(folder: text, target_path: text, title: text, date: text, query: text) -> [WikiPanelRow]:
+    var rows: [WikiPanelRow] = []
+    val files = rt_dir_walk(folder)
+    for file in files:
+        if not editor_is_markdown_path(file):
+            continue
+        if query != "" and editor_find_text(file.to_lower(), query) < 0:
+            continue
+        val insert_payload = file + "|" + target_path + "|" + title + "|" + date
+        rows.push(WikiPanelRow(icon: "template", label: editor_path_basename(file), detail: insert_payload, path: file, line: 0))
+    rows

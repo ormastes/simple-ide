@@ -1,0 +1,99 @@
+# Editor Debug Helpers
+#
+# Debug launch configuration, session panel, and keyboard shortcuts helpers.
+
+use std.editor.common.keybindings.*
+use std.editor.services.debug_session_registry.*
+use std.editor.view.wiki_panel.*
+use app.editor.editor_path_text_helpers.*
+
+extern fn rt_file_read_text(path: text) -> text
+
+fn _editor_debug_launch_config_for_doc(program: text, debug_type: text) -> EditorDebugLaunchConfig:
+    val configs = _editor_debug_launch_configs_for_doc(program, debug_type)
+    if configs.len() > 0:
+        return configs[0]
+    editor_debug_launch_config_default(program)
+
+fn _editor_debug_launch_configs_for_doc(program: text, debug_type: text) -> [EditorDebugLaunchConfig]:
+    val launch_path = _editor_find_launch_json(program)
+    if launch_path == "":
+        return [editor_debug_launch_config_default(program)]
+    val content = rt_file_read_text(launch_path) ?? ""
+    if content == "":
+        return [editor_debug_launch_config_default(program)]
+    val workspace = _editor_workspace_dir_from_launch_json(launch_path)
+    var resolved: [EditorDebugLaunchConfig] = []
+    val configs = editor_debug_launch_configs_from_json(content)
+    for config in configs:
+        if editor_debug_launch_config_matches_type(config, debug_type):
+            var selected = editor_debug_launch_config_with_program(config, program)
+            resolved.push(editor_debug_resolve_launch_config(selected, workspace, program))
+    val compounds = editor_debug_compound_configs_from_json(content)
+    for compound in compounds:
+        resolved.push(editor_debug_compound_as_launch_config(compound))
+    if resolved.len() == 0:
+        val selected = editor_debug_select_launch_config(content, debug_type, program)
+        resolved.push(editor_debug_resolve_launch_config(selected, workspace, program))
+    resolved
+
+fn _editor_debug_launch_config_panel(configs: [EditorDebugLaunchConfig]) -> WikiPanel:
+    var rows: [WikiPanelRow] = []
+    for config in configs:
+        val config_program = editor_debug_launch_config_program(config)
+        rows.push(WikiPanelRow(icon: "debug", label: editor_debug_launch_config_name(config), detail: editor_debug_launch_config_detail(config), path: config_program, line: 0))
+    wiki_panel_with_rows("Debug Launch Configs", rows)
+
+fn _editor_debug_sessions_panel(registry: EditorDebugRegistry) -> WikiPanel:
+    var rows: [WikiPanelRow] = []
+    var first = true
+    var i = 0
+    while i < editor_debug_session_count(registry):
+        val session = editor_debug_session_at(registry, i)
+        val config = editor_debug_session_config(session)
+        val active = if first then "active " else: ""
+        val session_id = editor_debug_session_id(session)
+        val config_program = editor_debug_launch_config_program(config)
+        val detail = active + editor_debug_session_status(session) + " " + editor_debug_launch_config_debug_type(config) + " " + config_program
+        rows.push(WikiPanelRow(icon: "debug", label: "#" + session_id.to_text() + " " + editor_debug_launch_config_name(config), detail: detail, path: config_program, line: session_id))
+        first = false
+        i = i + 1
+    if rows.len() == 0:
+        rows.push(WikiPanelRow(icon: "debug", label: "No debug sessions", detail: "", path: "", line: 0))
+    wiki_panel_with_rows("Debug Sessions", rows)
+
+fn _editor_debug_session_panel(session: EditorDebugSession) -> WikiPanel:
+    editor_debug_session_wiki_panel(session)
+
+fn _editor_debug_active_frame_id(session: EditorDebugSession) -> i64:
+    if session.stack_frames.len() > 0:
+        return session.stack_frames[0].id
+    1
+
+fn _editor_keyboard_shortcuts_panel(config: KeybindingConfig) -> WikiPanel:
+    var rows: [WikiPanelRow] = []
+    for binding in config.bindings:
+        var detail = binding.mode + " -> " + binding.command
+        if binding.args != "":
+            detail = detail + " " + binding.args
+        rows.push(WikiPanelRow(icon: "key", label: binding.key, detail: detail, path: "", line: 0))
+    wiki_panel_with_rows("Keyboard Shortcuts", rows)
+
+fn _editor_workspace_dir_from_launch_json(launch_path: text) -> text:
+    val vscode_dir = _editor_dirname(launch_path)
+    _editor_dirname(vscode_dir)
+
+fn _editor_find_launch_json(path: text) -> text:
+    var dir = _editor_dirname(path)
+    var depth = 0
+    while dir != "" and depth < 12:
+        val candidate = dir + "/.vscode/launch.json"
+        val content = rt_file_read_text(candidate) ?? ""
+        if content != "":
+            return candidate
+        val parent = _editor_dirname(dir)
+        if parent == dir:
+            return ""
+        dir = parent
+        depth = depth + 1
+    ""

@@ -1,0 +1,165 @@
+# Slide Model
+#
+# Types for presentation slides, elements, and layouts.
+
+# =========================================================================
+# Layout and Element Enums
+# =========================================================================
+
+enum SlideLayout:
+    TitleSlide
+    TitleContent
+    TwoColumn
+    Blank
+    SectionHeader
+
+enum SlideElementKind:
+    TextBox(content: text)
+    ImageEl(src: text, alt: text)
+    ShapeEl(shape_type: text, fill_color: text)
+
+# =========================================================================
+# Core Structs
+# =========================================================================
+
+struct SlideElement:
+    id: text
+    kind: SlideElementKind
+    x: i32
+    y: i32
+    width: i32
+    height: i32
+
+struct Slide:
+    id: text
+    layout: SlideLayout
+    elements: [SlideElement]
+    notes: text
+    background: text
+
+struct Presentation:
+    title: text
+    slides: [Slide]
+    active_slide: i32
+    theme_name: text
+
+# =========================================================================
+# Presentation Helpers
+# =========================================================================
+
+fn empty_presentation(title: text) -> Presentation:
+    """Create a new presentation with one title slide."""
+    val first = title_slide("slide_0", title, "")
+    return Presentation(
+        title: title,
+        slides: [first],
+        active_slide: 0,
+        theme_name: "default"
+    )
+
+fn slide_count(pres: Presentation) -> i32:
+    """Return the number of slides in a presentation."""
+    var count: i32 = 0
+    for s in pres.slides:
+        count = count + 1
+    return count
+
+fn current_slide(pres: Presentation) -> Slide?:
+    """Return the currently active slide, or nil if out of range."""
+    if pres.active_slide < 0:
+        return nil
+    var idx: i32 = 0
+    for s in pres.slides:
+        if idx == pres.active_slide:
+            return s
+        idx = idx + 1
+    return nil
+
+# =========================================================================
+# Slide Constructors
+# =========================================================================
+
+fn title_slide(id: text, title: text, subtitle: text) -> Slide:
+    """Create a title slide with a centered title and optional subtitle."""
+    var elements: [SlideElement] = []
+    val title_el = SlideElement(
+        id: "{id}_title",
+        kind: SlideElementKind.TextBox(content: title),
+        x: 100, y: 150,
+        width: 760, height: 80
+    )
+    elements.push(title_el)
+    if subtitle != "":
+        val sub_el = SlideElement(
+            id: "{id}_subtitle",
+            kind: SlideElementKind.TextBox(content: subtitle),
+            x: 150, y: 250,
+            width: 660, height: 50
+        )
+        elements.push(sub_el)
+    return Slide(
+        id: id,
+        layout: SlideLayout.TitleSlide,
+        elements: elements,
+        notes: "",
+        background: "#FFFFFF"
+    )
+
+fn blank_slide(id: text) -> Slide:
+    """Create an empty blank slide."""
+    return Slide(
+        id: id,
+        layout: SlideLayout.Blank,
+        elements: [],
+        notes: "",
+        background: "#FFFFFF"
+    )
+
+fn content_slide(id: text, title: text, body: text) -> Slide:
+    """Create a title-and-content slide with title at top and body below."""
+    var elements: [SlideElement] = []
+    val title_el = SlideElement(
+        id: "{id}_title",
+        kind: SlideElementKind.TextBox(content: title),
+        x: 50, y: 30,
+        width: 860, height: 60
+    )
+    elements.push(title_el)
+    val body_el = SlideElement(
+        id: "{id}_body",
+        kind: SlideElementKind.TextBox(content: body),
+        x: 50, y: 110,
+        width: 860, height: 400
+    )
+    elements.push(body_el)
+    return Slide(
+        id: id,
+        layout: SlideLayout.TitleContent,
+        elements: elements,
+        notes: "",
+        background: "#FFFFFF"
+    )
+
+# =========================================================================
+# Element Manipulation
+# =========================================================================
+
+fn add_text_box(slide: Slide, id: text, content: text, x: i32, y: i32, w: i32, h: i32) -> Slide:
+    """Add a text box element to a slide and return the updated slide."""
+    val el = SlideElement(
+        id: id,
+        kind: SlideElementKind.TextBox(content: content),
+        x: x, y: y,
+        width: w, height: h
+    )
+    var new_elements: [SlideElement] = []
+    for e in slide.elements:
+        new_elements.push(e)
+    new_elements.push(el)
+    return Slide(
+        id: slide.id,
+        layout: slide.layout,
+        elements: new_elements,
+        notes: slide.notes,
+        background: slide.background
+    )

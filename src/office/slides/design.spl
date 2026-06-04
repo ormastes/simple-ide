@@ -1,0 +1,55 @@
+# Slide design metadata helpers.
+#
+# Per-slide CSS-like design metadata layered on the existing Presentation and
+# Slide model. This lets IDE/PPT views change page design and outline text
+# styling without changing the core slide data structure.
+
+use app.office.slides.slide.{Presentation}
+use app.office.slides.outline.{SlideOutlineStyle, slide_outline_style, slide_outline_style_css}
+
+struct SlidePageDesign:
+    slide_id: text
+    selector: text
+    background: text
+    title_color: text
+    body_color: text
+    accent: text
+    outline_style: SlideOutlineStyle
+
+fn slide_page_design(slide_id: text, selector: text, background: text, title_color: text, body_color: text, accent: text, outline_text_transform: text) -> SlidePageDesign:
+    SlidePageDesign(
+        slide_id: slide_id,
+        selector: selector,
+        background: background,
+        title_color: title_color,
+        body_color: body_color,
+        accent: accent,
+        outline_style: slide_outline_style(selector + " .outline-item", title_color, "600", outline_text_transform, accent)
+    )
+
+fn default_slide_page_design(slide_id: text) -> SlidePageDesign:
+    slide_page_design(slide_id, ".slide-page-" + slide_id, "#FFFFFF", "#111827", "#374151", "#4A90D9", "none")
+
+fn slide_page_design_css(design: SlidePageDesign) -> text:
+    var page = design.selector + " background: " + design.background
+    page = page + "; color: " + design.body_color
+    page = page + "; border-color: " + design.accent + ";"
+    val title = design.selector + " .slide-title color: " + design.title_color + ";"
+    page + "\n" + title + "\n" + slide_outline_style_css(design.outline_style)
+
+fn presentation_designs(pres: Presentation, accent: text, outline_text_transform: text) -> [SlidePageDesign]:
+    var designs: [SlidePageDesign] = []
+    var idx = 0
+    for slide in pres.slides:
+        val selector = ".slide-page-" + idx.to_text()
+        val background = if idx % 2 == 0 then slide.background else: "#F8FAFC"
+        val title_color = if idx % 2 == 0 then "#111827" else: "#0F766E"
+        designs.push(slide_page_design(slide.id, selector, background, title_color, "#374151", accent, outline_text_transform))
+        idx = idx + 1
+    designs
+
+fn presentation_design_css(pres: Presentation, accent: text, outline_text_transform: text) -> text:
+    var chunks: [text] = []
+    for design in presentation_designs(pres, accent, outline_text_transform):
+        chunks.push(slide_page_design_css(design))
+    chunks.join("\n")

@@ -1,0 +1,72 @@
+# Markdown Dispatch Glue
+#
+# Translates MdCommandResult into EditorBuffer mutations and routes
+# vim motion combos to the md_vim_motions library.
+
+use std.editor.services.md_wiki_index.*
+
+fn md_apply_result(buffer: EditorBuffer, result: MdCommandResult):
+    if result.replace_line != "":
+        val row = buffer.cursor_row
+        val old_line = buffer.line_at(row)
+        buffer.move_to_line_start()
+        var i = 0
+        while i < old_line.len():
+            buffer.delete_at_cursor()
+            i = i + 1
+        buffer.insert_at_cursor(result.replace_line)
+    if result.insert_text != "":
+        buffer.insert_at_cursor(result.insert_text)
+    if result.cursor_delta_line != 0 or result.cursor_delta_col != 0:
+        buffer.move_relative(result.cursor_delta_line, result.cursor_delta_col)
+
+fn md_buffer_content(buffer: EditorBuffer) -> text:
+    var content = ""
+    var i = 0
+    while i < buffer.line_count():
+        if i > 0:
+            content = content + "\n"
+        content = content + buffer.line_at(i)
+        i = i + 1
+    content
+
+fn md_dispatch_motion(prefix: text, key: text, content: text, cursor_line: i64, cursor_col: i64) -> MdMotionResult:
+    if prefix == "]" and key == "]":
+        return md_vim_next_heading(content, cursor_line)
+    if prefix == "[" and key == "[":
+        return md_vim_prev_heading(content, cursor_line)
+    if prefix == "]" and key == "h":
+        return md_vim_next_sibling_heading(content, cursor_line)
+    if prefix == "[" and key == "h":
+        return md_vim_prev_sibling_heading(content, cursor_line)
+    if prefix == "[" and key == "p":
+        return md_vim_parent_heading(content, cursor_line)
+    if prefix == "]" and key == "l":
+        return md_vim_next_link(content, cursor_line, cursor_col)
+    if prefix == "[" and key == "l":
+        return md_vim_prev_link(content, cursor_line, cursor_col)
+    if prefix == "]" and key == "c":
+        return md_vim_next_code_block(content, cursor_line)
+    if prefix == "[" and key == "c":
+        return md_vim_prev_code_block(content, cursor_line)
+    MdMotionResult(line: cursor_line, col: cursor_col, found: false)
+
+fn md_update_preview(doc: EditorDocument, buffer: EditorBuffer):
+    if doc.md_state == nil:
+        return
+    if not doc.md_state.preview_visible:
+        return
+    val content = md_buffer_content(buffer)
+    val updated = preview_pane_update_for_cursor(doc.md_state.preview, content, buffer.cursor_row)
+    if updated.viewport_start < 0:
+        print ""
+
+fn md_update_preview_with_wiki(doc: EditorDocument, buffer: EditorBuffer, wiki_index: MdWikiIndex):
+    if doc.md_state == nil:
+        return
+    if not doc.md_state.preview_visible:
+        return
+    val content = md_buffer_content(buffer)
+    val updated = preview_pane_update_with_wiki_for_cursor(doc.md_state.preview, content, wiki_index, buffer.cursor_row)
+    if updated.viewport_start < 0:
+        print ""

@@ -1,0 +1,545 @@
+# Editor Commands
+#
+# Table-driven command dispatch for the editor.
+# Session-level commands (tabs, files) and buffer-level commands (movement, editing).
+
+use std.editor.buffer.buffer.*
+use std.editor.core.session.*
+use std.editor.services.md_diagnostics.*
+use std.editor.services.command_palette.*
+use app.editor.desktop_commands.*
+
+fn editor_dispatch_session(session: EditSession, cmd: EditCommand) -> EditResult:
+    match cmd.name:
+        "open-file":
+            if cmd.payload == "":
+                return edit_fail("usage: :e <path>")
+            session.open_file(cmd.payload)
+            val p = cmd.payload
+            edit_ok("opened {p}")
+        "tab-next":
+            session.switch_tab(1)
+            edit_ok("next tab")
+        "tab-prev":
+            session.switch_tab(0 - 1)
+            edit_ok("prev tab")
+        "tab-close":
+            session.close_tab()
+            edit_ok("tab closed")
+        "split-vertical":
+            session.split_editor()
+            edit_ok("split vertical")
+        "split-horizontal":
+            session.split_editor_horizontal()
+            edit_ok("split horizontal")
+        "close-other-groups":
+            session.close_other_groups()
+            edit_ok("only")
+        "resize-grow":
+            session.layout.tree.resize(session.layout.active_group_id, 5)
+            edit_ok("resize grow")
+        "resize-shrink":
+            session.layout.tree.resize(session.layout.active_group_id, 0 - 5)
+            edit_ok("resize shrink")
+        "focus-next":
+            session.focus_next_group()
+            edit_ok("focus next")
+        "focus-prev":
+            session.focus_prev_group()
+            edit_ok("focus prev")
+        "save":
+            val ok = session.save_active()
+            if ok:
+                val doc_save = session.active_document()
+                if doc_save != nil and doc_save.language_id == "markdown":
+                    val buf_save = session.active_buffer()
+                    if buf_save != nil:
+                        val save_content = md_buffer_content(buf_save)
+                        val diags = md_diagnose(save_content, doc_save.path())
+                        val dcount = diags.len()
+                        if dcount > 0:
+                            return edit_ok("saved ({dcount} diagnostics)")
+                edit_ok("saved")
+            else:
+                edit_fail("save failed")
+        "open-dialog":
+            val path = editor_open_file_dialog()
+            if path != "":
+                session.open_file(path)
+                edit_ok("opened dialog file")
+            else:
+                edit_ok("cancelled")
+        "save-dialog":
+            val buffer_sd = session.active_buffer()
+            if buffer_sd == nil:
+                return edit_fail("no file open")
+            val save_path = editor_save_file_dialog()
+            if save_path != "":
+                buffer_sd.save_as(save_path)
+                edit_ok("saved as dialog file")
+            else:
+                edit_ok("cancelled")
+        "clipboard-copy":
+            val buffer_cc = session.active_buffer()
+            if buffer_cc == nil:
+                return edit_fail("no file open")
+            val row_cc = buffer_cc.cursor_row_value()
+            val line_cc = buffer_cc.line_at(row_cc)
+            editor_clipboard_copy(line_cc)
+            edit_ok("copied")
+        "clipboard-paste":
+            val buffer_cp = session.active_buffer()
+            if buffer_cp == nil:
+                return edit_fail("no file open")
+            val paste_text = editor_clipboard_paste()
+            if paste_text != "":
+                buffer_cp.insert_at_cursor(paste_text)
+            edit_ok("pasted")
+        "quit":
+            edit_quit()
+        "force-quit":
+            edit_quit()
+        _:
+            val buffer = session.active_buffer()
+            if buffer == nil:
+                return edit_fail("no file open")
+            editor_dispatch(buffer, cmd)
+
+fn editor_dispatch(buffer: EditorBuffer, cmd: EditCommand) -> EditResult:
+    match cmd.name:
+        "move-left":
+            buffer.move_relative(0, 0 - cmd.count)
+            edit_ok("left")
+        "move-right":
+            buffer.move_relative(0, cmd.count)
+            edit_ok("right")
+        "move-up":
+            buffer.move_relative(0 - cmd.count, 0)
+            edit_ok("up")
+        "move-down":
+            buffer.move_relative(cmd.count, 0)
+            edit_ok("down")
+        "move-line-start":
+            buffer.move_to_line_start()
+            edit_ok("home")
+        "move-line-end":
+            buffer.move_to_line_end()
+            edit_ok("end")
+        "move-file-top":
+            buffer.move_cursor(0, 0)
+            edit_ok("top")
+        "move-file-bottom":
+            buffer.move_cursor(buffer.line_count() - 1, 0)
+            edit_ok("bottom")
+        "insert-text":
+            buffer.insert_at_cursor(cmd.payload)
+            edit_ok("inserted")
+        "newline":
+            buffer.insert_at_cursor("\n")
+            edit_ok("newline")
+        "backspace":
+            buffer.delete_before_cursor()
+            edit_ok("backspace")
+        "delete":
+            buffer.delete_at_cursor()
+            edit_ok("delete")
+        "undo":
+            buffer.undo()
+            edit_ok("undo")
+        "redo":
+            buffer.redo()
+            edit_ok("redo")
+        "save":
+            val ok = buffer.save()
+            if ok:
+                val bp = buffer.path
+                edit_ok("saved {bp}")
+            else:
+                edit_fail("save failed")
+        "save-as":
+            val ok = buffer.save_as(cmd.payload)
+            if ok:
+                val sp = cmd.payload
+                edit_ok("saved {sp}")
+            else:
+                edit_fail("save failed")
+        "quit":
+            edit_quit()
+        "force-quit":
+            edit_quit()
+        _:
+            val cn = cmd.name
+            edit_fail("unknown command: {cn}")
+
+fn editor_cmd(name: text) -> EditCommand:
+    EditCommand(name: name, payload: "", count: 1)
+
+fn editor_cmd_with(name: text, payload: text) -> EditCommand:
+    EditCommand(name: name, payload: payload, count: 1)
+
+fn editor_cmd_count(name: text, count: i64) -> EditCommand:
+    EditCommand(name: name, payload: "", count: count)
+
+fn editor_parse_commandline(line: text) -> EditCommand:
+    val trimmed = line.trim()
+    if trimmed == "w":
+        return editor_cmd("save")
+    if trimmed == "q":
+        return editor_cmd("quit")
+    if trimmed == "q!":
+        return editor_cmd("force-quit")
+    if trimmed == "wq":
+        return editor_cmd("save")
+    if trimmed.starts_with("w "):
+        return editor_cmd_with("save-as", trimmed.slice(2, trimmed.len()).trim())
+    if trimmed.starts_with("e "):
+        return editor_cmd_with("open-file", trimmed.slice(2, trimmed.len()).trim())
+    if trimmed.starts_with("edit "):
+        return editor_cmd_with("open-file", trimmed.slice(5, trimmed.len()).trim())
+    if trimmed == "bn" or trimmed == "tabn":
+        return editor_cmd("tab-next")
+    if trimmed == "bp" or trimmed == "tabp":
+        return editor_cmd("tab-prev")
+    if trimmed == "bd" or trimmed == "tabc":
+        return editor_cmd("tab-close")
+    if trimmed == "vs" or trimmed == "vsplit":
+        return editor_cmd("split-vertical")
+    if trimmed == "sp" or trimmed == "split":
+        return editor_cmd("split-horizontal")
+    if trimmed == "only":
+        return editor_cmd("close-other-groups")
+    if trimmed == "open":
+        return editor_cmd("open-dialog")
+    if trimmed == "saveas":
+        return editor_cmd("save-dialog")
+    if trimmed == "settings":
+        return editor_cmd("settings")
+    if trimmed == "palette":
+        return editor_cmd("palette")
+    if trimmed == "preview":
+        return editor_cmd("preview")
+    if trimmed == "outline":
+        return editor_cmd("outline")
+    if trimmed == "quickfix":
+        return editor_cmd("quickfix")
+    if trimmed == "quickfix-apply":
+        return editor_cmd("quickfix-apply")
+    if trimmed == "problems":
+        return editor_cmd("problems")
+    if trimmed.starts_with("diagnostics-filter "):
+        return editor_cmd_with("diagnostics-filter", trimmed.slice(19, trimmed.len()).trim())
+    if trimmed.starts_with("diagnostics-group "):
+        return editor_cmd_with("diagnostics-group", trimmed.slice(18, trimmed.len()).trim())
+    if trimmed.starts_with("diagnostics-sort "):
+        return editor_cmd_with("diagnostics-sort", trimmed.slice(17, trimmed.len()).trim())
+    if trimmed == "completion" or trimmed == "suggest":
+        return editor_cmd("completion")
+    if trimmed == "hover":
+        return editor_cmd("hover")
+    if trimmed == "hover-dismiss":
+        return editor_cmd("hover-dismiss")
+    if trimmed == "definition" or trimmed == "goto-definition":
+        return editor_cmd("definition")
+    if trimmed == "code-action":
+        return editor_cmd("code-action")
+    if trimmed == "references":
+        return editor_cmd("references")
+    if trimmed == "selection-ranges" or trimmed == "selection-range":
+        return editor_cmd("selection-ranges")
+    if trimmed == "selection-expand" or trimmed == "expand-selection":
+        return editor_cmd("selection-expand")
+    if trimmed == "selection-shrink" or trimmed == "shrink-selection":
+        return editor_cmd("selection-shrink")
+    if trimmed == "selection-apply-all":
+        return editor_cmd("selection-apply-all")
+    if trimmed == "document-symbols":
+        return editor_cmd("document-symbols")
+    if trimmed == "prepare-rename":
+        return editor_cmd("prepare-rename")
+    if trimmed.starts_with("rename-preview "):
+        return editor_cmd_with("rename-preview", trimmed.slice(15, trimmed.len()).trim())
+    if trimmed == "rename-confirm":
+        return editor_cmd("rename-confirm")
+    if trimmed == "workspace-edit-cancel" or trimmed == "rename-cancel" or trimmed == "formatting-cancel":
+        return editor_cmd("workspace-edit-cancel")
+    if trimmed.starts_with("rename "):
+        return editor_cmd_with("rename", trimmed.slice(7, trimmed.len()).trim())
+    if trimmed == "formatting" or trimmed == "format":
+        return editor_cmd("formatting")
+    if trimmed == "formatting-preview" or trimmed == "format-preview":
+        return editor_cmd("formatting-preview")
+    if trimmed == "formatting-save" or trimmed == "format-save":
+        return editor_cmd("formatting-save")
+    if trimmed == "range-formatting" or trimmed == "range-format":
+        return editor_cmd("range-formatting")
+    if trimmed == "range-formatting-preview" or trimmed == "range-format-preview":
+        return editor_cmd("range-formatting-preview")
+    if trimmed == "range-formatting-save" or trimmed == "range-format-save":
+        return editor_cmd("range-formatting-save")
+    if trimmed == "signature-help":
+        return editor_cmd("signature-help")
+    if trimmed == "signature-next":
+        return editor_cmd("signature-next")
+    if trimmed == "signature-prev":
+        return editor_cmd("signature-prev")
+    if trimmed == "signature-dismiss":
+        return editor_cmd("signature-dismiss")
+    if trimmed == "document-links":
+        return editor_cmd("document-links")
+    if trimmed == "open-link":
+        return editor_cmd("open-link")
+    if trimmed == "folding-ranges":
+        return editor_cmd("folding-ranges")
+    if trimmed == "fold-all":
+        return editor_cmd("fold-all")
+    if trimmed == "unfold-all":
+        return editor_cmd("unfold-all")
+    if trimmed == "fold-toggle":
+        return editor_cmd("fold-toggle")
+    if trimmed == "callout-fold-toggle" or trimmed == "callout-toggle":
+        return editor_cmd("callout-fold-toggle")
+    if trimmed.starts_with("workspace-symbols "):
+        return editor_cmd_with("workspace-symbols", trimmed.slice(18, trimmed.len()).trim())
+    if trimmed == "workspace-symbols":
+        return editor_cmd("workspace-symbols")
+    if trimmed == "semantic-tokens":
+        return editor_cmd("semantic-tokens")
+    if trimmed == "inlay-hints":
+        return editor_cmd("inlay-hints")
+    if trimmed == "code-lens":
+        return editor_cmd("code-lens")
+    if trimmed == "code-lens-run":
+        return editor_cmd("code-lens-run")
+    if trimmed.starts_with("code-lens-resolve "):
+        return editor_cmd_with("code-lens-resolve", trimmed.slice(18, trimmed.len()).trim())
+    if trimmed == "call-hierarchy":
+        return editor_cmd("call-hierarchy")
+    if trimmed.starts_with("call-hierarchy-incoming "):
+        return editor_cmd_with("call-hierarchy-incoming", trimmed.slice(24, trimmed.len()).trim())
+    if trimmed.starts_with("call-hierarchy-outgoing "):
+        return editor_cmd_with("call-hierarchy-outgoing", trimmed.slice(24, trimmed.len()).trim())
+    if trimmed == "lsp-jump":
+        return editor_cmd("lsp-jump")
+    if trimmed == "lsp-back" or trimmed == "definition-back":
+        return editor_cmd("lsp-back")
+    if trimmed == "keyboard-shortcuts" or trimmed == "shortcuts":
+        return editor_cmd("keyboard-shortcuts")
+    if trimmed == "debug-start" or trimmed == "debug":
+        return editor_cmd("debug-start")
+    if trimmed == "debug-process-start" or trimmed == "debug-process":
+        return editor_cmd("debug-process-start")
+    if trimmed == "debug-configs" or trimmed == "debug-select":
+        return editor_cmd("debug-configs")
+    if trimmed == "debug-console" or trimmed == "debug-session":
+        return editor_cmd("debug-console")
+    if trimmed == "debug-sessions":
+        return editor_cmd("debug-sessions")
+    if trimmed.starts_with("debug-configs "):
+        return editor_cmd_with("debug-configs", trimmed.slice(14, trimmed.len()).trim())
+    if trimmed.starts_with("debug-start "):
+        return editor_cmd_with("debug-start", trimmed.slice(12, trimmed.len()).trim())
+    if trimmed.starts_with("debug-process-start "):
+        return editor_cmd_with("debug-process-start", trimmed.slice(20, trimmed.len()).trim())
+    if trimmed.starts_with("debug "):
+        return editor_cmd_with("debug-start", trimmed.slice(6, trimmed.len()).trim())
+    if trimmed.starts_with("debug-switch "):
+        return editor_cmd_with("debug-switch", trimmed.slice(13, trimmed.len()).trim())
+    if trimmed == "debug-restart" or trimmed == "restart-debug":
+        return editor_cmd("debug-restart")
+    if trimmed == "debug-continue" or trimmed == "continue-debug":
+        return editor_cmd("debug-continue")
+    if trimmed == "debug-pause" or trimmed == "pause-debug":
+        return editor_cmd("debug-pause")
+    if trimmed == "debug-step-over":
+        return editor_cmd_with("debug-step", "stepOver")
+    if trimmed == "debug-step-into":
+        return editor_cmd_with("debug-step", "stepIn")
+    if trimmed == "debug-step-out":
+        return editor_cmd_with("debug-step", "stepOut")
+    if trimmed == "debug-terminate" or trimmed == "stop-debug":
+        return editor_cmd("debug-terminate")
+    if trimmed.starts_with("debug-exceptions "):
+        return editor_cmd_with("debug-exceptions", trimmed.slice(17, trimmed.len()).trim())
+    if trimmed.starts_with("debug-watch "):
+        return editor_cmd_with("debug-watch", trimmed.slice(12, trimmed.len()).trim())
+    if trimmed.starts_with("debug-evaluate "):
+        return editor_cmd_with("debug-evaluate", trimmed.slice(15, trimmed.len()).trim())
+    if trimmed.starts_with("daily-note-create "):
+        return editor_cmd_with("daily-note-create", trimmed.slice(18, trimmed.len()).trim())
+    if trimmed.starts_with("daily-note-picker "):
+        return editor_cmd_with("daily-note-picker", trimmed.slice(18, trimmed.len()).trim())
+    if trimmed == "daily-note-picker":
+        return editor_cmd("daily-note-picker")
+    if trimmed.starts_with("template-insert "):
+        return editor_cmd_with("template-insert", trimmed.slice(16, trimmed.len()).trim())
+    if trimmed.starts_with("template-picker "):
+        return editor_cmd_with("template-picker", trimmed.slice(16, trimmed.len()).trim())
+    if trimmed.starts_with("wiki-embed-insert "):
+        return editor_cmd_with("wiki-embed-insert", trimmed.slice(18, trimmed.len()).trim())
+    if trimmed.starts_with("attachment-insert "):
+        return editor_cmd_with("attachment-insert", trimmed.slice(18, trimmed.len()).trim())
+    if trimmed.starts_with("attachment-picker "):
+        return editor_cmd_with("attachment-picker", trimmed.slice(18, trimmed.len()).trim())
+    if trimmed == "wiki-backlinks":
+        return editor_cmd("wiki-backlinks")
+    if trimmed == "wiki-tasks":
+        return editor_cmd_with("wiki-tasks", "open")
+    if trimmed.starts_with("wiki-tasks "):
+        return editor_cmd_with("wiki-tasks", trimmed.slice(11, trimmed.len()).trim())
+    if trimmed.starts_with("wiki-task-batch "):
+        return editor_cmd_with("wiki-task-batch", trimmed.slice(16, trimmed.len()).trim())
+    if trimmed.starts_with("wiki-vault-task-batch "):
+        return editor_cmd_with("wiki-vault-task-batch", trimmed.slice(22, trimmed.len()).trim())
+    if trimmed == "wiki-properties":
+        return editor_cmd("wiki-properties")
+    if trimmed.starts_with("wiki-property-set "):
+        return editor_cmd_with("wiki-property-set", trimmed.slice(18, trimmed.len()).trim())
+    if trimmed.starts_with("wiki-vault-property-set "):
+        return editor_cmd_with("wiki-vault-property-set", trimmed.slice(24, trimmed.len()).trim())
+    if trimmed.starts_with("wiki-vault-property-review "):
+        return editor_cmd_with("wiki-vault-property-review", trimmed.slice(27, trimmed.len()).trim())
+    if trimmed.starts_with("wiki-property-diagnostics "):
+        return editor_cmd_with("wiki-property-diagnostics", trimmed.slice(26, trimmed.len()).trim())
+    if trimmed.starts_with("wiki-tags "):
+        return editor_cmd_with("wiki-tags", trimmed.slice(10, trimmed.len()).trim())
+    if trimmed == "wiki-graph":
+        return editor_cmd("wiki-graph")
+    if trimmed.starts_with("wiki-quick-switch "):
+        return editor_cmd_with("wiki-quick-switch", trimmed.slice(18, trimmed.len()).trim())
+    if trimmed.starts_with("wiki-vault-search "):
+        return editor_cmd_with("wiki-vault-search", trimmed.slice(18, trimmed.len()).trim())
+    if trimmed == "markdown-table-row-insert" or trimmed == "table-row-insert":
+        return editor_cmd("markdown-table-row-insert")
+    if trimmed == "markdown-table-column-insert" or trimmed == "table-column-insert":
+        return editor_cmd("markdown-table-column-insert")
+    if trimmed == "markdown-table-cell-next" or trimmed == "table-cell-next":
+        return editor_cmd("markdown-table-cell-next")
+    if trimmed == "markdown-table-cell-prev" or trimmed == "markdown-table-cell-previous" or trimmed == "table-cell-prev" or trimmed == "table-cell-previous":
+        return editor_cmd("markdown-table-cell-prev")
+    editor_cmd_with("unknown", trimmed)
+
+fn editor_all_commands() -> [PaletteEntry]:
+    var cmds: [PaletteEntry] = []
+    cmds.push(PaletteEntry(name: "Open File", description: "Open a file by path", command_name: "open-file", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Save", description: "Save current file", command_name: "save", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Save As", description: "Save current file to a new path", command_name: "save-as", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Quit", description: "Quit the editor", command_name: "quit", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Force Quit", description: "Quit without saving", command_name: "force-quit", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Tab Next", description: "Switch to next tab", command_name: "tab-next", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Tab Prev", description: "Switch to previous tab", command_name: "tab-prev", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Tab Close", description: "Close current tab", command_name: "tab-close", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Split Vertical", description: "Split editor vertically", command_name: "split-vertical", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Split Horizontal", description: "Split editor horizontally", command_name: "split-horizontal", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Close Other Groups", description: "Close all groups except active", command_name: "close-other-groups", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Resize Grow", description: "Grow active split pane", command_name: "resize-grow", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Resize Shrink", description: "Shrink active split pane", command_name: "resize-shrink", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Focus Next", description: "Focus next editor group", command_name: "focus-next", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Focus Prev", description: "Focus previous editor group", command_name: "focus-prev", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Undo", description: "Undo last change", command_name: "undo", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Redo", description: "Redo last undone change", command_name: "redo", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Open Dialog", description: "Open file via OS dialog", command_name: "open-dialog", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Save As Dialog", description: "Save file via OS dialog", command_name: "save-dialog", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Copy", description: "Copy current line to clipboard", command_name: "clipboard-copy", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Paste", description: "Paste from clipboard", command_name: "clipboard-paste", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Move Up", description: "Move cursor up", command_name: "move-up", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Move Down", description: "Move cursor down", command_name: "move-down", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Move Left", description: "Move cursor left", command_name: "move-left", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Move Right", description: "Move cursor right", command_name: "move-right", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Go to Top", description: "Move to beginning of file", command_name: "move-file-top", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Go to Bottom", description: "Move to end of file", command_name: "move-file-bottom", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Line Start", description: "Move to beginning of line", command_name: "move-line-start", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Line End", description: "Move to end of line", command_name: "move-line-end", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Quick Fix", description: "Request code actions at the cursor", command_name: "quickfix", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Apply Quick Fix", description: "Apply the selected code action", command_name: "quickfix-apply", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Problems", description: "Show diagnostics and problems", command_name: "problems", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Filter Problems", description: "Filter diagnostics by severity and source", command_name: "diagnostics-filter", command_payload: "error|"))
+    cmds.push(PaletteEntry(name: "Group Problems", description: "Group diagnostics by severity or source", command_name: "diagnostics-group", command_payload: "severity"))
+    cmds.push(PaletteEntry(name: "Sort Problems", description: "Sort diagnostics by severity, source, or path", command_name: "diagnostics-sort", command_payload: "severity"))
+    cmds.push(PaletteEntry(name: "Trigger Suggest", description: "Request completions from the active language server", command_name: "completion", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Show Hover", description: "Request hover from the active language server", command_name: "hover", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Dismiss Hover", description: "Hide the active language-server hover popup", command_name: "hover-dismiss", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Go to Definition", description: "Request definition from the active language server", command_name: "definition", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Code Action", description: "Request code actions from the active language server", command_name: "code-action", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Find References", description: "Request references from the active language server", command_name: "references", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Selection Ranges", description: "Request language-server selection ranges at the cursor", command_name: "selection-ranges", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Expand Selection", description: "Apply the selected language-server selection range", command_name: "selection-expand", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Shrink Selection", description: "Apply the previous language-server selection range", command_name: "selection-shrink", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Apply All Selection Ranges", description: "Apply all language-server selection ranges as active selections", command_name: "selection-apply-all", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Document Symbols", description: "Request document symbols from the active language server", command_name: "document-symbols", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Prepare Rename", description: "Request rename range validation from the active language server", command_name: "prepare-rename", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Rename Symbol", description: "Rename the active symbol using the language server", command_name: "rename", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Preview Rename", description: "Preview language-server rename edits before applying", command_name: "rename-preview", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Confirm Rename", description: "Apply the pending rename preview edits", command_name: "rename-confirm", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Cancel Workspace Edit", description: "Discard the pending rename or formatting preview edits", command_name: "workspace-edit-cancel", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Format Document", description: "Request formatting edits from the active language server", command_name: "formatting", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Preview Format Document", description: "Preview formatting edits before applying", command_name: "formatting-preview", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Format Document and Save", description: "Apply language-server formatting edits and save the active file", command_name: "formatting-save", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Format Range", description: "Request range formatting edits from the active language server", command_name: "range-formatting", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Preview Format Range", description: "Preview range-formatting edits before applying", command_name: "range-formatting-preview", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Format Range and Save", description: "Apply range-formatting edits and save the active file", command_name: "range-formatting-save", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Signature Help", description: "Request signature help from the active language server", command_name: "signature-help", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Next Signature", description: "Select the next signature-help overload", command_name: "signature-next", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Previous Signature", description: "Select the previous signature-help overload", command_name: "signature-prev", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Dismiss Signature Help", description: "Hide the active signature-help popup", command_name: "signature-dismiss", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Document Links", description: "Request document links from the active language server", command_name: "document-links", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Open Link", description: "Open the Markdown link or wiki link under the cursor", command_name: "open-link", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Folding Ranges", description: "Request folding ranges from the active language server", command_name: "folding-ranges", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Fold All", description: "Fold all foldable ranges in the active document", command_name: "fold-all", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Unfold All", description: "Clear all folds in the active document", command_name: "unfold-all", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Toggle Fold", description: "Toggle the fold for the current Markdown section", command_name: "fold-toggle", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Toggle Callout Fold", description: "Toggle the folded state for the current Obsidian callout", command_name: "callout-fold-toggle", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Workspace Symbols", description: "Request workspace symbols from the active language server", command_name: "workspace-symbols", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Semantic Tokens", description: "Request semantic tokens from the active language server", command_name: "semantic-tokens", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Inlay Hints", description: "Request inlay hints from the active language server", command_name: "inlay-hints", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Code Lens", description: "Request code lens entries from the active language server", command_name: "code-lens", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Run Selected Code Lens", description: "Execute the selected code lens command", command_name: "code-lens-run", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Resolve Code Lens", description: "Resolve a code lens item JSON payload", command_name: "code-lens-resolve", command_payload: "{}"))
+    cmds.push(PaletteEntry(name: "Call Hierarchy", description: "Request call hierarchy roots from the active language server", command_name: "call-hierarchy", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Incoming Calls", description: "Request incoming calls for a call hierarchy item JSON payload", command_name: "call-hierarchy-incoming", command_payload: "{}"))
+    cmds.push(PaletteEntry(name: "Outgoing Calls", description: "Request outgoing calls for a call hierarchy item JSON payload", command_name: "call-hierarchy-outgoing", command_payload: "{}"))
+    cmds.push(PaletteEntry(name: "Jump to LSP Result", description: "Open the selected LSP result target", command_name: "lsp-jump", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Back from LSP Result", description: "Return to the previous LSP navigation location", command_name: "lsp-back", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Keyboard Shortcuts", description: "Show configured editor shortcuts", command_name: "keyboard-shortcuts", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Create Daily Note", description: "Create a daily Markdown note from a date payload", command_name: "daily-note-create", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Daily Note Picker", description: "Open a date picker for creating a daily Markdown note", command_name: "daily-note-picker", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Insert Template", description: "Insert a Markdown template into a target note", command_name: "template-insert", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Template Picker", description: "List Markdown templates and insert the selected template", command_name: "template-picker", command_payload: ".|||"))
+    cmds.push(PaletteEntry(name: "Insert Wiki Embed", description: "Insert an Obsidian-style note transclusion into a Markdown note", command_name: "wiki-embed-insert", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Insert Attachment", description: "Append an attachment embed to a Markdown note", command_name: "attachment-insert", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Attachment Picker", description: "List image and attachment candidates from a vault root", command_name: "attachment-picker", command_payload: ".|"))
+    cmds.push(PaletteEntry(name: "Wiki Backlinks", description: "Show backlinks for the active note", command_name: "wiki-backlinks", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Wiki Tasks", description: "Show open tasks across loaded notes", command_name: "wiki-tasks", command_payload: "open"))
+    cmds.push(PaletteEntry(name: "Wiki Done Tasks", description: "Show completed tasks across loaded notes", command_name: "wiki-tasks", command_payload: "done"))
+    cmds.push(PaletteEntry(name: "Mark All Tasks Done", description: "Mark all active-note Markdown tasks complete", command_name: "wiki-task-batch", command_payload: "done"))
+    cmds.push(PaletteEntry(name: "Mark All Tasks Open", description: "Mark all active-note Markdown tasks open", command_name: "wiki-task-batch", command_payload: "open"))
+    cmds.push(PaletteEntry(name: "Mark Vault Tasks Done", description: "Mark all Markdown tasks in a vault root complete", command_name: "wiki-vault-task-batch", command_payload: ".|done"))
+    cmds.push(PaletteEntry(name: "Mark Vault Tasks Open", description: "Mark all Markdown tasks in a vault root open", command_name: "wiki-vault-task-batch", command_payload: ".|open"))
+    cmds.push(PaletteEntry(name: "Wiki Properties", description: "Show frontmatter properties for the active note", command_name: "wiki-properties", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Set Wiki Property", description: "Set a frontmatter property on the active note", command_name: "wiki-property-set", command_payload: "status|active"))
+    cmds.push(PaletteEntry(name: "Set Vault Wiki Property", description: "Set a frontmatter property across Markdown notes in a vault root", command_name: "wiki-vault-property-set", command_payload: ".|status|active"))
+    cmds.push(PaletteEntry(name: "Review Vault Wiki Property", description: "Preview Markdown notes affected by a vault-wide property edit", command_name: "wiki-vault-property-review", command_payload: ".|status|active"))
+    cmds.push(PaletteEntry(name: "Validate Wiki Properties", description: "Validate active note frontmatter properties", command_name: "wiki-property-diagnostics", command_payload: "status|required|active,draft"))
+    cmds.push(PaletteEntry(name: "Wiki Tags", description: "Show loaded notes containing a tag", command_name: "wiki-tags", command_payload: "project"))
+    cmds.push(PaletteEntry(name: "Wiki Graph", description: "Show graph edges for the active note", command_name: "wiki-graph", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Wiki Quick Switch", description: "Find loaded wiki notes by title or path", command_name: "wiki-quick-switch", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Wiki Vault Search", description: "Search Markdown content across a vault root", command_name: "wiki-vault-search", command_payload: ".|query"))
+    cmds.push(PaletteEntry(name: "Insert Table Row", description: "Insert a Markdown table row after the current row", command_name: "markdown-table-row-insert", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Insert Table Column", description: "Insert a Markdown table column after the current cell", command_name: "markdown-table-column-insert", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Next Table Cell", description: "Move to the next Markdown table cell", command_name: "markdown-table-cell-next", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Previous Table Cell", description: "Move to the previous Markdown table cell", command_name: "markdown-table-cell-prev", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Start Debugging", description: "Start the configured debug adapter", command_name: "debug-start", command_payload: "simple"))
+    cmds.push(PaletteEntry(name: "Start Process Debugging", description: "Start the configured debug adapter through native stdio transport", command_name: "debug-process-start", command_payload: "simple"))
+    cmds.push(PaletteEntry(name: "Select Debug Configuration", description: "Pick a VSCode launch configuration before starting", command_name: "debug-configs", command_payload: "simple"))
+    cmds.push(PaletteEntry(name: "Debug Console", description: "Show the active debug session watches and console", command_name: "debug-console", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Debug Sessions", description: "Show and switch active debug sessions", command_name: "debug-sessions", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Restart Debugging", description: "Restart the active debug session", command_name: "debug-restart", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Continue Debugging", description: "Continue the active debug session", command_name: "debug-continue", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Pause Debugging", description: "Pause the active debug session", command_name: "debug-pause", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Step Over", description: "Step over in the active debug session", command_name: "debug-step", command_payload: "stepOver"))
+    cmds.push(PaletteEntry(name: "Step Into", description: "Step into in the active debug session", command_name: "debug-step", command_payload: "stepIn"))
+    cmds.push(PaletteEntry(name: "Step Out", description: "Step out in the active debug session", command_name: "debug-step", command_payload: "stepOut"))
+    cmds.push(PaletteEntry(name: "Terminate Debugging", description: "Terminate the active debug session", command_name: "debug-terminate", command_payload: ""))
+    cmds.push(PaletteEntry(name: "Exception Breakpoints", description: "Set exception breakpoint filters", command_name: "debug-exceptions", command_payload: "caught,uncaught"))
+    cmds.push(PaletteEntry(name: "Add Debug Watch", description: "Add a watch expression to the active debug session", command_name: "debug-watch", command_payload: "answer"))
+    cmds.push(PaletteEntry(name: "Evaluate Debug Expression", description: "Evaluate an expression in the active debug session", command_name: "debug-evaluate", command_payload: "answer"))
+    cmds

@@ -1,0 +1,542 @@
+# Editor TUI Shell — Panels & Chrome
+#
+# Panel rendering, tab bar, file tree, split borders, settings, cursor,
+# command line, and palette. Split from tui_shell.spl for size.
+
+use std.tui.terminal.*
+use std.tui.style.*
+use std.editor.services.diagnostics.*
+use std.editor.extensions.builtin.md_edit_assist.*
+use std.editor.view.diagnostics_panel.*
+use std.editor.view.lsp_result_panel.*
+use std.editor.view.wiki_panel.*
+use std.editor.view.file_tree.*
+use std.editor.view.settings_view.*
+use std.editor.services.command_palette.*
+use std.editor.common.config.*
+use std.editor.core.session.{EditSession}
+use std.editor.core.path_text.{editor_path_basename}
+
+
+fn _tui_render_command_line(ctrl: EditorController, zones: LayoutZones):
+    terminal_move_cursor(zones.command_y, 0)
+    if ctrl.session.mode == EditorMode.Command:
+        terminal_write(":" + ctrl.commandline)
+    else:
+        terminal_write(ctrl.status_msg)
+
+
+fn _tui_render_cursor(ctrl: EditorController, buffer: EditorBuffer, zones: LayoutZones, line_num_width: i64):
+    if buffer != nil:
+        if ctrl.focus_panel == "editor":
+            val cursor_screen_row = buffer.cursor_row - buffer.viewport.top_row + zones.editor_y
+            val cursor_screen_col = buffer.cursor_col - buffer.viewport.left_col + line_num_width + 1 + zones.editor_x
+            terminal_move_cursor(cursor_screen_row, cursor_screen_col)
+    terminal_show_cursor()
+
+
+fn _tui_render_tab_bar(session: EditSession, width: i64):
+    terminal_move_cursor(0, 0)
+    val group_idx = _layout_find_group_index_local(session.layout.groups, session.layout.active_group_id)
+    if group_idx < 0 or group_idx >= session.layout.groups.len():
+        var empty_bar = ""
+        var ei = 0
+        while ei < width:
+            empty_bar = empty_bar + " "
+            ei = ei + 1
+        terminal_write("\x1b[7m" + empty_bar + "\x1b[0m")
+        return
+    val group = session.layout.groups[group_idx]
+    var tab_line = ""
+    var t = 0
+    while t < group.tabs.len():
+        val tab = group.tabs[t]
+        val doc_idx = session._find_doc_index(tab.doc_id)
+        var label = "[No Name]"
+        if doc_idx >= 0:
+            val tab_path = session.documents[doc_idx].path()
+            if tab_path != "":
+                label = editor_path_basename(tab_path)
+        var dirty = ""
+        if doc_idx >= 0:
+            val doc = session.documents[doc_idx]
+            if doc.buffer.dirty:
+                dirty = "[+]"
+        val entry = " " + label + dirty + " "
+        if t == group.active_tab_index:
+            tab_line = tab_line + "\x1b[1;7m" + entry + "\x1b[0m"
+        else:
+            tab_line = tab_line + "\x1b[2m" + entry + "\x1b[0m"
+        if t < group.tabs.len() - 1:
+            tab_line = tab_line + "|"
+        t = t + 1
+    terminal_write(tab_line)
+
+
+fn _tui_render_file_tree(file_tree: FileTreeState, start_row: i64, height: i64, width: i64, focused: bool):
+    val visible: [FileTreeVisibleNode] = file_tree.visible_nodes()
+    var row = 0
+    while row < height:
+        terminal_move_cursor(start_row + row, 0)
+        if row < visible.len():
+            val node: FileTreeVisibleNode = visible[row]
+            var indent = ""
+            var d = 0
+            while d < node.depth:
+                indent = indent + "  "
+                d = d + 1
+            val prefix = if node.is_dir then (if node.expanded then "v " else: "> ") else: "  "
+            val name = node.name
+            var line = indent + prefix + name
+            if line.len() > width - 1:
+                line = line.slice(0, width - 1)
+            var pad = ""
+            var pi = 0
+            while pi < width - 1 - line.len():
+                pad = pad + " "
+                pi = pi + 1
+            if row == file_tree.selected_index:
+                if focused:
+                    terminal_write("\x1b[7m" + line + pad + "\x1b[0m")
+                else:
+                    terminal_write("\x1b[2;7m" + line + pad + "\x1b[0m")
+            else:
+                terminal_write(line + pad)
+        else:
+            var blank = ""
+            var bi = 0
+            while bi < width - 1:
+                blank = blank + " "
+                bi = bi + 1
+            terminal_write(blank)
+        row = row + 1
+    var sep_row = 0
+    while sep_row < height:
+        terminal_move_cursor(start_row + sep_row, width - 1)
+        terminal_write("\x1b[2m|\x1b[0m")
+        sep_row = sep_row + 1
+
+
+fn _tui_render_split_borders(tree: SplitTree, rects: [SplitRect], active_group_id: i64, area_x: i64, area_y: i64, area_w: i64, area_h: i64):
+    if rects.len() <= 1:
+        return
+    var i = 0
+    while i < rects.len():
+        val left = rects[i]
+        var j = i + 1
+        while j < rects.len():
+            val right = rects[j]
+            if left.x + left.w == right.x:
+                _tui_render_vertical_split_border(left.x + left.w - 1, _tui_max_i64(left.y, right.y), _tui_min_i64(left.y + left.h, right.y + right.h), right.group_id == active_group_id)
+            elif right.x + right.w == left.x:
+                _tui_render_vertical_split_border(right.x + right.w - 1, _tui_max_i64(left.y, right.y), _tui_min_i64(left.y + left.h, right.y + right.h), left.group_id == active_group_id)
+            if left.y + left.h == right.y:
+                _tui_render_horizontal_split_border(_tui_max_i64(left.x, right.x), left.y + left.h - 1, _tui_min_i64(left.x + left.w, right.x + right.w), right.group_id == active_group_id)
+            elif right.y + right.h == left.y:
+                _tui_render_horizontal_split_border(_tui_max_i64(left.x, right.x), right.y + right.h - 1, _tui_min_i64(left.x + left.w, right.x + right.w), left.group_id == active_group_id)
+            j = j + 1
+        i = i + 1
+
+fn _tui_render_vertical_split_border(x: i64, y_start: i64, y_end: i64, active: bool):
+    var y = y_start
+    while y < y_end:
+        terminal_move_cursor(y, x)
+        if active:
+            terminal_write("\x1b[1m|\x1b[0m")
+        else:
+            terminal_write("\x1b[2m|\x1b[0m")
+        y = y + 1
+
+fn _tui_render_horizontal_split_border(x_start: i64, y: i64, x_end: i64, active: bool):
+    var x = x_start
+    while x < x_end:
+        terminal_move_cursor(y, x)
+        if active:
+            terminal_write("\x1b[1m-\x1b[0m")
+        else:
+            terminal_write("\x1b[2m-\x1b[0m")
+        x = x + 1
+
+fn _tui_min_i64(a: i64, b: i64) -> i64:
+    if a < b:
+        return a
+    b
+
+fn _tui_max_i64(a: i64, b: i64) -> i64:
+    if a > b:
+        return a
+    b
+
+fn _tui_render_pane_tabs(group: EditorGroup, rect: SplitRect, is_active: bool):
+    terminal_move_cursor(rect.y, rect.x)
+    var tab_line = ""
+    var t = 0
+    while t < group.tabs.len():
+        val tab = group.tabs[t]
+        val label = "#" + tab.doc_id.to_text()
+        val entry = " " + label + " "
+        if t == group.active_tab_index:
+            if is_active:
+                tab_line = tab_line + "\x1b[1;7m" + entry + "\x1b[0m"
+            else:
+                tab_line = tab_line + "\x1b[7m" + entry + "\x1b[0m"
+        else:
+            tab_line = tab_line + "\x1b[2m" + entry + "\x1b[0m"
+        if t < group.tabs.len() - 1:
+            tab_line = tab_line + "|"
+        t = t + 1
+    var pad = ""
+    var pi = 0
+    while pi < rect.w - tab_line.len():
+        pad = pad + " "
+        pi = pi + 1
+    terminal_write(tab_line + pad)
+
+fn _tui_render_pane_content(buffer: EditorBuffer, x: i64, y: i64, w: i64, h: i64, line_num_width: i64, path: text, diagnostics: [EditorDiagnostic], theme: text):
+    var row = 0
+    while row < h:
+        terminal_move_cursor(y + row, x)
+        if buffer != nil:
+            val file_row = buffer.visible_line_at(row)
+            if file_row >= 0 and file_row < buffer.line_count():
+                val num_str = str(file_row + 1)
+                var padding = ""
+                var p = 0
+                while p < line_num_width - num_str.len():
+                    padding = padding + " "
+                    p = p + 1
+                val gutter = diagnostics_gutter_icon(diagnostics, path, file_row)
+                terminal_write(padding + num_str + gutter + " ")
+                val line = buffer.line_with_fold_marker(file_row)
+                val vis_start = buffer.viewport.left_col
+                val vis_end = vis_start + w - line_num_width - 2
+                if vis_start < line.len():
+                    val end_idx = if vis_end < line.len() then vis_end else: line.len()
+                    val visible_line = line.slice(vis_start, end_idx)
+                    terminal_write(tui_render_editor_line_at_theme(buffer, file_row, visible_line, vis_start, theme, path))
+            else:
+                terminal_write("~")
+        else:
+            terminal_write("~")
+        row = row + 1
+
+fn _layout_find_group_index_local(groups: [EditorGroup], group_id: i64) -> i64:
+    var i = 0
+    while i < groups.len():
+        if groups[i].id == group_id:
+            return i
+        i = i + 1
+    -1
+
+fn _tui_render_settings(ctrl: EditorController, zones: LayoutZones):
+    val sv = ctrl.settings_view
+    val left_w = 20
+    val right_x = left_w + 1
+    val right_w = zones.editor_w - left_w - 1
+    val area_y = zones.editor_y
+    val area_h = zones.editor_h
+
+    # left column: category list
+    var row = 0
+    while row < area_h:
+        terminal_move_cursor(area_y + row, zones.editor_x)
+        if row < sv.categories.len():
+            val cat = sv.categories[row]
+            var line = " " + cat
+            if line.len() > left_w:
+                line = line.slice(0, left_w)
+            var pad = ""
+            var pi = 0
+            while pi < left_w - line.len():
+                pad = pad + " "
+                pi = pi + 1
+            if row == sv.category_index:
+                terminal_write("\x1b[7m" + line + pad + "\x1b[0m")
+            else:
+                terminal_write(line + pad)
+        else:
+            var blank = ""
+            var bi = 0
+            while bi < left_w:
+                blank = blank + " "
+                bi = bi + 1
+            terminal_write(blank)
+        terminal_move_cursor(area_y + row, zones.editor_x + left_w)
+        terminal_write("\x1b[2m|\x1b[0m")
+        row = row + 1
+
+    # right column: filtered settings list
+    var srow = 0
+    while srow < area_h:
+        terminal_move_cursor(area_y + srow, zones.editor_x + right_x)
+        if srow < sv.filtered.len():
+            val sd = sv.filtered[srow]
+            val cur_val = editor_config_get_by_key(ctrl.config, sd.key)
+            var entry = " " + sd.label + ": " + cur_val
+            if entry.len() > right_w - 1:
+                entry = entry.slice(0, right_w - 1)
+            var epad = ""
+            var epi = 0
+            while epi < right_w - 1 - entry.len():
+                epad = epad + " "
+                epi = epi + 1
+            if srow == sv.selected_index:
+                if sv.editing:
+                    val edit_line = " " + sd.label + ": [" + sv.edit_value + "]"
+                    terminal_write("\x1b[1;7m" + edit_line + "\x1b[0m")
+                else:
+                    terminal_write("\x1b[7m" + entry + epad + "\x1b[0m")
+                # show description below if space
+                if area_y + srow + 1 < area_y + area_h:
+                    terminal_move_cursor(area_y + srow + 1, zones.editor_x + right_x)
+                    val desc = "   " + sd.description
+                    terminal_write("\x1b[2m" + desc + "\x1b[0m")
+            else:
+                terminal_write(entry + epad)
+        else:
+            var sblank = ""
+            var sbi = 0
+            while sbi < right_w - 1:
+                sblank = sblank + " "
+                sbi = sbi + 1
+            terminal_write(sblank)
+        srow = srow + 1
+
+fn _group_active_buffer(session: EditSession, group_idx: i64) -> EditorBuffer:
+    if group_idx < 0 or group_idx >= session.layout.groups.len():
+        return nil
+    val group = session.layout.groups[group_idx]
+    if group.tabs.len() == 0:
+        return nil
+    if group.active_tab_index < 0 or group.active_tab_index >= group.tabs.len():
+        return nil
+    val tab = group.tabs[group.active_tab_index]
+    val doc_idx = session._find_doc_index(tab.doc_id)
+    if doc_idx < 0:
+        return nil
+    session.documents[doc_idx].buffer
+
+fn _group_active_path(session: EditSession, group_idx: i64) -> text:
+    if group_idx < 0 or group_idx >= session.layout.groups.len():
+        return ""
+    val group = session.layout.groups[group_idx]
+    if group.tabs.len() == 0:
+        return ""
+    if group.active_tab_index < 0 or group.active_tab_index >= group.tabs.len():
+        return ""
+    val tab = group.tabs[group.active_tab_index]
+    val doc_idx = session._find_doc_index(tab.doc_id)
+    if doc_idx < 0:
+        return ""
+    session.documents[doc_idx].path()
+
+
+fn _tui_render_preview_pane(preview: PreviewPane, buffer: EditorBuffer, x: i64, y: i64, w: i64, h: i64):
+    var sep_row = 0
+    while sep_row < h:
+        terminal_move_cursor(y + sep_row, x)
+        terminal_write("\x1b[2m|\x1b[0m")
+        sep_row = sep_row + 1
+    val content_x = x + 1
+    val content_w = w - 1
+    terminal_move_cursor(y, content_x)
+    var header = " Preview "
+    var hpad = ""
+    var hp = 0
+    while hp < content_w - header.len():
+        hpad = hpad + "-"
+        hp = hp + 1
+    terminal_write("\x1b[1;36m" + header + hpad + "\x1b[0m")
+    val lines = preview_pane_render_for_editor(preview, buffer, h - 1)
+    var row = 0
+    while row < h - 1:
+        terminal_move_cursor(y + 1 + row, content_x)
+        if row < lines.len():
+            val line = lines[row]
+            val visible_len = content_w
+            if line.len() > visible_len:
+                terminal_write(line.slice(0, visible_len))
+            else:
+                terminal_write(line)
+        row = row + 1
+
+
+fn _tui_render_outline_pane(outline: OutlinePanel, x: i64, y: i64, w: i64, h: i64):
+    var sep_row = 0
+    while sep_row < h:
+        terminal_move_cursor(y + sep_row, x)
+        terminal_write("\x1b[2m|\x1b[0m")
+        sep_row = sep_row + 1
+    val content_x = x + 1
+    val content_w = w - 1
+    terminal_move_cursor(y, content_x)
+    var header = " Outline "
+    var hpad = ""
+    var hp = 0
+    while hp < content_w - header.len():
+        hpad = hpad + "-"
+        hp = hp + 1
+    terminal_write("\x1b[1;32m" + header + hpad + "\x1b[0m")
+    val lines = outline_panel_render(outline, h - 1)
+    var row = 0
+    while row < h - 1:
+        terminal_move_cursor(y + 1 + row, content_x)
+        if row < lines.len():
+            val line = lines[row]
+            if line.len() > content_w:
+                terminal_write(line.slice(0, content_w))
+            else:
+                terminal_write(line)
+        row = row + 1
+
+
+fn _tui_render_wiki_panel(panel: WikiPanel, x: i64, y: i64, w: i64, h: i64):
+    var sep_row = 0
+    while sep_row < h:
+        terminal_move_cursor(y + sep_row, x)
+        terminal_write("\x1b[2m|\x1b[0m")
+        sep_row = sep_row + 1
+    val content_x = x + 1
+    val content_w = w - 1
+    terminal_move_cursor(y, content_x)
+    var header = " " + panel.title + " "
+    var hpad = ""
+    var hp = 0
+    while hp < content_w - header.len():
+        hpad = hpad + "-"
+        hp = hp + 1
+    terminal_write("\x1b[1;35m" + header + hpad + "\x1b[0m")
+    val lines = wiki_panel_render(panel, h - 1)
+    var row = 0
+    while row < h - 1:
+        terminal_move_cursor(y + 1 + row, content_x)
+        if row < lines.len():
+            val line = lines[row]
+            if line.len() > content_w:
+                terminal_write(line.slice(0, content_w))
+            else:
+                terminal_write(line)
+        row = row + 1
+
+
+fn _tui_render_lsp_result_panel(panel: LspResultPanel, x: i64, y: i64, w: i64, h: i64):
+    var sep_row = 0
+    while sep_row < h:
+        terminal_move_cursor(y + sep_row, x)
+        terminal_write("\x1b[2m|\x1b[0m")
+        sep_row = sep_row + 1
+    val content_x = x + 1
+    val content_w = w - 1
+    terminal_move_cursor(y, content_x)
+    var header = " " + panel.title + " "
+    var hpad = ""
+    var hp = 0
+    while hp < content_w - header.len():
+        hpad = hpad + "-"
+        hp = hp + 1
+    terminal_write("\x1b[1;34m" + header + hpad + "\x1b[0m")
+    val lines = lsp_result_panel_render(panel, h - 1)
+    var row = 0
+    while row < h - 1:
+        terminal_move_cursor(y + 1 + row, content_x)
+        if row < lines.len():
+            val line = lines[row]
+            if line.len() > content_w:
+                terminal_write(line.slice(0, content_w))
+            else:
+                terminal_write(line)
+        row = row + 1
+
+
+fn _tui_render_diagnostics_panel(panel: DiagnosticsPanel, x: i64, y: i64, w: i64, h: i64):
+    var sep_row = 0
+    while sep_row < h:
+        terminal_move_cursor(y + sep_row, x)
+        terminal_write("\x1b[2m|\x1b[0m")
+        sep_row = sep_row + 1
+    val content_x = x + 1
+    val content_w = w - 1
+    terminal_move_cursor(y, content_x)
+    var header = " " + panel.title + " "
+    var hpad = ""
+    var hp = 0
+    while hp < content_w - header.len():
+        hpad = hpad + "-"
+        hp = hp + 1
+    terminal_write("\x1b[1;31m" + header + hpad + "\x1b[0m")
+    val lines = diagnostics_panel_render(panel, h - 1)
+    var row = 0
+    while row < h - 1:
+        terminal_move_cursor(y + 1 + row, content_x)
+        if row < lines.len():
+            val line = lines[row]
+            if line.len() > content_w:
+                terminal_write(line.slice(0, content_w))
+            else:
+                terminal_write(line)
+        row = row + 1
+
+
+fn _tui_render_palette(state: PaletteState, zones: LayoutZones, width: i64):
+    val palette_w = 60
+    val palette_h = 12
+    val px = (width - palette_w) / 2
+    val py = zones.editor_y + 1
+    terminal_move_cursor(py, px)
+    var border_top = "+"
+    var bt = 0
+    while bt < palette_w - 2:
+        border_top = border_top + "-"
+        bt = bt + 1
+    border_top = border_top + "+"
+    terminal_write("\x1b[1m" + border_top + "\x1b[0m")
+    terminal_move_cursor(py + 1, px)
+    var query_line = "| > " + state.query
+    var qpad = ""
+    var qp = 0
+    while qp < palette_w - 2 - query_line.len():
+        qpad = qpad + " "
+        qp = qp + 1
+    terminal_write("\x1b[1m" + query_line + qpad + " |\x1b[0m")
+    terminal_move_cursor(py + 2, px)
+    var sep = "|"
+    var sp = 0
+    while sp < palette_w - 2:
+        sep = sep + "-"
+        sp = sp + 1
+    sep = sep + "|"
+    terminal_write("\x1b[2m" + sep + "\x1b[0m")
+    var ri = 0
+    while ri < palette_h - 4:
+        terminal_move_cursor(py + 3 + ri, px)
+        if ri < state.filtered.len():
+            val entry: PaletteEntry = state.filtered[ri]
+            var eline = "  " + entry.name
+            if eline.len() > palette_w - 4:
+                eline = eline.slice(0, palette_w - 4)
+            var epad = ""
+            var ep = 0
+            while ep < palette_w - 4 - eline.len():
+                epad = epad + " "
+                ep = ep + 1
+            if ri == state.selected_index:
+                terminal_write("\x1b[7m| " + eline + epad + " |\x1b[0m")
+            else:
+                terminal_write("| " + eline + epad + " |")
+        else:
+            var blank = "|"
+            var bi = 0
+            while bi < palette_w - 2:
+                blank = blank + " "
+                bi = bi + 1
+            blank = blank + "|"
+            terminal_write(blank)
+        ri = ri + 1
+    terminal_move_cursor(py + palette_h - 1, px)
+    var border_bot = "+"
+    var bb = 0
+    while bb < palette_w - 2:
+        border_bot = border_bot + "-"
+        bb = bb + 1
+    border_bot = border_bot + "+"
+    terminal_write("\x1b[1m" + border_bot + "\x1b[0m")

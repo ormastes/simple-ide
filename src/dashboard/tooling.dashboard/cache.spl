@@ -1,0 +1,179 @@
+# Dashboard Cache Manager
+#
+# Local compatibility copy of tooling.dashboard.cache so dashboard entrypoints
+# can resolve the cache API when compiling from the app tree.
+
+use std.io.{time_now_unix_micros, timestamp_year, timestamp_month, timestamp_day, timestamp_hour, timestamp_minute, timestamp_second}
+use tooling.dashboard.types.{DashboardData}
+use tooling.dashboard.database.{DashboardDatabase}
+
+# =========================================================================
+# Constants
+# =========================================================================
+
+val DEFAULT_TTL_SECONDS: i32 = 30
+val CACHE_FILE_TTL_SECONDS: i32 = 30
+
+# =========================================================================
+# Cache Entry
+# =========================================================================
+
+class CacheEntry:
+    data: DashboardData
+    timestamp: i64
+    ttl_seconds: i32
+
+    static fn new(data: DashboardData, ttl_seconds: i32) -> CacheEntry:
+        return CacheEntry {
+            data: data,
+            timestamp: _now_timestamp(),
+            ttl_seconds: ttl_seconds
+        }
+
+    fn is_valid() -> bool:
+        val current_time = _now_timestamp()
+        val age_seconds = current_time - self.timestamp
+        return age_seconds < self.ttl_seconds
+
+    fn age_seconds() -> i64:
+        val current_time = _now_timestamp()
+        return current_time - self.timestamp
+
+# =========================================================================
+# Cache Stats
+# =========================================================================
+
+class CacheStats:
+    is_valid: bool
+    age_seconds: Option<i64>
+    ttl_seconds: i32
+    last_updated: text
+
+# =========================================================================
+# Cache Manager
+# =========================================================================
+
+class DashboardCache:
+    entry: Option<CacheEntry>
+    ttl_seconds: i32
+    database: DashboardDatabase
+
+    static fn new() -> DashboardCache:
+        return DashboardCache {
+            entry: nil,
+            ttl_seconds: DEFAULT_TTL_SECONDS,
+            database: DashboardDatabase.new()
+        }
+
+    static fn with_ttl(ttl_seconds: i32) -> DashboardCache:
+        return DashboardCache {
+            entry: nil,
+            ttl_seconds: ttl_seconds,
+            database: DashboardDatabase.new()
+        }
+
+    fn get() -> Result<DashboardData, text>:
+        match self.entry:
+            case Some(entry):
+                if entry.is_valid():
+                    Ok(entry.data)
+                else:
+                    self.reload()
+            case nil:
+                self.reload()
+
+    fn reload() -> Result<DashboardData, text>:
+        match self.database.read_all():
+            case Err(e):
+                return Err("Failed to load dashboard data: {e}")
+            case Ok(data):
+                self.entry = Some(CacheEntry.new(data, self.ttl_seconds))
+                return Ok(data)
+
+    fn update(data: DashboardData) -> Result<(), text>:
+        match self.database.write_all(data):
+            case Err(e):
+                return Err("Failed to write dashboard data: {e}")
+            case Ok(_):
+                val _ = 0
+
+        self.entry = Some(CacheEntry.new(data, self.ttl_seconds))
+        return Ok(())
+
+    fn invalidate():
+        self.entry = nil
+
+    fn is_valid() -> bool:
+        match self.entry:
+            case Some(entry):
+                return entry.is_valid()
+            case nil:
+                return false
+
+    fn age_seconds() -> Option<i64>:
+        match self.entry:
+            case Some(entry):
+                return Some(entry.age_seconds())
+            case nil:
+                return nil
+
+    fn stats() -> CacheStats:
+        match self.entry:
+            case Some(entry):
+                return CacheStats {
+                    is_valid: entry.is_valid(),
+                    age_seconds: Some(entry.age_seconds()),
+                    ttl_seconds: entry.ttl_seconds,
+                    last_updated: _now_iso8601()
+                }
+            case nil:
+                return CacheStats {
+                    is_valid: false,
+                    age_seconds: nil,
+                    ttl_seconds: DEFAULT_TTL_SECONDS,
+                    last_updated: ""
+                }
+
+# =========================================================================
+# Global Cache
+# =========================================================================
+
+var GLOBAL_CACHE: Option<DashboardCache> = nil
+
+fn get_global_cache() -> DashboardCache:
+    match GLOBAL_CACHE:
+        case Some(cache):
+            return cache
+        case nil:
+            val cache = DashboardCache.new()
+            GLOBAL_CACHE = Some(cache)
+            return cache
+
+fn get_cached_data() -> Result<DashboardData, text>:
+    val cache = get_global_cache()
+    return cache.get()
+
+fn update_cache(data: DashboardData) -> Result<(), text>:
+    val cache = get_global_cache()
+    return cache.update(data)
+
+fn invalidate_cache():
+    val cache = get_global_cache()
+    cache.invalidate()
+
+fn cache_stats() -> CacheStats:
+    val cache = get_global_cache()
+    return cache.stats()
+
+fn _now_timestamp() -> i64:
+    time_now_unix_micros() / 1_000_000
+
+fn _now_iso8601() -> text:
+    val micros = time_now_unix_micros()
+    val year = timestamp_year(micros) as i64
+    val month = timestamp_month(micros) as i64
+    val day = timestamp_day(micros) as i64
+    val hour = timestamp_hour(micros) as i64
+    val minute = timestamp_minute(micros) as i64
+    val second = timestamp_second(micros) as i64
+    "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"

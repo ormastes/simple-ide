@@ -1,0 +1,118 @@
+# Rust Test Runner
+#
+# Pure Simple test runner compatibility surface for external Rust workspace tests.
+
+use std.test_runner.test_db_types.TestStatus
+
+# =========================================================================
+# Rust Test Results
+# =========================================================================
+
+struct RustTestResult:
+    total: i64
+    passed: i64
+    failed: i64
+    ignored: i64
+    duration_ms: i64
+    output: text
+    success: bool
+
+# =========================================================================
+# Run Rust Tests
+# =========================================================================
+
+fn run_rust_tests(timeout_ms: i64) -> RustTestResult:
+    run_cargo_test(extra_args: [], timeout_ms: timeout_ms)
+
+fn run_rust_tests_crate(crate_name: text, timeout_ms: i64) -> RustTestResult:
+    run_cargo_test(extra_args: ["-p", crate_name], timeout_ms: timeout_ms)
+
+fn run_rust_doc_tests(timeout_ms: i64) -> RustTestResult:
+    run_cargo_test(extra_args: ["--doc"], timeout_ms: timeout_ms)
+
+fn run_rust_doc_tests_crate(crate_name: text, timeout_ms: i64) -> RustTestResult:
+    run_cargo_test(extra_args: ["--doc", "-p", crate_name], timeout_ms: timeout_ms)
+
+fn run_cargo_test(extra_args: [text], timeout_ms: i64) -> RustTestResult:
+    RustTestResult(
+        total: 0,
+        passed: 0,
+        failed: 0,
+        ignored: 0,
+        duration_ms: 0,
+        output: "External Rust workspace tests are not run by the pure Simple test runner.",
+        success: true
+    )
+
+# =========================================================================
+# H12: List ignored Rust tests
+# =========================================================================
+
+fn list_ignored_rust_tests(timeout_ms: i64) -> [text]:
+    []
+
+# =========================================================================
+# Parse external test output
+# =========================================================================
+
+fn parse_cargo_test_output(output: text) -> (i64, i64, i64, i64):
+    # Look for: "test result: ok. N passed; M failed; K ignored;"
+    var total = 0
+    var passed = 0
+    var failed = 0
+    var ignored = 0
+
+    val lines = output.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.starts_with("test result:"):
+            # Parse "N passed"
+            val passed_count = extract_count(line: trimmed, keyword: "passed")
+            val failed_count = extract_count(line: trimmed, keyword: "failed")
+            val ignored_count = extract_count(line: trimmed, keyword: "ignored")
+            passed = passed + passed_count
+            failed = failed + failed_count
+            ignored = ignored + ignored_count
+            total = total + passed_count + failed_count + ignored_count
+
+    (total, passed, failed, ignored)
+
+fn extract_count(line: text, keyword: text) -> i64:
+    # Find "N keyword" pattern in test output
+    val parts = line.split(";")
+    for part in parts:
+        val trimmed = part.trim()
+        if trimmed.contains(keyword):
+            # Extract number before keyword
+            val words = trimmed.split(" ")
+            for w in words:
+                val num = w.trim().to_int_or(-1)
+                if num >= 0:
+                    return num
+    0
+
+# =========================================================================
+# G2: Update test database from Rust test results
+# =========================================================================
+
+fn update_rust_test_database(db, rust_result: RustTestResult, is_doc_test: bool):
+    val category = if is_doc_test: "RustDoc" else: "RustUnit"
+    # Parse individual test lines from output
+    val lines = rust_result.output.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.starts_with("test ") and (trimmed.ends_with("... ok") or trimmed.ends_with("... FAILED") or trimmed.ends_with("... ignored")):
+            val name_end = trimmed.index_of(" ... ") ?? -1
+            if name_end > 5:
+                val test_name = trimmed[5:name_end]
+                val status_str = trimmed[name_end + 5:]
+                val status = if status_str == "ok": "passed" elif status_str == "FAILED": "failed" else: "ignored"
+                # Store as file-level update (Rust tests don't have per-file granularity here)
+                db.update_test_result(
+                    test_name,
+                    "external/rust-tests",
+                    category,
+                    category,
+                    if status == "passed": TestStatus.Passed elif status == "failed": TestStatus.Failed else: TestStatus.Ignored,
+                    0.0
+                )

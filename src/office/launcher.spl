@@ -1,0 +1,72 @@
+# Office Suite Launcher
+#
+# Home screen with app grid and recent files.
+
+use common.ui.widget.{WidgetNode, UITree}
+use common.ui.builder.{column, row, panel, label, statusbar, build_tree_with_title}
+use common.ui.theme_registry.{ThemeId, theme_id_key}
+use common.ui.ios.builder.{navigation_bar, card}
+use common.office.file_ops.{RecentFile}
+
+fn launcher_app_cards() -> [WidgetNode]:
+    """Return card widgets for the office suite apps."""
+    var cards: [WidgetNode] = []
+    var word_card = card("card_word", "Word", [
+        label("card_word_icon", "W"),
+        label("card_word_label", "Documents")
+    ])
+    word_card = word_card.set_prop("action", "open_word")
+    cards.push(word_card)
+    var sheets_card = card("card_sheets", "Sheets", [
+        label("card_sheets_icon", "S"),
+        label("card_sheets_label", "Spreadsheets")
+    ])
+    sheets_card = sheets_card.set_prop("action", "open_sheets")
+    cards.push(sheets_card)
+    var slides_card = card("card_slides", "Slides", [
+        label("card_slides_icon", "P"),
+        label("card_slides_label", "Presentations")
+    ])
+    slides_card = slides_card.set_prop("action", "open_slides")
+    cards.push(slides_card)
+    var mail_card = card("card_mail", "Mail", [
+        label("card_mail_icon", "M"),
+        label("card_mail_label", "Email")
+    ])
+    mail_card = mail_card.set_prop("action", "open_mail")
+    cards.push(mail_card)
+    var planner_card = card("card_planner", "Planner", [
+        label("card_planner_icon", "K"),
+        label("card_planner_label", "Tasks & Projects")
+    ])
+    planner_card = planner_card.set_prop("action", "open_planner")
+    cards.push(planner_card)
+    cards
+
+fn _build_recent_files_panel(recent: [RecentFile]) -> WidgetNode:
+    var items: [WidgetNode] = []
+    var idx = 0
+    for file in recent:
+        val item = label("recent_{idx}", "{file.title} ({file.app_name}) - {file.path}")
+        items.push(item)
+        idx = idx + 1
+    if items.len() == 0:
+        items.push(label("recent_empty", "No recent files"))
+    panel("recent_panel", "Recent Files", items)
+
+fn build_launcher_ui(recent: [RecentFile]) -> UITree:
+    """Build the launcher home screen UI tree."""
+    val nav = navigation_bar("nav", "Simple Office", [], [])
+    val cards = launcher_app_cards()
+    val first_row = row("app_row_1", [cards[0], cards[1], cards[2]])
+    val second_row = row("app_row_2", [cards[3], cards[4]])
+    val app_grid = column("app_grid", [first_row, second_row])
+    val recent_panel = _build_recent_files_panel(recent)
+    val status = statusbar("statusbar", "Simple Office", "v1.0")
+    val root = column("root", [
+        nav,
+        app_grid,
+        recent_panel,
+        status
+    ])
+    build_tree_with_title(root, "Simple Office", theme_id_key(ThemeId.IOSLight))

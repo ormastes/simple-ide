@@ -1,0 +1,167 @@
+# Simple Test Runner entrypoint.
+# Startup-light surface for source-mode help and readiness probes.
+
+use std.cli.cli_util (get_cli_args)
+use std.cli.log_modes.{parse_log_options, log_options_help, render_progress}
+use std.log.{error}
+
+val TOOL_NAME = "Simple Test Runner"
+val TOOL_VERSION = "1.0.0-beta"
+
+fn main() -> i64:
+    val raw_args = get_cli_args()
+    val log_opts = parse_log_options(raw_args)
+    if not log_opts.valid:
+        error("test-runner-new", log_opts.error)
+        return 1
+
+    val args = runner_clean_log_args(raw_args)
+    if args.len() > 0 and (args[0] == "--help" or args[0] == "-h" or args[0] == "help"):
+        print_help_with_progress(log_opts.progress)
+        return 0
+    if args.len() > 0 and (args[0] == "--version" or args[0] == "-v"):
+        if log_opts.log_mode == "json":
+            print "{\"command\":\"test-runner-new\",\"status\":\"ok\",\"version\":\"{TOOL_VERSION}\"}"
+        else:
+            print "{TOOL_NAME} v{TOOL_VERSION}"
+        return 0
+
+    val mode = runner_option_value(args, "--mode", "interpreter")
+    val target = runner_target(args)
+    val list_only = runner_has_option(args, "--list")
+    val coverage = runner_has_option(args, "--coverage")
+
+    if runner_has_unknown_option(args):
+        val message = "Unknown test runner option: {runner_first_unknown_option(args)}"
+        if log_opts.log_mode == "json":
+            print "{\"command\":\"test-runner-new\",\"status\":\"error\",\"message\":\"{message}\"}"
+        else:
+            error("test-runner-new", message)
+        return 1
+
+    if log_opts.log_mode == "json":
+        print "{\"command\":\"test-runner-new\",\"status\":\"planned\",\"target\":\"{target}\",\"mode\":\"{mode}\",\"listOnly\":{runner_bool_json(list_only)},\"coverage\":{runner_bool_json(coverage)}}"
+    else:
+        val progress = render_progress(log_opts.progress, 1, 1, "test-runner-new")
+        if progress != "":
+            print progress
+        print "{TOOL_NAME} plan"
+        print "  target: {target}"
+        print "  mode: {mode}"
+    0
+
+fn print_help():
+    print "{TOOL_NAME}"
+    print ""
+    print "Usage: simple test-runner-new [path] [options]"
+    print ""
+    print "Options:"
+    print "  -h, --help             Show this help message"
+    print "  -v, --version          Show version information"
+    print "  --unit                 Run unit tests only"
+    print "  --integration          Run integration tests only"
+    print "  --system               Run system tests only"
+    print "  --fail-fast            Stop on first failure"
+    print "  --tag <name>           Filter by tag"
+    print "  --mode <mode>          interpreter, smf, or native"
+    print "  --compile              Shorthand for --mode=native"
+    print "  --timeout <secs>       Timeout per test file"
+    print "  --list                 List test files without running"
+    print "  --coverage             Enable coverage tracking"
+    print ""
+    print "Shared log options:"
+    for line in log_options_help():
+        print "  {line}"
+
+fn print_help_with_progress(progress_mode: text):
+    val progress = render_progress(progress_mode, 0, 1, "usage")
+    if progress != "":
+        print progress
+    print_help()
+
+fn runner_target(args: [text]) -> text:
+    for arg in args:
+        if not arg.starts_with("-"):
+            return arg
+    "test"
+
+fn runner_option_value(args: [text], name: text, fallback: text) -> text:
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+        if arg == name and i + 1 < args.len():
+            return args[i + 1]
+        if arg.starts_with(name + "="):
+            return arg.substring(name.len() + 1)
+        if arg == "--compile":
+            return "native"
+        if arg.starts_with("--compile="):
+            return arg.substring(10)
+        i = i + 1
+    fallback
+
+fn runner_has_option(args: [text], name: text) -> bool:
+    for arg in args:
+        if arg == name:
+            return true
+    false
+
+fn runner_bool_json(value: bool) -> text:
+    if value:
+        "true"
+    else:
+        "false"
+
+fn runner_has_unknown_option(args: [text]) -> bool:
+    runner_first_unknown_option(args) != ""
+
+fn runner_first_unknown_option(args: [text]) -> text:
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+        if runner_option_takes_value(arg):
+            i = i + 2
+        elif runner_known_option(arg):
+            i = i + 1
+        elif arg.starts_with("-"):
+            return arg
+        else:
+            i = i + 1
+    ""
+
+fn runner_option_takes_value(arg: text) -> bool:
+    arg == "--tag" or arg == "--mode" or arg == "--timeout"
+
+fn runner_known_option(arg: text) -> bool:
+    arg == "--unit" or arg == "--integration" or arg == "--system" or
+        arg == "--fail-fast" or arg == "--compile" or arg == "--list" or
+        arg == "--list-ignored" or arg == "--only-slow" or
+        arg == "--only-skipped" or arg == "--show-tags" or
+        arg == "--safe-mode" or arg == "--safe" or
+        arg == "--force-rebuild" or arg == "--keep-artifacts" or
+        arg == "--all" or arg == "--coverage" or arg == "--gc-log" or
+        arg.starts_with("--tag=") or arg.starts_with("--mode=") or
+        arg.starts_with("--compile=") or arg.starts_with("--timeout=") or
+        arg.starts_with("--format") or arg.starts_with("--seed") or
+        arg.starts_with("--gc=")
+
+fn runner_is_log_option(arg: text) -> bool:
+    arg == "--human" or arg == "--llm" or arg == "--json" or
+        arg == "--tui" or arg == "--stdout" or arg == "--quiet" or
+        arg == "--verbose" or arg == "--dots" or arg == "--count" or
+        arg == "--no-progress" or arg == "--log-mode" or arg == "--surface" or
+        arg == "--progress" or arg.starts_with("--log-mode=") or
+        arg.starts_with("--surface=") or arg.starts_with("--progress=")
+
+fn runner_clean_log_args(args: [text]) -> [text]:
+    var cleaned: [text] = []
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+        if runner_is_log_option(arg):
+            if arg == "--log-mode" or arg == "--surface" or arg == "--progress":
+                i = i + 1
+        else:
+            cleaned.push(arg)
+        i = i + 1
+    cleaned

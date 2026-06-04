@@ -1,0 +1,85 @@
+# Kanban View
+#
+# Renders a project as a kanban board with columns and task cards.
+
+use common.ui.widget.{WidgetNode}
+use common.ui.builder.{row, panel, scroll, label, button, with_flex}
+use common.ui.ios.builder.{card}
+use app.office.planner.task.{Task, priority_icon, priority_name, status_name}
+use app.office.planner.board.{Project, BoardColumn, tasks_in_column}
+
+# =========================================================================
+# Kanban Board Builder
+# =========================================================================
+
+fn build_kanban_view(project: Project) -> WidgetNode:
+    """Build a horizontal row of column panels, each with scrollable task cards."""
+    var column_widgets: [WidgetNode] = []
+    var col_idx: i32 = 0
+    for col in project.board.columns:
+        val col_widget = _build_column_widget(project, col, col_idx)
+        column_widgets = column_widgets.push(col_widget)
+        col_idx = col_idx + 1
+    return row("kanban_board", column_widgets)
+
+# =========================================================================
+# Column and Card Builders
+# =========================================================================
+
+fn _build_column_widget(project: Project, col: BoardColumn, col_idx: i32) -> WidgetNode:
+    """Build a single kanban column panel with its task cards."""
+    val col_tasks = tasks_in_column(project, col.name)
+    val task_count = _count_items(col_tasks)
+    val header_text = if col.wip_limit > 0: "{col.name} ({task_count}/{col.wip_limit})" else: "{col.name} ({task_count})"
+
+    var card_widgets: [WidgetNode] = []
+    var t_idx: i32 = 0
+    for task in col_tasks:
+        val task_card = _build_task_card(task, col_idx, t_idx)
+        card_widgets = card_widgets.push(task_card)
+        t_idx = t_idx + 1
+
+    if card_widgets.len() == 0:
+        card_widgets = card_widgets.push(label("col_{col_idx}_empty", "(empty)"))
+
+    var col_panel = panel("col_{col_idx}", header_text, [
+        scroll("col_{col_idx}_scroll", 500, card_widgets)
+    ])
+    col_panel = with_flex(col_panel, 1)
+    return col_panel
+
+fn _build_task_card(task: Task, col_idx: i32, t_idx: i32) -> WidgetNode:
+    """Build a card widget for a single task."""
+    val prio = priority_icon(task.priority)
+    val prio_name = priority_name(task.priority)
+    val title_text = "{prio} {task.title}"
+
+    var card_children: [WidgetNode] = []
+    card_children = card_children.push(label("task_{task.id}_title", title_text))
+
+    if task.assignee != "":
+        card_children = card_children.push(label("task_{task.id}_assignee", "Assigned: {task.assignee}"))
+    if task.due_date != "":
+        card_children = card_children.push(label("task_{task.id}_due", "Due: {task.due_date}"))
+    if task.labels.len() > 0:
+        var label_names: [text] = []
+        for lbl in task.labels:
+            label_names = label_names.push(lbl.name)
+        card_children = card_children.push(label("task_{task.id}_labels", label_names.join(", ")))
+    if prio_name != "None":
+        card_children = card_children.push(label("task_{task.id}_priority", "Priority: {prio_name}"))
+
+    var task_card = card("task_{task.id}", task.title, card_children)
+    task_card = task_card.set_prop("action", "select_task_{task.id}")
+    return task_card
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _count_items(tasks: [Task]) -> i32:
+    """Count items in a task list."""
+    var count: i32 = 0
+    for t in tasks:
+        count = count + 1
+    return count

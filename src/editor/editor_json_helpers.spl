@@ -1,0 +1,154 @@
+# Editor JSON Helpers
+#
+# Low-level JSON parsing utilities for editor LSP/code-action processing.
+
+use app.editor.editor_path_text_helpers.*
+
+fn _editor_escape_json(s: text) -> text:
+    var result = ""
+    var i = 0
+    while i < s.len():
+        val ch = s.char_at(i)
+        if ch == "\"":
+            result = result + "\\\""
+        elif ch == "\\":
+            result = result + "\\\\"
+        else:
+            result = result + ch
+        i = i + 1
+    result
+
+fn _editor_json_number_field(json: text, field: text) -> i64:
+    var i = 0
+    while i < json.len():
+        if json.slice(i, json.len()).starts_with(field):
+            var j = i + field.len()
+            while j < json.len() and (json.char_at(j) == " " or json.char_at(j) == ":"):
+                j = j + 1
+            var num = ""
+            while j < json.len():
+                val ch = json.char_at(j)
+                if ch == "0" or ch == "1" or ch == "2" or ch == "3" or ch == "4" or ch == "5" or ch == "6" or ch == "7" or ch == "8" or ch == "9":
+                    num = num + ch
+                else:
+                    break
+                j = j + 1
+            if num != "":
+                return num.to_i64() ?? -1
+        i = i + 1
+    -1
+
+fn _editor_json_number_after(json: text, marker: text, field: text) -> i64:
+    var i = 0
+    while i < json.len():
+        if json.slice(i, json.len()).starts_with(marker):
+            return _editor_json_number_field(json.slice(i, json.len()), field)
+        i = i + 1
+    -1
+
+fn _editor_json_string_field(json: text, field: text) -> text:
+    var i = 0
+    while i < json.len():
+        if json.slice(i, json.len()).starts_with(field):
+            var j = i + field.len()
+            while j < json.len() and (json.char_at(j) == " " or json.char_at(j) == ":"):
+                j = j + 1
+            if j < json.len() and json.char_at(j) == "\"":
+                return _editor_unescape_json_string(json, j)
+        i = i + 1
+    ""
+
+fn _editor_json_value_field(json: text, field: text) -> text:
+    var i = 0
+    while i < json.len():
+        if json.slice(i, json.len()).starts_with(field):
+            var j = i + field.len()
+            while j < json.len() and (json.char_at(j) == " " or json.char_at(j) == ":"):
+                j = j + 1
+            if j >= json.len():
+                return ""
+            val ch = json.char_at(j)
+            if ch == "{" or ch == "[":
+                return _editor_json_balanced(json, j, ch)
+            if ch == "\"":
+                return "\"" + _editor_escape_json(_editor_unescape_json_string(json, j)) + "\""
+            var result = ""
+            while j < json.len():
+                val c = json.char_at(j)
+                if c == "," or c == "}":
+                    return result.trim()
+                result = result + c
+                j = j + 1
+            return result.trim()
+        i = i + 1
+    ""
+
+fn _editor_json_balanced(json: text, start: i64, open_ch: text) -> text:
+    val close_ch = if open_ch == "{" then "}" else: "]"
+    var depth = 0
+    var i = start
+    var in_str = false
+    while i < json.len():
+        val ch = json.char_at(i)
+        if in_str:
+            if ch == "\\":
+                i = i + 1
+            elif ch == "\"":
+                in_str = false
+        else:
+            if ch == "\"":
+                in_str = true
+            elif ch == open_ch:
+                depth = depth + 1
+            elif ch == close_ch:
+                depth = depth - 1
+                if depth == 0:
+                    return json.slice(start, i + 1)
+        i = i + 1
+    ""
+
+fn _editor_json_numbers_in_array_field(json: text, field: text) -> [i64]:
+    var nums: [i64] = []
+    val idx = _editor_find_text(json, field)
+    if idx < 0:
+        return nums
+    var i = idx
+    while i < json.len() and json.char_at(i) != "[":
+        i = i + 1
+    if i >= json.len():
+        return nums
+    i = i + 1
+    while i < json.len() and json.char_at(i) != "]":
+        while i < json.len() and (json.char_at(i) == " " or json.char_at(i) == "\n" or json.char_at(i) == ","):
+            i = i + 1
+        var digits = ""
+        while i < json.len() and json.char_at(i) >= "0" and json.char_at(i) <= "9":
+            digits = digits + json.char_at(i)
+            i = i + 1
+        if digits != "":
+            nums.push(digits.to_i64() ?? 0)
+        else:
+            i = i + 1
+    nums
+
+fn _editor_unescape_json_string(json: text, start: i64) -> text:
+    var result = ""
+    var i = start + 1
+    while i < json.len():
+        val ch = json.char_at(i)
+        if ch == "\"":
+            return result
+        if ch == "\\":
+            i = i + 1
+            if i < json.len():
+                val esc = json.char_at(i)
+                if esc == "n":
+                    result = result + "\n"
+                elif esc == "t":
+                    result = result + "\t"
+                else:
+                    result = result + esc
+        else:
+            result = result + ch
+        i = i + 1
+    result

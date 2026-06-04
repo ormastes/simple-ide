@@ -1,0 +1,312 @@
+# SDoctest Code Block Extractor
+#
+# Extracts code blocks from markdown files with modifier parsing.
+# Supports fence modifiers (```simple:skip) and HTML comment markers.
+
+use std.io.{file_read, file_exists}
+use std.test_runner.sdoctest.types.{SdoctestBlock, SdoctestModifier}
+
+# =========================================================================
+# Public API
+# =========================================================================
+
+fn extract_sdoctest_blocks(file_path: text) -> [SdoctestBlock]:
+    if not file_exists(file_path):
+        return []
+
+    val content = file_read(file_path) ?? ""
+    if content == "":
+        return []
+    extract_blocks_from_content(content: content, file_path: file_path)
+
+fn extract_blocks_from_content(content: text, file_path: text) -> [SdoctestBlock]:
+    val lines = content.split("\n")
+    var blocks: [SdoctestBlock] = []
+    var i = 0
+    var in_code_block = false
+    var code_lines: [text] = []
+    var start_line = 0
+    var current_language = ""
+    var current_modifiers: [SdoctestModifier] = []
+    var skip_next = false
+    var skip_region = false
+    var ignore_next = false
+    var ignore_region = false
+    var pending_run_config = ""
+
+    while i < lines.len():
+        val line = lines[i]
+        val trimmed = line.trim()
+
+        # Check for HTML comment markers
+        if trimmed == "<!--sdoctest:skip-next-->":
+            skip_next = true
+            i = i + 1
+            continue
+
+        if trimmed == "<!--sdoctest:skip-begin-->":
+            skip_region = true
+            i = i + 1
+            continue
+
+        if trimmed == "<!--sdoctest:skip-end-->":
+            skip_region = false
+            i = i + 1
+            continue
+
+        if trimmed == "<!--sdoctest:ignore-next-->":
+            ignore_next = true
+            i = i + 1
+            continue
+
+        if trimmed == "<!--sdoctest:ignore-begin-->":
+            ignore_region = true
+            i = i + 1
+            continue
+
+        if trimmed == "<!--sdoctest:ignore-end-->":
+            ignore_region = false
+            i = i + 1
+            continue
+
+        if trimmed.starts_with( "<!--sdoctest:@") and trimmed.ends_with( "-->"):
+            val inner = trimmed[14 : trimmed.len() - 3]
+            pending_run_config = inner
+            i = i + 1
+            continue
+
+        if not in_code_block:
+            # Check for opening fence
+            if trimmed.starts_with( "```simple") or trimmed.starts_with( "```spl") or trimmed.starts_with( "```sdoctest"):
+                in_code_block = true
+                code_lines = []
+                start_line = i + 1
+
+                # Parse language and modifiers from fence line
+                val fence_info = parse_fence_line(trimmed)
+                current_language = fence_info.0
+                current_modifiers = fence_info.1
+
+                # Apply pending run-config from HTML comment
+                if pending_run_config != "":
+                    current_modifiers.push(SdoctestModifier.RunConfig(pending_run_config))
+                    pending_run_config = ""
+
+                # Apply skip-next marker
+                if skip_next:
+                    current_modifiers.push(SdoctestModifier.Skip)
+                    skip_next = false
+
+                # Apply skip-region
+                if skip_region:
+                    current_modifiers.push(SdoctestModifier.Skip)
+
+                # Apply ignore-next marker
+                if ignore_next:
+                    current_modifiers.push(SdoctestModifier.Ignore)
+                    ignore_next = false
+
+                # Apply ignore-region
+                if ignore_region:
+                    current_modifiers.push(SdoctestModifier.Ignore)
+        else:
+            # Inside a code block
+            if trimmed == "```":
+                in_code_block = false
+                # For sdoctest blocks, strip >>> prompts and remove output lines
+                var final_lines = code_lines
+                if current_language == "sdoctest":
+                    final_lines = strip_doctest_prompts(code_lines)
+                if final_lines.len() > 0:
+                    blocks.push(SdoctestBlock(
+                        source_file: file_path,
+                        line_number: start_line,
+                        code: final_lines.join("\n"),
+                        language: current_language,
+                        modifiers: current_modifiers
+                    ))
+                current_modifiers = []
+                current_language = ""
+            else:
+                code_lines.push(line)
+
+        i = i + 1
+
+    blocks
+
+# =========================================================================
+# Fence Line Parsing
+# =========================================================================
+
+fn parse_fence_line(fence: text) -> (text, [SdoctestModifier]):
+    # Input examples:
+    #   ```simple
+    #   ```simple:skip
+    #   ```simple:init=std_imports,env=slow
+    #   ```simple:should_fail,tag=integration
+    #   ```spl:skip
+
+    var language = ""
+    var modifiers: [SdoctestModifier] = []
+
+    # Strip leading backticks
+    var rest = fence
+    while rest.starts_with( "`"):
+        rest = rest[1:]
+
+    # Split on first ':'
+    val ci = rest.index_of(":") ?? -1
+    if ci >= 0:
+        language = rest[0:ci]
+        val mod_str = rest[ci + 1:]
+        modifiers = parse_modifiers(mod_str)
+    else:
+        language = rest.trim()
+
+    (language, modifiers)
+
+fn parse_modifiers(mod_str: text) -> [SdoctestModifier]:
+    var modifiers: [SdoctestModifier] = []
+    val parts = mod_str.split(",")
+
+    for part in parts:
+        val trimmed = part.trim()
+        if trimmed == "":
+            continue
+
+        if trimmed == "skip":
+            modifiers.push(SdoctestModifier.Skip)
+        elif trimmed == "should_fail":
+            modifiers.push(SdoctestModifier.ShouldFail)
+        elif trimmed == "fail_as_success":
+            modifiers.push(SdoctestModifier.FailAsSuccess)
+        elif trimmed == "ignore_output":
+            modifiers.push(SdoctestModifier.IgnoreOutput)
+        elif trimmed.starts_with( "init="):
+            val name = trimmed[5:]
+            modifiers.push(SdoctestModifier.Init(name))
+        elif trimmed.starts_with( "env="):
+            val name = trimmed[4:]
+            modifiers.push(SdoctestModifier.Env(name))
+        elif trimmed.starts_with( "tag="):
+            val name = trimmed[4:]
+            modifiers.push(SdoctestModifier.Tag(name))
+        elif trimmed.starts_with( "@"):
+            val rc = trimmed[1:]
+            modifiers.push(SdoctestModifier.RunConfig(rc))
+
+    modifiers
+
+# =========================================================================
+# Doctest Prompt Stripping
+# =========================================================================
+
+fn strip_doctest_prompts(lines: [text]) -> [text]:
+    # Strip >>> and ... prompts from sdoctest blocks, remove expected output lines
+    var result: [text] = []
+    for line in lines:
+        var trimmed = line.trim()
+        if trimmed.starts_with( ">>> "):
+            result.push(trimmed[4:])
+        elif trimmed == ">>>":
+            result.push("")
+        elif trimmed.starts_with( "... "):
+            result.push(trimmed[4:])
+        elif trimmed == "...":
+            result.push("")
+        # else: expected output line — skip it
+    result
+
+# =========================================================================
+# Reusable Definition Extraction (for block accumulation)
+# =========================================================================
+
+fn extract_reusable_lines(code: text) -> text:
+    # Extract reusable definitions from a code block:
+    # - `use` import statements
+    # - `struct`, `class`, `enum`, `fn` definitions (with their indented bodies)
+    # Does NOT extract bare expressions, assignments, or print statements.
+    val lines = code.split("\n")
+    var result_lines: [text] = []
+    var i = 0
+
+    while i < lines.len():
+        val line = lines[i]
+        val trimmed = line.trim()
+
+        # Skip empty lines, comments, bare expressions
+        if trimmed == "" or trimmed.starts_with( "#"):
+            i = i + 1
+            continue
+
+        # Accumulate `use` import lines
+        if trimmed.starts_with( "use "):
+            result_lines.push(line)
+            i = i + 1
+            continue
+
+        # Accumulate `import` lines
+        if trimmed.starts_with( "import "):
+            result_lines.push(line)
+            i = i + 1
+            continue
+
+        # Accumulate definition blocks: struct, class, enum, fn, impl
+        var is_def = false
+        if trimmed.starts_with( "struct ") or trimmed.starts_with( "class "):
+            is_def = true
+        if trimmed.starts_with( "enum ") or trimmed.starts_with( "fn "):
+            is_def = true
+        if trimmed.starts_with( "impl "):
+            is_def = true
+        if trimmed.starts_with( "static fn "):
+            is_def = true
+        if trimmed.starts_with( "me "):
+            is_def = true
+
+        if is_def:
+            # Grab this line plus all indented continuation lines
+            val def_indent = line_indent_count(line)
+            result_lines.push(line)
+            i = i + 1
+            while i < lines.len():
+                val next_line = lines[i]
+                val next_trimmed = next_line.trim()
+                # Empty lines within definition are kept
+                if next_trimmed == "":
+                    result_lines.push(next_line)
+                    i = i + 1
+                    continue
+                val next_indent = line_indent_count(next_line)
+                if next_indent > def_indent:
+                    result_lines.push(next_line)
+                    i = i + 1
+                else:
+                    break
+            continue
+
+        # Skip everything else (bare expressions, val/var assignments, print, etc.)
+        i = i + 1
+
+    # Join and trim trailing empty lines
+    var result = result_lines.join("\n")
+    result = result.trim()
+    result
+
+fn line_indent_count(line: text) -> i64:
+    var count = 0
+    var i = 0
+    while i < line.len():
+        val ch = line[i:i + 1]
+        if ch == " ":
+            count = count + 1
+        elif ch == "\t":
+            count = count + 4
+        else:
+            break
+        i = i + 1
+    count
+
+# =========================================================================
+# Exports
+# =========================================================================

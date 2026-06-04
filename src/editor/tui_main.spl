@@ -1,0 +1,26 @@
+# Editor TUI launcher entry.
+#
+# Dedicated native entry that builds an EditSession from file args and enters
+# the terminal UI render loop (editor_tui_run). Kept narrow on purpose: it reads
+# argv via the runtime extern instead of std.cli.cli_util so the linked surface
+# stays small.
+
+use std.editor.core.session.{EditSession}
+use std.editor.core.launch.{editor_launch_file_args_after_command}
+use app.editor.editor_controller.{EditorController}
+use app.editor.tui_shell.{editor_tui_run}
+
+extern fn rt_cli_get_args() -> [text]
+
+fn _editor_tui_file_args() -> [text]:
+    editor_launch_file_args_after_command(rt_cli_get_args(), ["editor", "tui", "ide"])
+
+fn main() -> i64:
+    var session = EditSession.new()
+    val files = _editor_tui_file_args()
+    for path in files:
+        session.open_file(path)
+    if session.documents.len() == 0:
+        session.open_empty()
+    editor_tui_run(session)
+    0

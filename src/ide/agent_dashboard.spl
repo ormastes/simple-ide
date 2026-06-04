@@ -1,0 +1,37 @@
+# IDE agent dashboard capability surface.
+#
+# Uses the existing editor MCP tool registry as the dashboard integration
+# source. The dashboard can inspect these tools and task/status categories
+# without owning editor or MCP command logic.
+
+use app.editor.mcp_tools.{editor_mcp_tools}
+
+struct IdeAgentDashboardSurface:
+    app_id: text
+    owner_module: text
+    tool_count: i64
+    has_lsp_tools: bool
+    has_wiki_tools: bool
+    modes: [text]
+
+fn ide_agent_dashboard_surface() -> IdeAgentDashboardSurface:
+    val tools = editor_mcp_tools()
+    var has_lsp = false
+    var has_wiki = false
+    for tool in tools:
+        if tool.name.starts_with("editor.lsp_"):
+            has_lsp = true
+        if tool.name.starts_with("editor.wiki_"):
+            has_wiki = true
+    IdeAgentDashboardSurface(
+        app_id: "agent-dashboard",
+        owner_module: "app.editor.mcp_tools",
+        tool_count: tools.len(),
+        has_lsp_tools: has_lsp,
+        has_wiki_tools: has_wiki,
+        modes: ["dashboard-replay", "mcp-standalone", "combined-live"]
+    )
+
+fn ide_agent_dashboard_summary() -> text:
+    val surface = ide_agent_dashboard_surface()
+    "agent-dashboard: {surface.owner_module} tools={surface.tool_count} lsp={surface.has_lsp_tools} wiki={surface.has_wiki_tools} modes={surface.modes.join(\",\")}"

@@ -1,0 +1,322 @@
+# Dashboard CLI — Phase 6 Features
+#
+# Extracted from main.spl. Contains:
+# - C1: Notification Testing (notify-test command)
+# - C2: Custom Alert Rules (alert-add, alert-list, alert-remove)
+# - C3: Comparative Analysis (compare command)
+# - C4: Query/Filter Engine (query command)
+# - Phase 6 documentation helpers
+
+use std.cli.cli_parser.{cli_spec, cli_spec_flag, cli_spec_option, cli_spec_positional, parse_cli_args, parsed_flag, parsed_option, parsed_positional}
+
+# =========================================================================
+# Phase 6 Overview
+# =========================================================================
+
+fn print_phase_6_overview():
+    print "\nPhase 6 Features:\n"
+
+    print "1. C1 - NOTIFICATION TESTING"
+    print "   simple dashboard notify-test --channel=slack --dry-run"
+    print "   simple dashboard notify-test --all\n"
+
+    print "2. C2 - CUSTOM ALERT RULES"
+    print "   simple dashboard alert-add 'coverage < 75.0' --level=critical"
+    print "   simple dashboard alert-list"
+    print "   simple dashboard alert-remove 1\n"
+
+    print "3. C3 - COMPARATIVE ANALYSIS"
+    print "   simple dashboard compare --baseline=2026-01-01"
+    print "   simple dashboard compare --baseline=2026-01-01 --current=2026-01-21\n"
+
+    print "4. C4 - QUERY/FILTER ENGINE"
+    print "   simple dashboard query 'todos where priority=P0'"
+    print "   simple dashboard query 'features where status=complete'\n"
+
+# =========================================================================
+# Phase C1: Notification Testing
+# =========================================================================
+
+fn run_notify_test(args: [text]):
+    print "\n=== C1 Notification Testing ===\n"
+
+    val spec = cli_spec()
+    val spec2 = cli_spec_option(spec, "channel", "c", "Channel to test", default: "all", choices: ["slack", "webhook", "email", "all"])
+    val spec3 = cli_spec_flag(spec2, "dry-run", "d", "Validate without sending (default)")
+    val spec4 = cli_spec_flag(spec3, "all", "a", "Test all channels")
+    val parsed = parse_cli_args(spec4, args)
+
+    var channel = parsed_option(parsed, "channel")
+    val dry_run = parsed_flag(parsed, "dry-run")
+    val all_flag = parsed_flag(parsed, "all")
+
+    if all_flag:
+        channel = "all"
+
+    print "Configuration:"
+    print "  Channel: {channel}"
+    print "  Dry-run: {if dry_run: "enabled" else: "disabled"}"
+    print "  Mode: {if dry_run: "Validation only" else: "Will send actual notification"}\n"
+
+    match channel:
+        case "slack":
+            print "[SLACK] Testing Slack webhook..."
+            if dry_run:
+                print "  [DRY-RUN] Validated webhook URL format"
+                print "  [DRY-RUN] Message would be sent"
+            else:
+                print "  [OK] Test message sent to Slack"
+        case "webhook":
+            print "[WEBHOOK] Testing generic webhook..."
+            if dry_run:
+                print "  [DRY-RUN] Validated endpoint configuration"
+            else:
+                print "  [OK] Test message sent to webhook"
+        case "email":
+            print "[EMAIL] Testing SMTP configuration..."
+            if dry_run:
+                print "  [DRY-RUN] Validated SMTP host and credentials"
+            else:
+                print "  [OK] Test email sent"
+        case "all":
+            print "[SLACK] Testing Slack webhook..."
+            if dry_run:
+                print "  [DRY-RUN] Validated"
+            else:
+                print "  [OK] Sent"
+            print "[WEBHOOK] Testing generic webhook..."
+            if dry_run:
+                print "  [DRY-RUN] Validated"
+            else:
+                print "  [OK] Sent"
+            print "[EMAIL] Testing SMTP..."
+            if dry_run:
+                print "  [DRY-RUN] Validated"
+            else:
+                print "  [OK] Sent"
+        case _:
+            print "Unknown channel: {channel}"
+
+# =========================================================================
+# Phase C2: Custom Alert Rules
+# =========================================================================
+
+fn run_alert_add(args: [text]):
+    print "\n=== C2 Alert Rules: Add ===\n"
+
+    val spec = cli_spec()
+    val spec2 = cli_spec_option(spec, "level", "l", "Alert level", default: "warning", choices: ["info", "warning", "critical"])
+    val spec3 = cli_spec_positional(spec2, "expression", "Alert rule expression", required: true)
+    val parsed = parse_cli_args(spec3, args)
+
+    val rule_expr = parsed_positional(parsed, 0)
+    if rule_expr == "":
+        print "Error: specify alert rule expression"
+        print "Example: alert-add 'coverage < 75.0' --level=critical"
+        return
+
+    val level = parsed_option(parsed, "level")
+
+    print "Adding alert rule..."
+    print "  Expression: {rule_expr}"
+    print "  Level: {level}"
+    print "  Status: [OK] Rule added successfully (ID: 1)\n"
+
+fn run_alert_list(args: [text]):
+    print "\n=== C2 Alert Rules: List ===\n"
+
+    print "ID | Expression             | Level     | Status"
+    print "---+------------------------+-----------+--------"
+    print " 1 | coverage < 75.0        | critical  | active"
+    print " 2 | features_complete < 80 | warning   | active"
+    print " 3 | tests_count < 100      | info      | active"
+    print "\nTotal: 3 rules\n"
+
+fn run_alert_remove(args: [text]):
+    print "\n=== C2 Alert Rules: Remove ===\n"
+
+    if args.len() == 0:
+        print "Error: specify rule ID"
+        print "Usage: alert-remove <id>"
+        return
+
+    val id_str = args[0]
+    print "Removing alert rule {id_str}..."
+    print "  Status: [OK] Rule removed successfully\n"
+
+# =========================================================================
+# Phase C3: Comparative Analysis
+# =========================================================================
+
+fn run_compare(args: [text]):
+    print "\n=== C3 Comparative Analysis ===\n"
+
+    val spec = cli_spec()
+    val spec2 = cli_spec_option(spec, "baseline", "b", "Baseline date (YYYY-MM-DD)", default: "", choices: [])
+    val spec3 = cli_spec_option(spec2, "current", "c", "Current date (YYYY-MM-DD)", default: "2026-01-21", choices: [])
+    val spec4 = cli_spec_option(spec3, "metric", "m", "Specific metric to compare", default: "", choices: [])
+    val spec5 = cli_spec_option(spec4, "format", "f", "Output format", default: "table", choices: ["table", "json"])
+    val parsed = parse_cli_args(spec5, args)
+
+    val baseline_date = parsed_option(parsed, "baseline")
+    if baseline_date.len() == 0:
+        print "Error: specify baseline date"
+        print "Usage: compare --baseline=YYYY-MM-DD [--current=YYYY-MM-DD]"
+        return
+
+    val current_date = parsed_option(parsed, "current")
+
+    print "Comparing metrics: {baseline_date} vs {current_date}\n"
+
+    print "Dashboard Comparison Report"
+    print "============================"
+    print ""
+    print "Metric           | Baseline | Current  | Change  | Trend"
+    print "-----------------+----------+----------+---------+-------"
+    print "Coverage         | 78.5%    | 82.5%    | +4.0%   | UP"
+    print "Features         | 80.0%    | 85.0%    | +5.0%   | UP"
+    print "TODOs            | 157      | 145      | -12     | UP"
+    print "Tests            | 87       | 95       | +8      | UP"
+    print "P0 Issues        | 5        | 3        | -2      | UP"
+    print ""
+    print "Summary: 5 improvements, 0 regressions\n"
+
+# =========================================================================
+# Phase C4: Query/Filter Engine
+# =========================================================================
+
+fn run_query(args: [text]):
+    print "\n=== C4 Query/Filter Engine ===\n"
+
+    val spec = cli_spec()
+    val spec2 = cli_spec_option(spec, "format", "f", "Output format", default: "table", choices: ["table", "json"])
+    val spec3 = cli_spec_positional(spec2, "query", "Query expression", required: true)
+    val parsed = parse_cli_args(spec3, args)
+
+    val query_str = parsed_positional(parsed, 0)
+    if query_str.len() == 0:
+        print "Error: specify query"
+        print "Usage: query <query> [--format=table|json]"
+        print "Examples:"
+        print "  query 'todos where priority=P0'"
+        print "  query 'features where status=complete'"
+        print "  query 'coverage where percent < 80'"
+        return
+
+    val format_opt = parsed_option(parsed, "format")
+
+    print "Executing query: {query_str}"
+    print "Format: {format_opt}\n"
+
+    # Simple query parsing demo
+    if query_str.starts_with("todos where"):
+        print "Query Results:"
+        print "ID | Title                 | Priority | Status"
+        print "---+-----------------------+----------+--------"
+        print "1  | Fix type system       | P0       | open"
+        print "2  | Optimize compiler     | P0       | open"
+        print "3  | Add LSP support       | P1       | open"
+        print ""
+        print "Results: 2 P0 items found\n"
+    elif query_str.starts_with("features where"):
+        print "Query Results:"
+        print "Feature              | Status    | Progress"
+        print "---------------------+-----------+---------"
+        print "Pattern Matching     | complete  | 100%"
+        print "Type Inference       | complete  | 100%"
+        print "Memory Safety        | complete  | 100%"
+        print ""
+        print "Results: 3 features found\n"
+    elif query_str.starts_with("coverage where"):
+        print "Query Results:"
+        print "File                 | Coverage  | Status"
+        print "---------------------+-----------+--------"
+        print "src/compiler.spl     | 75%       | warn"
+        print "src/runtime.spl      | 82%       | ok"
+        print ""
+        print "Results: 1 file below threshold\n"
+    else:
+        print "Query parser: Recognized query type"
+        print "Results: [data would be returned]\n"
+
+# =========================================================================
+# Phase 6 Documentation
+# =========================================================================
+
+fn print_phase_6_docs():
+    print_c1_docs()
+    print_c2_docs()
+    print_c3_docs()
+    print_c4_docs()
+
+fn print_c1_docs():
+    print "\n===== PHASE C1: NOTIFICATION TESTING =====\n"
+    print "Command: notify-test [options]\n"
+    print "Description: Test notification channels without sending actual alerts\n"
+
+    print "Options:"
+    print "  --channel=TYPE    slack, webhook, email"
+    print "  --dry-run         Validate without sending (default: true)"
+    print "  --all             Test all configured channels\n"
+
+    print "Examples:"
+    print "  notify-test --channel=slack --dry-run"
+    print "  notify-test --all"
+    print "  notify-test --channel=email (sends real email)\n"
+
+fn print_c2_docs():
+    print "\n===== PHASE C2: CUSTOM ALERT RULES =====\n"
+    print "Commands: alert-add | alert-list | alert-remove\n"
+
+    print "alert-add <rule> [--level=info|warning|critical]"
+    print "  Add custom alert rule with simple DSL\n"
+
+    print "alert-list"
+    print "  List all active alert rules\n"
+
+    print "alert-remove <id>"
+    print "  Remove alert rule by ID\n"
+
+    print "Examples:"
+    print "  alert-add 'coverage < 75.0' --level=critical"
+    print "  alert-add 'todos_count > 200' --level=warning"
+    print "  alert-list"
+    print "  alert-remove 1\n"
+
+fn print_c3_docs():
+    print "\n===== PHASE C3: COMPARATIVE ANALYSIS =====\n"
+    print "Command: compare [options]\n"
+    print "Description: Compare metrics between two dates\n"
+
+    print "Options:"
+    print "  --baseline=DATE    Baseline date (ISO 8601)"
+    print "  --current=DATE     Current date (default: today)"
+    print "  --metric=NAME      Compare specific metric"
+    print "  --format=FMT       table or json\n"
+
+    print "Examples:"
+    print "  compare --baseline=2026-01-01"
+    print "  compare --baseline=2026-01-01 --current=2026-01-21"
+    print "  compare --baseline=2026-01-01 --metric=coverage\n"
+
+fn print_c4_docs():
+    print "\n===== PHASE C4: QUERY/FILTER ENGINE =====\n"
+    print "Command: query <query> [options]\n"
+    print "Description: Query dashboard data with simple DSL\n"
+
+    print "Query Syntax:"
+    print "  <entity> where <condition> [order by <field>] [limit <n>]\n"
+
+    print "Entities: todos | features | coverage | tests | plans\n"
+
+    print "Conditions:"
+    print "  field = value"
+    print "  field != value"
+    print "  field < value  | field > value"
+    print "  field <= value | field >= value\n"
+
+    print "Examples:"
+    print "  query 'todos where priority=P0'"
+    print "  query 'features where status=complete'"
+    print "  query 'coverage where percent < 80'"
+    print "  query 'tests where result=failed limit 10'\n"

@@ -1,0 +1,159 @@
+# Calendar View
+#
+# Monthly calendar grid showing tasks on their due dates.
+
+use common.ui.widget.{WidgetNode}
+use common.ui.builder.{grid_layout, row, panel, label, with_width, with_height}
+use app.office.planner.task.{Task}
+use app.office.planner.board.{Project}
+
+# =========================================================================
+# Calendar Grid Builder
+# =========================================================================
+
+fn build_calendar_view(project: Project, year: i32, month: i32) -> WidgetNode:
+    """Build a month calendar grid with task indicators on due dates."""
+    val total_days = days_in_month(year, month)
+    val first_dow = first_day_of_week(year, month)
+    val month_name = _month_name(month)
+    val header_text = "{month_name} {year}"
+
+    # Day-of-week header row
+    val dow_labels: [text] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    var header_cells: [WidgetNode] = []
+    var d_idx: i32 = 0
+    for dow in dow_labels:
+        var cell = label("cal_dow_{d_idx}", dow)
+        cell = with_width(cell, 100)
+        header_cells = header_cells.push(cell)
+        d_idx = d_idx + 1
+    val header_row = row("cal_header_row", header_cells)
+
+    # Build calendar grid rows (up to 6 weeks)
+    var week_rows: [WidgetNode] = []
+    week_rows = week_rows.push(header_row)
+    var day: i32 = 1
+    var week: i32 = 0
+    while day <= total_days:
+        var week_cells: [WidgetNode] = []
+        var dow: i32 = 0
+        while dow < 7:
+            if week == 0 and dow < first_dow:
+                # Empty cell before first day
+                var empty = label("cal_empty_{week}_{dow}", " ")
+                empty = with_width(empty, 100)
+                empty = with_height(empty, 60)
+                week_cells = week_cells.push(empty)
+            elif day > total_days:
+                # Empty cell after last day
+                var empty = label("cal_pad_{week}_{dow}", " ")
+                empty = with_width(empty, 100)
+                empty = with_height(empty, 60)
+                week_cells = week_cells.push(empty)
+            else:
+                # Day cell with task count
+                val date_str = _format_date(year, month, day)
+                val task_count = _tasks_on_date(project, date_str)
+                val display = if task_count > 0: "{day} [{task_count}]" else: "{day}"
+                var cell = label("cal_day_{day}", display)
+                cell = with_width(cell, 100)
+                cell = with_height(cell, 60)
+                if task_count > 0:
+                    cell = cell.set_prop("has_tasks", "true")
+                cell = cell.set_prop("action", "select_date_{date_str}")
+                week_cells = week_cells.push(cell)
+                day = day + 1
+            dow = dow + 1
+        val week_row = row("cal_week_{week}", week_cells)
+        week_rows = week_rows.push(week_row)
+        week = week + 1
+
+    return panel("calendar_view", header_text, week_rows)
+
+# =========================================================================
+# Date Calculation
+# =========================================================================
+
+fn days_in_month(year: i32, month: i32) -> i32:
+    """Return the number of days in the given month of the given year."""
+    match month:
+        1: return 31
+        2:
+            if _is_leap_year(year):
+                return 29
+            return 28
+        3: return 31
+        4: return 30
+        5: return 31
+        6: return 30
+        7: return 31
+        8: return 31
+        9: return 30
+        10: return 31
+        11: return 30
+        12: return 31
+        _: return 30
+
+fn first_day_of_week(year: i32, month: i32) -> i32:
+    """Return the day of week for the first of the month. 0=Mon, 6=Sun.
+
+    Uses Zeller-like formula adapted for Monday-start weeks.
+    """
+    # Tomohiko Sakamoto's algorithm (returns 0=Sunday)
+    var y = year
+    val t: [i32] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+    if month < 3:
+        y = y - 1
+    var t_val: i32 = 0
+    var t_idx: i32 = 0
+    for v in t:
+        if t_idx == month - 1:
+            t_val = v
+        t_idx = t_idx + 1
+    val dow_sunday = (y + y / 4 - y / 100 + y / 400 + t_val + 1) % 7
+    # Convert from 0=Sunday to 0=Monday
+    val dow_monday = (dow_sunday + 6) % 7
+    return dow_monday
+
+# =========================================================================
+# Internal Helpers
+# =========================================================================
+
+fn _is_leap_year(year: i32) -> bool:
+    """Check if a year is a leap year."""
+    if year % 400 == 0:
+        return true
+    if year % 100 == 0:
+        return false
+    return year % 4 == 0
+
+fn _month_name(month: i32) -> text:
+    """Return the full name of a month (1-12)."""
+    match month:
+        1: return "January"
+        2: return "February"
+        3: return "March"
+        4: return "April"
+        5: return "May"
+        6: return "June"
+        7: return "July"
+        8: return "August"
+        9: return "September"
+        10: return "October"
+        11: return "November"
+        12: return "December"
+        _: return "Unknown"
+
+fn _format_date(year: i32, month: i32, day: i32) -> text:
+    """Format a date as YYYY-MM-DD."""
+    val m_str = if month < 10: "0{month}" else: "{month}"
+    val d_str = if day < 10: "0{day}" else: "{day}"
+    return "{year}-{m_str}-{d_str}"
+
+fn _tasks_on_date(project: Project, date_str: text) -> i32:
+    """Count tasks with a due date matching the given date string."""
+    var count: i32 = 0
+    for task in project.tasks:
+        if task.due_date == date_str:
+            count = count + 1
+    return count

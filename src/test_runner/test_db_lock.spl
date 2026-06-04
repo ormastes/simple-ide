@@ -1,0 +1,29 @@
+# Test Database File Locking
+#
+# PID-based file locking with timeout and stale lock detection.
+# Uses file_lock/file_unlock SFFI for OS-level locking.
+
+use std.io.{file_lock, file_unlock}
+
+# =========================================================================
+# FileLock
+# =========================================================================
+
+struct FileLock:
+    handle: i64
+    path: text
+
+impl FileLock:
+    static fn acquire(path: text, timeout_secs: i64) -> FileLock?:
+        val handle = file_lock(path, timeout_secs)
+        if handle < 0:
+            eprint("Failed to acquire lock for {path} (timeout: {timeout_secs}s)")
+            return nil
+        FileLock(handle: handle, path: path)
+
+    fn release() -> bool:
+        file_unlock(self.handle)
+
+    fn is_valid() -> bool:
+        self.handle > 0
+

@@ -1,0 +1,83 @@
+# Task Daemon Collector
+#
+# Discovers background jobs written by the task daemon into
+# .build/task_daemon/tasks/*.task (key=value format) and maps
+# them to ManagedTask entries with kind=TaskKind.Job.
+
+use app.llm_dashboard.data.types.{ManagedTask, TaskKind, TaskState}
+
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_dir_list(path: text) -> [text]
+
+# =========================================================================
+# Public API
+# =========================================================================
+
+fn collect_task_daemon_tasks() -> [ManagedTask]:
+    """Scan .build/task_daemon/tasks/ for *.task files and return ManagedTask list."""
+    var tasks: [ManagedTask] = []
+    val task_dir = ".build/task_daemon/tasks"
+    if not rt_file_exists(task_dir):
+        return tasks
+    val files = rt_dir_list(task_dir)
+    for fname in files:
+        if fname.ends_with(".task"):
+            val path = "{task_dir}/{fname}"
+            val content = rt_file_read_text(path)
+            val task = _parse_task_file(fname, content)
+            if task.id != "":
+                tasks.push(task)
+    return tasks
+
+# =========================================================================
+# Internal: parse one task file
+# =========================================================================
+
+fn _parse_task_file(fname: text, content: text) -> ManagedTask:
+    """Parse key=value lines from a .task file into a ManagedTask."""
+    val id = _extract_kv(content, "id")
+    val command = _extract_kv(content, "command")
+    val pid_str = _extract_kv(content, "pid")
+    val status = _extract_kv(content, "status")
+    val exit_code_str = _extract_kv(content, "exit_code")
+    val start_time_str = _extract_kv(content, "start_time")
+
+    # Derive id: prefer field, fall back to stripping .task extension
+    val resolved_id = if id != "":
+        id
+    elif fname.ends_with(".task"):
+        fname.slice(0, fname.len() - 5)
+    else:
+        fname
+
+    var task = ManagedTask.new(resolved_id, TaskKind.Job, resolved_id, command)
+    task.state = _status_to_state(status)
+    task.agent_id = pid_str
+    if start_time_str != "":
+        task.created_at = start_time_str.to_i64() ?? 0
+    return task
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _status_to_state(status: text) -> TaskState:
+    match status:
+        "working"   => TaskState.Active
+        "completed" => TaskState.Completed
+        "failed"    => TaskState.Failed
+        "cancelled" => TaskState.Cancelled
+        _           => TaskState.Active
+
+fn _extract_kv(content: text, key: text) -> text:
+    """Extract value for key from key=value lines."""
+    val needle = "{key}="
+    val idx = content.index_of(needle)
+    if idx < 0:
+        return ""
+    val after = content.slice(idx + needle.len())
+    val end = after.index_of("\n")
+    if end >= 0:
+        return after.slice(0, end).trim()
+    return after.trim()

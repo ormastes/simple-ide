@@ -1,0 +1,62 @@
+# Editor Controller Types
+#
+# Data structs used by EditorController and its helper modules.
+
+struct EditorAction:
+    redraw: bool
+    quit: bool
+    status_msg: text
+
+struct NormalKeyResult:
+    message: text
+    quit: bool
+    enter_insert: bool
+    enter_command: bool
+
+struct InsertKeyResult:
+    message: text
+    exit_insert: bool
+
+struct CommandKeyResult:
+    commandline: text
+    done: bool
+    cancelled: bool
+
+struct EditorAppliedCodeAction:
+    applied: bool
+    content: text
+    line: i64
+    col: i64
+
+struct EditorPropertyPayload:
+    key: text
+    value: text
+
+struct EditorVaultPropertyPayload:
+    root: text
+    key: text
+    value: text
+    selected_paths: [text]
+
+struct EditorLocation:
+    path: text
+    line: i64
+    col: i64
+
+struct LayoutZones:
+    tab_bar_y: i64
+    tab_bar_h: i64
+    sidebar_x: i64
+    sidebar_y: i64
+    sidebar_w: i64
+    sidebar_h: i64
+    editor_x: i64
+    editor_y: i64
+    editor_w: i64
+    editor_h: i64
+    status_y: i64
+    command_y: i64
+
+struct LayoutZonesRight:
+    x: i64
+    w: i64

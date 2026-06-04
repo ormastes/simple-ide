@@ -1,0 +1,648 @@
+# Dashboard Assistant Bridge Contract
+#
+# Dashboard-side contract for attaching to assistant snapshots/deltas without
+# becoming the source of truth. The assistant core owns persistence and
+# mutation; this module only classifies, merges, and reports bridge state.
+
+struct AssistantBridgePolicy:
+    source_of_truth: text
+    allow_live_attach: bool
+    allow_operator_actions: bool
+    allow_snapshots: bool
+    allow_deltas: bool
+    allow_notification_delivery: bool
+    stale_after_micros: i64
+    degraded_after_micros: i64
+    max_delta_batch: i64
+    refresh_on_attach: bool
+
+struct AssistantBridgeSnapshot:
+    snapshot_id: text
+    session_id: text
+    source_of_truth: text
+    revision: i64
+    objective: text
+    status: text
+    mode: text
+    timeline_count: i64
+    task_count: i64
+    notification_count: i64
+    digest_checkpoint_id: text
+    captured_at_micros: i64
+    loaded_at_micros: i64
+    live_attachable: bool
+
+struct AssistantBridgeDelta:
+    delta_id: text
+    session_id: text
+    source_of_truth: text
+    revision: i64
+    delta_kind: text
+    summary: text
+    payload_kind: text
+    correlation_id: text
+    created_at_micros: i64
+    is_state_change: bool
+    is_control_plane: bool
+
+struct AssistantBridgeFreshness:
+    session_id: text
+    source_of_truth: text
+    attachment_mode: text
+    state: text
+    reason: text
+    snapshot_id: text
+    delta_id: text
+    revision: i64
+    last_seen_micros: i64
+    age_micros: i64
+    stale_after_micros: i64
+    degraded_after_micros: i64
+    is_live: bool
+    is_stale: bool
+    is_degraded: bool
+    can_route_actions: bool
+    should_refresh: bool
+
+struct AssistantBridgeNotificationState:
+    total: i64
+    pending: i64
+    delivered: i64
+    suppressed: i64
+    last_notification_id: text
+    last_route_reason: text
+    last_delivery_status: text
+
+struct AssistantBridgeProjection:
+    session_id: text
+    source_of_truth: text
+    mode: text
+    snapshot: AssistantBridgeSnapshot
+    last_delta: AssistantBridgeDelta
+    freshness: AssistantBridgeFreshness
+    notifications: AssistantBridgeNotificationState
+    last_refresh_micros: i64
+    live_attached: bool
+    live_controls_enabled: bool
+    read_only: bool
+    degraded_reason: text
+
+struct AssistantBridgeRouteDecision:
+    action_kind: text
+    allowed: bool
+    route_target: text
+    policy_state: text
+    reason: text
+    should_refresh: bool
+    requires_live_attach: bool
+
+fn assistant_bridge_default_policy() -> AssistantBridgePolicy:
+    AssistantBridgePolicy(
+        source_of_truth: "assistant_core",
+        allow_live_attach: true,
+        allow_operator_actions: true,
+        allow_snapshots: true,
+        allow_deltas: true,
+        allow_notification_delivery: true,
+        stale_after_micros: 30_000_000,
+        degraded_after_micros: 120_000_000,
+        max_delta_batch: 256,
+        refresh_on_attach: true
+    )
+
+fn assistant_bridge_empty_notification_state() -> AssistantBridgeNotificationState:
+    AssistantBridgeNotificationState(
+        total: 0,
+        pending: 0,
+        delivered: 0,
+        suppressed: 0,
+        last_notification_id: "",
+        last_route_reason: "",
+        last_delivery_status: ""
+    )
+
+fn assistant_bridge_empty_snapshot(session_id: text, source_of_truth: text) -> AssistantBridgeSnapshot:
+    AssistantBridgeSnapshot(
+        snapshot_id: "",
+        session_id: session_id,
+        source_of_truth: source_of_truth,
+        revision: 0,
+        objective: "",
+        status: "unknown",
+        mode: "replay",
+        timeline_count: 0,
+        task_count: 0,
+        notification_count: 0,
+        digest_checkpoint_id: "",
+        captured_at_micros: 0,
+        loaded_at_micros: 0,
+        live_attachable: false
+    )
+
+fn assistant_bridge_empty_delta(session_id: text, source_of_truth: text) -> AssistantBridgeDelta:
+    AssistantBridgeDelta(
+        delta_id: "",
+        session_id: session_id,
+        source_of_truth: source_of_truth,
+        revision: 0,
+        delta_kind: "none",
+        summary: "",
+        payload_kind: "",
+        correlation_id: "",
+        created_at_micros: 0,
+        is_state_change: false,
+        is_control_plane: false
+    )
+
+fn _assistant_bridge_age_micros(now_micros: i64, stamp_micros: i64) -> i64:
+    if now_micros <= 0 or stamp_micros <= 0:
+        return 0
+    val age = now_micros - stamp_micros
+    if age <= 0:
+        return 0
+    age
+
+fn _assistant_bridge_source_is_live(snapshot: AssistantBridgeSnapshot, policy: AssistantBridgePolicy) -> bool:
+    policy.allow_live_attach and policy.allow_snapshots and snapshot.live_attachable and snapshot.source_of_truth == policy.source_of_truth
+
+fn _assistant_bridge_observed_time(snapshot: AssistantBridgeSnapshot, delta: AssistantBridgeDelta) -> i64:
+    if delta.created_at_micros > 0:
+        return delta.created_at_micros
+    if snapshot.loaded_at_micros > 0:
+        return snapshot.loaded_at_micros
+    snapshot.captured_at_micros
+
+fn assistant_bridge_freshness_from_snapshot(snapshot: AssistantBridgeSnapshot, policy: AssistantBridgePolicy, now_micros: i64) -> AssistantBridgeFreshness:
+    val source_live = _assistant_bridge_source_is_live(snapshot, policy)
+    val observed_at = if snapshot.loaded_at_micros > 0: snapshot.loaded_at_micros else: snapshot.captured_at_micros
+    val age = _assistant_bridge_age_micros(now_micros, observed_at)
+
+    if not source_live:
+        var reason = "replay-only snapshot"
+        if snapshot.live_attachable and snapshot.source_of_truth != policy.source_of_truth:
+            reason = "source-of-truth mismatch"
+        return AssistantBridgeFreshness(
+            session_id: snapshot.session_id,
+            source_of_truth: snapshot.source_of_truth,
+            attachment_mode: "replay",
+            state: "replay",
+            reason: reason,
+            snapshot_id: snapshot.snapshot_id,
+            delta_id: "",
+            revision: snapshot.revision,
+            last_seen_micros: observed_at,
+            age_micros: age,
+            stale_after_micros: policy.stale_after_micros,
+            degraded_after_micros: policy.degraded_after_micros,
+            is_live: false,
+            is_stale: false,
+            is_degraded: false,
+            can_route_actions: false,
+            should_refresh: false
+        )
+
+    if observed_at <= 0:
+        return AssistantBridgeFreshness(
+            session_id: snapshot.session_id,
+            source_of_truth: snapshot.source_of_truth,
+            attachment_mode: "live",
+            state: "disconnected",
+            reason: "snapshot has no freshness timestamp",
+            snapshot_id: snapshot.snapshot_id,
+            delta_id: "",
+            revision: snapshot.revision,
+            last_seen_micros: 0,
+            age_micros: 0,
+            stale_after_micros: policy.stale_after_micros,
+            degraded_after_micros: policy.degraded_after_micros,
+            is_live: false,
+            is_stale: false,
+            is_degraded: true,
+            can_route_actions: false,
+            should_refresh: policy.refresh_on_attach
+        )
+
+    if age <= policy.stale_after_micros:
+        return AssistantBridgeFreshness(
+            session_id: snapshot.session_id,
+            source_of_truth: snapshot.source_of_truth,
+            attachment_mode: "live",
+            state: "fresh",
+            reason: "attached to live assistant core",
+            snapshot_id: snapshot.snapshot_id,
+            delta_id: "",
+            revision: snapshot.revision,
+            last_seen_micros: observed_at,
+            age_micros: age,
+            stale_after_micros: policy.stale_after_micros,
+            degraded_after_micros: policy.degraded_after_micros,
+            is_live: true,
+            is_stale: false,
+            is_degraded: false,
+            can_route_actions: policy.allow_operator_actions,
+            should_refresh: false
+        )
+
+    if age <= policy.degraded_after_micros:
+        return AssistantBridgeFreshness(
+            session_id: snapshot.session_id,
+            source_of_truth: snapshot.source_of_truth,
+            attachment_mode: "live",
+            state: "stale",
+            reason: "live source has not refreshed recently",
+            snapshot_id: snapshot.snapshot_id,
+            delta_id: "",
+            revision: snapshot.revision,
+            last_seen_micros: observed_at,
+            age_micros: age,
+            stale_after_micros: policy.stale_after_micros,
+            degraded_after_micros: policy.degraded_after_micros,
+            is_live: true,
+            is_stale: true,
+            is_degraded: false,
+            can_route_actions: false,
+            should_refresh: true
+        )
+
+    AssistantBridgeFreshness(
+        session_id: snapshot.session_id,
+        source_of_truth: snapshot.source_of_truth,
+        attachment_mode: "live",
+        state: "degraded",
+        reason: "live source is beyond degraded threshold",
+        snapshot_id: snapshot.snapshot_id,
+        delta_id: "",
+        revision: snapshot.revision,
+        last_seen_micros: observed_at,
+        age_micros: age,
+        stale_after_micros: policy.stale_after_micros,
+        degraded_after_micros: policy.degraded_after_micros,
+        is_live: true,
+        is_stale: false,
+        is_degraded: true,
+        can_route_actions: false,
+        should_refresh: true
+    )
+
+fn assistant_bridge_freshness_from_delta(snapshot: AssistantBridgeSnapshot, delta: AssistantBridgeDelta, policy: AssistantBridgePolicy, now_micros: i64) -> AssistantBridgeFreshness:
+    if delta.delta_id == "":
+        return assistant_bridge_freshness_from_snapshot(snapshot, policy, now_micros)
+    if not policy.allow_deltas:
+        return AssistantBridgeFreshness(
+            session_id: snapshot.session_id,
+            source_of_truth: snapshot.source_of_truth,
+            attachment_mode: "replay",
+            state: "replay",
+            reason: "delta attachments disabled by policy",
+            snapshot_id: snapshot.snapshot_id,
+            delta_id: delta.delta_id,
+            revision: snapshot.revision,
+            last_seen_micros: delta.created_at_micros,
+            age_micros: _assistant_bridge_age_micros(now_micros, delta.created_at_micros),
+            stale_after_micros: policy.stale_after_micros,
+            degraded_after_micros: policy.degraded_after_micros,
+            is_live: false,
+            is_stale: false,
+            is_degraded: false,
+            can_route_actions: false,
+            should_refresh: false
+        )
+    if delta.session_id != snapshot.session_id:
+        return AssistantBridgeFreshness(
+            session_id: snapshot.session_id,
+            source_of_truth: snapshot.source_of_truth,
+            attachment_mode: "live",
+            state: "disconnected",
+            reason: "delta session mismatch",
+            snapshot_id: snapshot.snapshot_id,
+            delta_id: delta.delta_id,
+            revision: snapshot.revision,
+            last_seen_micros: delta.created_at_micros,
+            age_micros: _assistant_bridge_age_micros(now_micros, delta.created_at_micros),
+            stale_after_micros: policy.stale_after_micros,
+            degraded_after_micros: policy.degraded_after_micros,
+            is_live: false,
+            is_stale: false,
+            is_degraded: true,
+            can_route_actions: false,
+            should_refresh: true
+        )
+    if delta.source_of_truth != policy.source_of_truth:
+        return AssistantBridgeFreshness(
+            session_id: snapshot.session_id,
+            source_of_truth: snapshot.source_of_truth,
+            attachment_mode: "replay",
+            state: "replay",
+            reason: "delta source-of-truth mismatch",
+            snapshot_id: snapshot.snapshot_id,
+            delta_id: delta.delta_id,
+            revision: snapshot.revision,
+            last_seen_micros: delta.created_at_micros,
+            age_micros: _assistant_bridge_age_micros(now_micros, delta.created_at_micros),
+            stale_after_micros: policy.stale_after_micros,
+            degraded_after_micros: policy.degraded_after_micros,
+            is_live: false,
+            is_stale: false,
+            is_degraded: false,
+            can_route_actions: false,
+            should_refresh: false
+        )
+
+    val observed_at = _assistant_bridge_observed_time(snapshot, delta)
+    val age = _assistant_bridge_age_micros(now_micros, observed_at)
+    val revision = if delta.revision > snapshot.revision: delta.revision else: snapshot.revision
+
+    if age <= policy.stale_after_micros:
+        return AssistantBridgeFreshness(
+            session_id: snapshot.session_id,
+            source_of_truth: snapshot.source_of_truth,
+            attachment_mode: "live",
+            state: "fresh",
+            reason: "delta received from live assistant core",
+            snapshot_id: snapshot.snapshot_id,
+            delta_id: delta.delta_id,
+            revision: revision,
+            last_seen_micros: observed_at,
+            age_micros: age,
+            stale_after_micros: policy.stale_after_micros,
+            degraded_after_micros: policy.degraded_after_micros,
+            is_live: true,
+            is_stale: false,
+            is_degraded: false,
+            can_route_actions: policy.allow_operator_actions,
+            should_refresh: false
+        )
+
+    if age <= policy.degraded_after_micros:
+        return AssistantBridgeFreshness(
+            session_id: snapshot.session_id,
+            source_of_truth: snapshot.source_of_truth,
+            attachment_mode: "live",
+            state: "stale",
+            reason: "delta stream is stale",
+            snapshot_id: snapshot.snapshot_id,
+            delta_id: delta.delta_id,
+            revision: revision,
+            last_seen_micros: observed_at,
+            age_micros: age,
+            stale_after_micros: policy.stale_after_micros,
+            degraded_after_micros: policy.degraded_after_micros,
+            is_live: true,
+            is_stale: true,
+            is_degraded: false,
+            can_route_actions: false,
+            should_refresh: true
+        )
+
+    AssistantBridgeFreshness(
+        session_id: snapshot.session_id,
+        source_of_truth: snapshot.source_of_truth,
+        attachment_mode: "live",
+        state: "degraded",
+        reason: "delta stream is degraded",
+        snapshot_id: snapshot.snapshot_id,
+        delta_id: delta.delta_id,
+        revision: revision,
+        last_seen_micros: observed_at,
+        age_micros: age,
+        stale_after_micros: policy.stale_after_micros,
+        degraded_after_micros: policy.degraded_after_micros,
+        is_live: true,
+        is_stale: false,
+        is_degraded: true,
+        can_route_actions: false,
+        should_refresh: true
+    )
+
+fn assistant_bridge_notification_state_from_snapshot(snapshot: AssistantBridgeSnapshot) -> AssistantBridgeNotificationState:
+    AssistantBridgeNotificationState(
+        total: snapshot.notification_count,
+        pending: 0,
+        delivered: snapshot.notification_count,
+        suppressed: 0,
+        last_notification_id: snapshot.snapshot_id,
+        last_route_reason: "snapshot-imported",
+        last_delivery_status: "snapshot"
+    )
+
+fn assistant_bridge_projection_from_snapshot(snapshot: AssistantBridgeSnapshot, policy: AssistantBridgePolicy, now_micros: i64) -> AssistantBridgeProjection:
+    val freshness = assistant_bridge_freshness_from_snapshot(snapshot, policy, now_micros)
+    val notifications = assistant_bridge_notification_state_from_snapshot(snapshot)
+    val last_delta = assistant_bridge_empty_delta(snapshot.session_id, snapshot.source_of_truth)
+    var mode = "replay"
+    if freshness.state == "fresh" or freshness.state == "stale":
+        mode = "live"
+    elif freshness.state == "degraded":
+        mode = "degraded"
+
+    AssistantBridgeProjection(
+        session_id: snapshot.session_id,
+        source_of_truth: snapshot.source_of_truth,
+        mode: mode,
+        snapshot: snapshot,
+        last_delta: last_delta,
+        freshness: freshness,
+        notifications: notifications,
+        last_refresh_micros: if snapshot.loaded_at_micros > 0: snapshot.loaded_at_micros else: now_micros,
+        live_attached: freshness.is_live,
+        live_controls_enabled: freshness.can_route_actions,
+        read_only: not freshness.can_route_actions,
+        degraded_reason: freshness.reason
+    )
+
+fn assistant_bridge_projection_from_empty(session_id: text, policy: AssistantBridgePolicy, now_micros: i64) -> AssistantBridgeProjection:
+    val snapshot = assistant_bridge_empty_snapshot(session_id, policy.source_of_truth)
+    val freshness = AssistantBridgeFreshness(
+        session_id: session_id,
+        source_of_truth: policy.source_of_truth,
+        attachment_mode: "replay",
+        state: "replay",
+        reason: "standalone replay mode",
+        snapshot_id: "",
+        delta_id: "",
+        revision: 0,
+        last_seen_micros: now_micros,
+        age_micros: 0,
+        stale_after_micros: policy.stale_after_micros,
+        degraded_after_micros: policy.degraded_after_micros,
+        is_live: false,
+        is_stale: false,
+        is_degraded: false,
+        can_route_actions: false,
+        should_refresh: false
+    )
+    AssistantBridgeProjection(
+        session_id: session_id,
+        source_of_truth: policy.source_of_truth,
+        mode: "replay",
+        snapshot: snapshot,
+        last_delta: assistant_bridge_empty_delta(session_id, policy.source_of_truth),
+        freshness: freshness,
+        notifications: assistant_bridge_empty_notification_state(),
+        last_refresh_micros: now_micros,
+        live_attached: false,
+        live_controls_enabled: false,
+        read_only: true,
+        degraded_reason: "standalone replay mode"
+    )
+
+fn assistant_bridge_apply_delta(projection: AssistantBridgeProjection, delta: AssistantBridgeDelta, policy: AssistantBridgePolicy, now_micros: i64) -> AssistantBridgeProjection:
+    val freshness = assistant_bridge_freshness_from_delta(projection.snapshot, delta, policy, now_micros)
+    var notifications = projection.notifications
+
+    if delta.delta_kind == "notification":
+        if policy.allow_notification_delivery:
+            notifications.total = notifications.total + 1
+            notifications.pending = notifications.pending + 1
+            notifications.last_delivery_status = "recorded"
+        else:
+            notifications.suppressed = notifications.suppressed + 1
+            notifications.last_delivery_status = "suppressed"
+        notifications.last_notification_id = delta.delta_id
+        notifications.last_route_reason = delta.payload_kind
+    elif delta.delta_kind == "notification_ack":
+        if notifications.pending > 0:
+            notifications.pending = notifications.pending - 1
+        notifications.delivered = notifications.delivered + 1
+        notifications.last_notification_id = delta.delta_id
+        notifications.last_route_reason = delta.payload_kind
+        notifications.last_delivery_status = "acked"
+    elif delta.delta_kind == "notification_suppressed":
+        notifications.suppressed = notifications.suppressed + 1
+        notifications.last_notification_id = delta.delta_id
+        notifications.last_route_reason = delta.payload_kind
+        notifications.last_delivery_status = "suppressed"
+    elif delta.delta_kind == "refresh":
+        notifications.last_route_reason = "refresh"
+        notifications.last_delivery_status = "refreshed"
+    elif delta.payload_kind != "":
+        notifications.last_route_reason = delta.payload_kind
+
+    var mode = "replay"
+    if freshness.state == "fresh" or freshness.state == "stale":
+        mode = "live"
+    elif freshness.state == "degraded":
+        mode = "degraded"
+
+    AssistantBridgeProjection(
+        session_id: projection.session_id,
+        source_of_truth: projection.source_of_truth,
+        mode: mode,
+        snapshot: projection.snapshot,
+        last_delta: delta,
+        freshness: freshness,
+        notifications: notifications,
+        last_refresh_micros: if delta.created_at_micros > 0: delta.created_at_micros else: now_micros,
+        live_attached: freshness.is_live,
+        live_controls_enabled: freshness.can_route_actions,
+        read_only: not freshness.can_route_actions,
+        degraded_reason: freshness.reason
+    )
+
+fn assistant_bridge_is_stale(freshness: AssistantBridgeFreshness) -> bool:
+    freshness.state == "stale"
+
+fn assistant_bridge_is_degraded(freshness: AssistantBridgeFreshness) -> bool:
+    freshness.state == "degraded" or freshness.state == "disconnected"
+
+fn assistant_bridge_can_route_action(freshness: AssistantBridgeFreshness, action_kind: text) -> bool:
+    if action_kind == "refresh" or action_kind == "inspect" or action_kind == "status" or action_kind == "timeline" or action_kind == "tasks" or action_kind == "notifications" or action_kind == "brief":
+        return true
+    freshness.can_route_actions
+
+fn assistant_bridge_mode_label(projection: AssistantBridgeProjection) -> text:
+    projection.mode
+
+fn assistant_bridge_health_label(freshness: AssistantBridgeFreshness) -> text:
+    freshness.state
+
+fn assistant_bridge_age_label(age_micros: i64) -> text:
+    if age_micros <= 0:
+        return "0s"
+    val seconds = age_micros / 1_000_000
+    if seconds < 60:
+        return "{seconds}s"
+    val minutes = seconds / 60
+    if minutes < 60:
+        return "{minutes}m"
+    val hours = minutes / 60
+    "{hours}h"
+
+fn assistant_bridge_notification_label(notifications: AssistantBridgeNotificationState) -> text:
+    "pending={notifications.pending} delivered={notifications.delivered} suppressed={notifications.suppressed}"
+
+fn assistant_bridge_banner_text(projection: AssistantBridgeProjection) -> text:
+    val freshness = projection.freshness
+    val age_text = assistant_bridge_age_label(freshness.age_micros)
+    val controls = if projection.live_controls_enabled: "controls=enabled" else: "controls=read-only"
+    val notifications = assistant_bridge_notification_label(projection.notifications)
+    "session={projection.session_id} mode={projection.mode} health={freshness.state} age={age_text} {controls} {notifications}"
+
+fn assistant_bridge_degraded_reason(freshness: AssistantBridgeFreshness) -> text:
+    freshness.reason
+
+fn assistant_bridge_route_action(projection: AssistantBridgeProjection, action_kind: text) -> AssistantBridgeRouteDecision:
+    if action_kind == "refresh":
+        return AssistantBridgeRouteDecision(
+            action_kind: action_kind,
+            allowed: true,
+            route_target: "bridge_refresh",
+            policy_state: projection.freshness.state,
+            reason: "refresh the live bridge or replay snapshot",
+            should_refresh: true,
+            requires_live_attach: false
+        )
+
+    if action_kind == "inspect" or action_kind == "status" or action_kind == "timeline" or action_kind == "tasks" or action_kind == "notifications" or action_kind == "brief":
+        return AssistantBridgeRouteDecision(
+            action_kind: action_kind,
+            allowed: true,
+            route_target: "dashboard_cache",
+            policy_state: "read_only",
+            reason: "read-only inspection is always allowed",
+            should_refresh: false,
+            requires_live_attach: false
+        )
+
+    if projection.freshness.can_route_actions:
+        return AssistantBridgeRouteDecision(
+            action_kind: action_kind,
+            allowed: true,
+            route_target: "assistant_core",
+            policy_state: "live",
+            reason: "live bridge attached and fresh enough for operator control",
+            should_refresh: false,
+            requires_live_attach: true
+        )
+
+    if projection.freshness.state == "stale":
+        return AssistantBridgeRouteDecision(
+            action_kind: action_kind,
+            allowed: false,
+            route_target: "blocked",
+            policy_state: "stale",
+            reason: "bridge is stale; refresh before routing control actions",
+            should_refresh: true,
+            requires_live_attach: true
+        )
+
+    if projection.freshness.state == "degraded" or projection.freshness.state == "disconnected":
+        return AssistantBridgeRouteDecision(
+            action_kind: action_kind,
+            allowed: false,
+            route_target: "blocked",
+            policy_state: projection.freshness.state,
+            reason: "bridge is degraded or disconnected; control actions are blocked",
+            should_refresh: true,
+            requires_live_attach: true
+        )
+
+    AssistantBridgeRouteDecision(
+        action_kind: action_kind,
+        allowed: false,
+        route_target: "blocked",
+        policy_state: projection.freshness.state,
+        reason: "bridge is replay-only; control actions stay on the assistant core",
+        should_refresh: false,
+        requires_live_attach: false
+    )

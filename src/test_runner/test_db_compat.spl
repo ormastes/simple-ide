@@ -1,0 +1,169 @@
+# Test Database Compatibility Layer
+#
+# Wraps unified lib.database.test_extended with custom test_db_core API
+# for backward compatibility during migration.
+#
+# This allows test runner to use unified library without changing all call sites.
+# Once migration is complete, call sites can be updated to use unified API directly.
+
+use std.database.test_extended.{
+    TestDatabaseExtended,
+    load_test_database_extended,
+    load_with_migration,
+    RunRecord,
+    TestInfo
+}
+use std.test_runner.test_db_types.{TestStatus, status_to_str}
+use std.test_runner.test_db_core.{parse_rfc3339_to_micros}
+
+# ============================================================================
+# Compatibility Wrapper
+# ============================================================================
+
+class TestDatabase:
+    db: TestDatabaseExtended
+    current_run_id: text
+
+    # Load from default path with auto-migration
+    static fn load() -> Result<TestDatabase, text>:
+        val db_opt = load_with_migration(path: "doc/08_tracking/test/test_db")
+        if not db_opt.?:
+            return Err("Failed to load test database")
+
+        Ok(TestDatabase(
+            db: db_opt.unwrap(),
+            current_run_id: ""
+        ))
+
+    # Save database
+    fn save() -> Result<(), text>:
+        val success = self.db.save()
+        if success:
+            Ok(())
+        else:
+            Err("Failed to save database")
+
+    # Update test result (custom API)
+    me update_test_result(
+        test_name: text,
+        test_file: text,
+        suite_name: text,
+        category: text,            # Ignored in unified implementation (derived from path)
+        status: TestStatus,
+        duration_ms: f64
+    ):
+        # Convert TestStatus enum to string
+        val status_str = status_to_str(status)
+
+        # Call unified API
+        # Note: unified API uses file_path as base for hierarchy
+        # custom API has separate test_name and test_file
+        # For compatibility, use test_name as the actual test name
+        self.db.update_test_result(
+            file_path: test_file,
+            suite_name: suite_name,
+            test_name: test_name,
+            status: status_str,
+            duration_ms: duration_ms,
+            run_id: self.current_run_id
+        )
+
+    # Start run tracking
+    me start_run() -> text:
+        val run_id = self.db.start_run()
+        self.current_run_id = run_id
+        run_id
+
+    # Complete run
+    me complete_run(run_id: text, test_count: i64, passed: i64, failed: i64, timed_out: i64):
+        self.db.complete_run(run_id: run_id, test_count: test_count, passed: passed, failed: failed, timed_out: timed_out)
+
+    # Cleanup stale runs
+    me cleanup_stale_runs(max_age_hours: i64):
+        val _deleted = self.db.cleanup_stale_runs(max_age_hours)
+        # Custom API returns void, unified returns count - discard result
+        ()
+
+    # Prune old runs
+    me prune_runs(keep_count: i64):
+        val _deleted = self.db.prune_runs(keep_count)
+        # Custom API returns void, unified returns count - discard result
+        ()
+
+    # List test runs
+    fn list_runs(status_filter: text) -> [RunRecord]:
+        self.db.list_runs(status_filter)
+
+    # ========================================================================
+    # Documentation Query Methods
+    # ========================================================================
+
+    # Get all test information
+    fn all_test_info() -> [TestInfo]:
+        self.db.all_test_info()
+
+    # Get tests by status
+    fn tests_by_status(status: text) -> [TestInfo]:
+        self.db.tests_by_status(status)
+
+    # Get test counts (total, passed, failed, skipped)
+    fn test_count_by_status() -> (i64, i64, i64, i64):
+        self.db.test_count_by_status()
+
+    # Get flaky test names
+    fn flaky_test_names() -> [text]:
+        self.db.flaky_test_names()
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn micros_to_rfc3339(micros: i64) -> text:
+    # Convert microseconds to RFC3339 timestamp
+    # Format: YYYY-MM-DDTHH:MM:SSZ
+    val secs = micros / 1000000
+
+    # Calculate components (simplified Gregorian calendar)
+    val days_since_epoch = secs / 86400
+    val seconds_today = secs % 86400
+
+    val hours = seconds_today / 3600
+    val minutes = (seconds_today % 3600) / 60
+    val seconds = seconds_today % 60
+
+    # Simplified year/month/day calculation (assumes 1970 epoch)
+    # This is approximate for non-leap year adjustments
+    val year = 1970 + (days_since_epoch / 365)
+    val day_of_year = days_since_epoch % 365
+    val month = (day_of_year / 30) + 1  # Simplified month
+    val day = (day_of_year % 30) + 1    # Simplified day
+
+    # Format as RFC3339 (pad with zeros)
+    val year_str = pad_zero(num: year, width: 4)
+    val month_str = pad_zero(num: month, width: 2)
+    val day_str = pad_zero(num: day, width: 2)
+    val hour_str = pad_zero(num: hours, width: 2)
+    val min_str = pad_zero(num: minutes, width: 2)
+    val sec_str = pad_zero(num: seconds, width: 2)
+
+    "{year_str}-{month_str}-{day_str}T{hour_str}:{min_str}:{sec_str}Z"
+
+fn pad_zero(num: i64, width: i64) -> text:
+    # Pad number with leading zeros to specified width
+    val s = "{num}"
+    var result = s
+    var current_len = s.len()
+
+    # Add leading zeros
+    while current_len < width:
+        result = "0" + result
+        current_len = current_len + 1
+
+    result
+
+# ============================================================================
+# Exports
+# ============================================================================
+
+fn load_test_db_compat() -> Result<TestDatabase, text>:
+    TestDatabase.load()

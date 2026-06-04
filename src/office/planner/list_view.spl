@@ -1,0 +1,43 @@
+# List View
+#
+# Renders a project's tasks as a sortable table.
+
+use common.ui.widget.{WidgetNode}
+use common.ui.builder.{panel, table_widget}
+use app.office.planner.task.{Task, status_name, priority_name, priority_icon}
+use app.office.planner.board.{Project}
+
+# =========================================================================
+# List View Builder
+# =========================================================================
+
+fn build_list_view(project: Project) -> WidgetNode:
+    """Build a table widget with all project tasks as rows."""
+    val headers: [text] = ["Priority", "Title", "Status", "Assignee", "Due Date", "Labels"]
+    var rows: [[text]] = []
+    for task in project.tasks:
+        val prio = "{priority_icon(task.priority)} {priority_name(task.priority)}"
+        val status = status_name(task.status)
+        val assignee = if task.assignee != "": task.assignee else: "-"
+        val due = if task.due_date != "": task.due_date else: "-"
+        val labels = _format_task_labels(task)
+        val row: [text] = [prio, task.title, status, assignee, due, labels]
+        rows = rows.push(row)
+    if rows.len() == 0:
+        rows = rows.push(["-", "(no tasks)", "-", "-", "-", "-"])
+    return panel("list_view", "All Tasks", [
+        table_widget("task_table", headers, rows)
+    ])
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _format_task_labels(task: Task) -> text:
+    """Format task labels as a comma-separated string."""
+    if task.labels.len() == 0:
+        return "-"
+    var names: [text] = []
+    for lbl in task.labels:
+        names = names.push(lbl.name)
+    return names.join(", ")

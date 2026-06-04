@@ -1,0 +1,84 @@
+# Cron Expression Parser
+#
+# Minimal 5-field cron expression support: minute hour dom month dow
+# e.g. "0 9 * * *" = daily at 9am, "*/5 * * * *" = every 5 minutes
+#
+# Returns timestamps in unix milliseconds (seconds precision).
+
+# =========================================================================
+# Cron Matching
+# =========================================================================
+
+fn cron_matches(expr: text, unix_ms: i64) -> bool:
+    """Check if a cron expression matches a given unix timestamp (ms)."""
+    val fields = expr.trim().split(" ")
+    if fields.len() < 5:
+        return false
+
+    val secs = unix_ms / 1000
+    val minute = (secs / 60) % 60
+    val hour = (secs / 3600) % 24
+    val dom = ((secs / 86400) % 31) + 1     # approximate day-of-month 1-31
+    val month = ((secs / 2629800) % 12) + 1  # approximate month 1-12
+    val dow = (secs / 86400) % 7             # approximate day-of-week 0-6
+
+    return (
+        _field_matches(fields[0], minute) and
+        _field_matches(fields[1], hour) and
+        _field_matches(fields[2], dom) and
+        _field_matches(fields[3], month) and
+        _field_matches(fields[4], dow)
+    )
+
+fn cron_next_time(expr: text, unix_ms: i64) -> i64:
+    """Estimate the next run time (ms) for a cron expression after the given timestamp."""
+    val fields = expr.trim().split(" ")
+    if fields.len() < 5:
+        return unix_ms + 60000  # default: 1 minute from now
+
+    # Step forward minute by minute up to 366 days (527040 minutes)
+    var t = (unix_ms / 60000 + 1) * 60000  # round up to next minute
+    var i = 0
+    while i < 527040:
+        if cron_matches(expr, t):
+            return t
+        t = t + 60000
+        i = i + 1
+    return unix_ms + 86400000  # fallback: 1 day
+
+fn interval_next_time(interval_seconds: i64, last_run_ms: i64) -> i64:
+    """Compute next run time for a fixed-interval task."""
+    return last_run_ms + (interval_seconds * 1000)
+
+# =========================================================================
+# Internal Field Matching
+# =========================================================================
+
+fn _field_matches(field: text, value: i64) -> bool:
+    """Check if a cron field string matches a given numeric value."""
+    if field == "*":
+        return true
+    # Step: */N
+    if field.starts_with("*/"):
+        val step_str = field.slice(2)
+        val step = step_str.to_i64() ?? 1
+        if step <= 0:
+            return true
+        return value % step == 0
+    # Range: N-M
+    val dash_idx = field.index_of("-")
+    if dash_idx > 0:
+        val lo = field.slice(0, dash_idx).to_i64() ?? 0
+        val hi = field.slice(dash_idx + 1).to_i64() ?? 0
+        return value >= lo and value <= hi
+    # List: N,M,K
+    if field.contains(","):
+        val parts = field.split(",")
+        for part in parts:
+            val n = part.trim().to_i64() ?? -1
+            if n == value:
+                return true
+        return false
+    # Literal: N
+    val n = field.to_i64() ?? -1
+    return n == value

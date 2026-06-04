@@ -1,0 +1,77 @@
+# Remote Collector
+#
+# Detects active claude remote-control sessions and background Claude Code agents.
+
+use app.llm_dashboard.data.types.{ManagedTask, TaskKind, TaskState}
+
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_dir_list(path: text) -> [text]
+extern fn rt_time_now_unix_micros() -> i64
+extern fn rt_process_is_running(pid: i64) -> bool
+
+# =========================================================================
+# Remote-Control Session Detection
+# =========================================================================
+
+fn collect_remote_sessions() -> [ManagedTask]:
+    """Detect active claude remote-control sessions."""
+    var tasks: [ManagedTask] = []
+    val now_ms = rt_time_now_unix_micros() / 1000
+
+    val remote_dir = _expand_home("~/.claude/remote-control")
+    if not rt_file_exists(remote_dir):
+        return tasks
+
+    val files = rt_dir_list(remote_dir)
+    for fname in files:
+        if fname.ends_with(".session"):
+            val path = "{remote_dir}/{fname}"
+            val content = rt_file_read_text(path)
+            val session_name = fname.slice(0, fname.len() - 8)
+            val pid_str = _extract_field(content, "pid")
+            val pid: i64 = pid_str.to_i64() ?? 0
+            var state = TaskState.Active
+            if pid > 0 and not rt_process_is_running(pid):
+                state = TaskState.Completed
+
+            var task = ManagedTask.new(
+                "remote_{session_name}",
+                TaskKind.RemoteControl,
+                session_name,
+                "claude remote-control --name {session_name}"
+            )
+            task.agent_id = pid_str
+            task.state = state
+            task.created_at = now_ms
+            tasks.push(task)
+
+    return tasks
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn _expand_home(path: text) -> text:
+    if path.starts_with("~/"):
+        val home = _get_home_dir()
+        return "{home}/{path.slice(2)}"
+    return path
+
+fn _get_home_dir() -> text:
+    if rt_file_exists("/Users"):
+        val entries = rt_dir_list("/Users")
+        if entries.len() > 0:
+            return "/Users/{entries[0]}"
+    return "/root"
+
+fn _extract_field(content: text, key: text) -> text:
+    val eq_needle = "{key}="
+    val idx = content.index_of(eq_needle)
+    if idx >= 0:
+        val after = content.slice(idx + eq_needle.len())
+        val end = after.index_of("\n")
+        if end >= 0:
+            return after.slice(0, end).trim()
+        return after.trim()
+    return ""

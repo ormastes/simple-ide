@@ -1,0 +1,473 @@
+# Test Runner Execution Modes
+#
+# Different execution mode functions (spec, doctest, combined, parallel,
+# container), result parsing, categorization, warnings display,
+# and database update logic.
+
+use std.io.{env_set, env_get}
+use std.io.{time_now_unix_micros}
+
+use std.test_runner.test_runner_types.{TestOptions, TestRunResult}
+use std.test_runner.test_config.{TestConfig}
+use std.test_runner.test_runner_files.{strip_ansi}
+use std.test_runner.test_runner_output.{print_result, print_summary}
+use std.test_runner.test_runner_helpers.{parse_individual_results, extract_test_name, extract_pending_test_name}
+# MEMORY DEBUG: groups 3-9 commented out to isolate memory usage
+# GROUP 3: Container & coverage
+# use sequential_container.{SequentialContainerConfig, sequential_container_run_all_tests}
+# use test_runner_container.container_detect_runtime
+# use test_runner_coverage.{setup_coverage, collect_coverage, print_coverage_summary, generate_coverage_reports, check_coverage_threshold, get_coverage_threshold, print_coverage_delta}
+# GROUP 4: Database & feature tracking
+# use test_db_compat.{TestDatabase, load_test_db_compat, micros_to_rfc3339}  # Using compatibility layer
+# use test_db_types.*
+# use std.database.feature.{FeatureDatabase, load_feature_database, create_feature_database, FeatureStatus}
+# GROUP 5: Doc generation & sdoctest
+# use doc_generator.generate_all_docs
+# use rust_test_runner.{run_rust_tests, RustTestResult}
+# use sdoctest.config.load_sdoctest_config
+# use sdoctest.runner.{run_sdoctest_mode, print_sdoctest_summary}
+# use sdoctest.types.{SdoctestRunResult, SdoctestFileResult, BlockStatus}
+# use doctest_runner.{run_spl_doctests_same_file, discover_spl_doctest_files}
+# use sdoctest.result_db.write_sdoctest_db
+# use sdoctest.doc_gen.generate_sdoctest_report
+# GROUP 9: Closure warnings
+# use compiler.core.closure_analysis.{closure_warnings_get, closure_warnings_has}
+# GROUP 9: Call graph warnings
+# use compiler.core.call_graph.{call_graph_warnings_get, call_graph_warnings_has}
+
+# =========================================================================
+# SPL Doctest Mode
+# =========================================================================
+
+# MEMORY DEBUG: entire body commented out (uses GROUP 5 types)
+fn run_spl_doctest_mode(options: TestOptions, config: TestConfig):
+    print "DISABLED: run_spl_doctest_mode (memory debug)"
+    # val dirs = ["src/lib/", "src/compiler/"]
+    # val files = discover_spl_doctest_files(dirs)
+    #
+    # if files.len() == 0:
+    #     print "No SPL files with doctests found."
+    #     return SdoctestRunResult(files: [], total: 0, passed: 0, failed: 0, skipped: 0, errors: 0, accepted: 0, duration_ms: 0)
+    #
+    # print "SPL Doctest: Running doctests from {files.len()} source file(s)..."
+    # print ""
+    #
+    # val run_start = time_now_unix_micros()
+    # var file_results: [SdoctestFileResult] = []
+    # var total = 0
+    # var passed = 0
+    # var failed = 0
+    # var skipped = 0
+    # var errors_count = 0
+    #
+    # val timeout_ms = config.timeout_seconds * 1000
+    #
+    # for file_path in files:
+    #     val file_result = run_spl_doctests_same_file(file_path, timeout_ms)
+    #     if file_result.total > 0:
+    #         val status_icon = if file_result.failed == 0 and file_result.errors == 0: "PASS" else: "FAIL"
+    #         print "  {status_icon}  {file_result.source_file} ({file_result.passed} passed, {file_result.failed} failed, {file_result.duration_ms}ms)"
+    #         if file_result.failed > 0 or file_result.errors > 0:
+    #             for br in file_result.blocks:
+    #                 if br.status == BlockStatus.Failed or br.status == BlockStatus.Error:
+    #                     print "        Line {br.block.line_number}: {br.error}"
+    #
+    #     total = total + file_result.total
+    #     passed = passed + file_result.passed
+    #     failed = failed + file_result.failed
+    #     skipped = skipped + file_result.skipped
+    #     errors_count = errors_count + file_result.errors
+    #     file_results.push(file_result)
+    #
+    #     if options.fail_fast and (file_result.failed > 0 or file_result.errors > 0):
+    #         print ""
+    #         print "Stopping early (--fail-fast)"
+    #         break
+    #
+    # val run_end = time_now_unix_micros()
+    # val duration_ms = (run_end - run_start) / 1000
+    #
+    # SdoctestRunResult(
+    #     files: file_results,
+    #     total: total,
+    #     passed: passed,
+    #     failed: failed,
+    #     skipped: skipped,
+    #     errors: errors_count,
+    #     accepted: 0,
+    #     duration_ms: duration_ms
+    # )
+
+# =========================================================================
+# Combined Mode (Spec + SDoctest)
+# =========================================================================
+
+# MEMORY DEBUG: entire body commented out (uses GROUP 4, 5 types)
+fn run_combined_mode(options: TestOptions, config: TestConfig) -> i64:
+    print "DISABLED: run_combined_mode (memory debug)"
+    return 1
+    # """
+    # Run both spec tests and sdoctests, combining results.
+    # This mode is activated when both run_spec_tests and run_sdoctests are true.
+    # """
+    # print "Simple Test Runner v0.4.0 (Combined Mode: Spec + SDoctest)"
+    # print ""
+    #
+    # # Run spec tests first
+    # print "=== Running Spec Tests ==="
+    # print ""
+    # val run_start = time_now_unix_micros()
+    # val spec_result = run_tests(options)
+    # val run_end = time_now_unix_micros()
+    # print_summary(spec_result, options.format)
+    # print ""
+    #
+    # # Run sdoctests second
+    # print "=== Running SDoctest ==="
+    # print ""
+    # val sdoctest_config = load_sdoctest_config("config/sdoctest.sdn")
+    # val sdoctest_result = run_sdoctest_mode(options, sdoctest_config)
+    # print_sdoctest_summary(sdoctest_result)
+    # print ""
+    #
+    # # Run SPL doctests third (if enabled)
+    # var spl_doctest_passed = 0
+    # var spl_doctest_failed = 0
+    # var spl_doctest_skipped = 0
+    # var spl_doctest_ok = true
+    # if config.run_spl_doctests:
+    #     print "=== Running SPL Doctests ==="
+    #     print ""
+    #     val spl_doctest_result = run_spl_doctest_mode(options, config)
+    #     spl_doctest_passed = spl_doctest_result.passed
+    #     spl_doctest_failed = spl_doctest_result.failed
+    #     spl_doctest_skipped = spl_doctest_result.skipped
+    #     spl_doctest_ok = spl_doctest_result.is_ok()
+    #     print ""
+    #
+    # # Combined summary
+    # print "=== Combined Results ==="
+    # val total_passed = spec_result.total_passed + sdoctest_result.passed + spl_doctest_passed
+    # val total_failed = spec_result.total_failed + sdoctest_result.failed + spl_doctest_failed
+    # val total_skipped = spec_result.total_skipped + sdoctest_result.skipped + spl_doctest_skipped
+    # print "Spec Tests:    {spec_result.total_passed} passed, {spec_result.total_failed} failed, {spec_result.total_skipped} skipped"
+    # print "SDoctest:      {sdoctest_result.passed} passed, {sdoctest_result.failed} failed, {sdoctest_result.skipped} skipped"
+    # if config.run_spl_doctests:
+    #     print "SPL Doctest:   {spl_doctest_passed} passed, {spl_doctest_failed} failed, {spl_doctest_skipped} skipped"
+    # print "---"
+    # print "Total:         {total_passed} passed, {total_failed} failed, {total_skipped} skipped"
+    # print ""
+    #
+    # # Write databases
+    # if not options.list and not options.no_db:
+    #     if spec_result.files.len() > 0:
+    #         update_test_database(spec_result, run_start, run_end)
+    #     if sdoctest_result.total > 0:
+    #         write_sdoctest_db(sdoctest_result, "doc/08_tracking/test/sdoctest_db.sdn")
+    #         generate_sdoctest_report(sdoctest_result, "doc/08_tracking/test/sdoctest_result.md")
+    #
+    # # Success if all pass
+    # val all_passed = spec_result.is_ok() and sdoctest_result.is_ok() and spl_doctest_ok
+    # if all_passed:
+    #     return 0
+    # return 1
+
+# =========================================================================
+# Parallel Mode
+# =========================================================================
+
+# MEMORY DEBUG: entire body commented out (uses GROUP 7, 8, 6)
+fn run_tests_parallel_mode(
+    files: [text],
+    options: TestOptions,
+    ckpt_passed: i64,
+    ckpt_failed: i64,
+    ckpt_skipped: i64
+) -> TestRunResult:
+    """
+    Run tests in parallel mode with worker pool.
+
+    Args:
+        files: List of test files
+        options: Test options
+        ckpt_passed: Checkpoint passed count
+        ckpt_failed: Checkpoint failed count
+        ckpt_skipped: Checkpoint skipped count
+
+    Returns: TestRunResult
+    """
+    print "DISABLED: run_tests_parallel_mode (memory debug)"
+    return TestRunResult(files: [], total_passed: 0, total_failed: 0, total_skipped: 0, total_pending: 0, total_timed_out: 0, total_duration_ms: 0, total_setup_ms: 0, total_cached: 0)
+    # # Determine worker count
+    # var max_workers = options.max_workers
+    # if max_workers <= 0:
+    #     max_workers = get_cpu_count()
+    #     if max_workers > 1:
+    #         max_workers = max_workers - 1  # Leave one core for system
+    #
+    # val mode_name = mode_to_str(options.mode)
+    # print "Running {files.len()} test file(s) [mode: {mode_name}, parallel: {max_workers} workers]..."
+    # if options.seed_set:
+    #     print "Seed: {options.seed}"
+    # if options.self_protect:
+    #     print "Self-protection enabled (CPU: {options.cpu_threshold}%, Memory: {options.mem_threshold}%)"
+    # print ""
+    #
+    # # Install signal handlers (if available)
+    # val cleanup_fn = create_signal_cleanup_handler(
+    #     tracker_kill_all_children,
+    #     tracker_stop_all_containers,
+    #     fn(): checkpoint_save([], 0, 0, 0, "signal")
+    # )
+    #
+    # val handlers_installed = install_signal_handlers(cleanup_fn)
+    # if handlers_installed:
+    #     print "Signal handlers installed (Ctrl+C will cleanup gracefully)"
+    # elif options.self_protect:
+    #     print "Signal handlers not available - using resource monitoring"
+    # print ""
+    #
+    # # Enable heartbeat monitoring
+    # if options.self_protect:
+    #     lifecycle_enable_heartbeat()
+    #
+    # # Run tests in parallel
+    # val results = run_tests_parallel_with_monitoring(files, options, max_workers)
+    #
+    # # Aggregate results
+    # var total_passed = ckpt_passed
+    # var total_failed = ckpt_failed
+    # var total_skipped = ckpt_skipped
+    # var total_pending = 0
+    # var total_timed_out = 0
+    # var total_duration_ms = 0
+    #
+    # for result in results:
+    #     print_result(result, options.format)
+    #
+    #     total_passed = total_passed + result.passed
+    #     total_failed = total_failed + result.failed
+    #     total_skipped = total_skipped + result.skipped
+    #     total_pending = total_pending + result.pending
+    #     if result.timed_out:
+    #         total_timed_out = total_timed_out + 1
+    #     total_duration_ms = total_duration_ms + result.duration_ms
+    #
+    # # Cleanup any orphaned resources
+    # val cleaned = cleanup_all_children()
+    # if cleaned > 0:
+    #     print ""
+    #     print "[CLEANUP] Cleaned up {cleaned} orphaned resources"
+    #
+    # # Clean up checkpoint on successful completion
+    # if options.resume and checkpoint_exists():
+    #     checkpoint_delete()
+    #
+    # TestRunResult(
+    #     files: results,
+    #     total_passed: total_passed,
+    #     total_failed: total_failed,
+    #     total_skipped: total_skipped,
+    #     total_pending: total_pending,
+    #     total_timed_out: total_timed_out,
+    #     total_duration_ms: total_duration_ms
+    # )
+
+# =========================================================================
+# Container Mode
+# =========================================================================
+
+# MEMORY DEBUG: entire body commented out (uses GROUP 3)
+fn run_tests_sequential_containers(files: [text], options: TestOptions) -> TestRunResult:
+    print "DISABLED: run_tests_sequential_containers (memory debug)"
+    return TestRunResult(files: [], total_passed: 0, total_failed: 0, total_skipped: 0, total_pending: 0, total_timed_out: 0, total_duration_ms: 0, total_setup_ms: 0, total_cached: 0)
+    # """
+    # Run tests in sequential container mode (maximum isolation).
+    #
+    # Args:
+    #     files: List of test files
+    #     options: Test options
+    #
+    # Returns: TestRunResult
+    # """
+    # # Create container config
+    # val runtime = container_detect_runtime()
+    # if runtime == "none":
+    #     print "ERROR: No container runtime available (docker or podman)"
+    #     print "Please install Docker or Podman to use sequential container mode"
+    #     return TestRunResult(
+    #         files: [],
+    #         total_passed: 0,
+    #         total_failed: 0,
+    #         total_skipped: 0,
+    #         total_pending: 0,
+    #         total_timed_out: 0,
+    #         total_duration_ms: 0
+    #     )
+    #
+    # val config = SequentialContainerConfig(
+    #     base_image: "simple-test-full:latest",
+    #     runtime: runtime,
+    #     memory_mb: 512,
+    #     cpu_cores: 1.0,
+    #     network: "none",
+    #     cleanup_on_error: true,
+    #     workspace: "."
+    # )
+    #
+    # # Run tests sequentially in containers
+    # print "SEQUENTIAL CONTAINER MODE"
+    # print "Runtime: {runtime}"
+    # print ""
+    #
+    # val results = sequential_container_run_all_tests(files, config)
+    #
+    # # Aggregate results
+    # var total_passed = 0
+    # var total_failed = 0
+    # var total_skipped = 0
+    # var total_pending = 0
+    # var total_timed_out = 0
+    # var total_duration_ms = 0
+    #
+    # for result in results:
+    #     print_result(result, options.format)
+    #
+    #     total_passed = total_passed + result.passed
+    #     total_failed = total_failed + result.failed
+    #     total_skipped = total_skipped + result.skipped
+    #     total_pending = total_pending + result.pending
+    #     if result.timed_out:
+    #         total_timed_out = total_timed_out + 1
+    #     total_duration_ms = total_duration_ms + result.duration_ms
+    #
+    #     if options.fail_fast and (result.failed > 0 or result.timed_out):
+    #         print ""
+    #         print "Stopping early (--fail-fast)"
+    #         break
+    #
+    # TestRunResult(
+    #     files: results,
+    #     total_passed: total_passed,
+    #     total_failed: total_failed,
+    #     total_skipped: total_skipped,
+    #     total_pending: total_pending,
+    #     total_timed_out: total_timed_out,
+    #     total_duration_ms: total_duration_ms
+    # )
+
+# =========================================================================
+# M1: Derive test category from file path
+# =========================================================================
+
+fn categorize_test_file(file_path: text) -> text:
+    if file_path.contains("test/01_unit/"):
+        return "Unit"
+    if file_path.contains("test/shared/"):
+        return "Shared"
+    if file_path.contains("test/03_system/feature/"):
+        return "Feature"
+    if file_path.contains("test/02_integration/"):
+        return "Integration"
+    if file_path.contains("test/03_system/"):
+        return "System"
+    if file_path.contains("test/benchmark/"):
+        return "Benchmark"
+    "Unknown"
+
+# =========================================================================
+# Closure Warnings Display
+# =========================================================================
+
+# MEMORY DEBUG: entire body commented out (uses GROUP 9)
+fn display_closure_warnings():
+    pass
+    # """Display closure variable capture warnings if any were detected."""
+    # if not closure_warnings_has():
+    #     return
+    #
+    # print ""
+    # print "=========================================="
+    # print "CLOSURE CAPTURE WARNINGS"
+    # print "=========================================="
+    # print ""
+    #
+    # val warnings = closure_warnings_get()
+    # var i = 0
+    # while i < warnings.len():
+    #     print "[CLOSURE WARNING] {warnings[i]}"
+    #     i = i + 1
+    #
+    # print ""
+    # print "For more information, see MEMORY.md"
+    # print "=========================================="
+
+# =========================================================================
+# Call Graph Warnings Display
+# =========================================================================
+
+# MEMORY DEBUG: entire body commented out (uses GROUP 9)
+fn display_call_graph_warnings():
+    pass
+    # """Display call graph recursion warnings if any were detected."""
+    # if not call_graph_warnings_has():
+    #     return
+    #
+    # print ""
+    # print "=========================================="
+    # print "CALL GRAPH WARNINGS"
+    # print "=========================================="
+    # print ""
+    #
+    # val warnings = call_graph_warnings_get()
+    # var i = 0
+    # for w in warnings:
+    #     print "[CALL GRAPH] {w}"
+    #     i = i + 1
+    #
+    # print ""
+    # print "Recursion is banned in @safe context"
+    # print "=========================================="
+
+# =========================================================================
+# Test Database Update (C5: per-test granularity, M1: categorization)
+# =========================================================================
+
+fn update_test_database(result: TestRunResult, run_start: i64, run_end: i64):
+    # Disabled: GROUP 4 imports (test_db_compat) are commented out for MEMORY DEBUG
+    # Enable the GROUP 4 imports above to activate database persistence
+    pass
+
+# =========================================================================
+# M3/H6: Update feature status from test results
+# =========================================================================
+
+# MEMORY DEBUG: entire body commented out (uses GROUP 4)
+fn update_features_from_tests(result: TestRunResult):
+    pass
+    # fn update_features_from_tests(fdb: FeatureDatabase, result: TestRunResult):
+    # # Build set of failed file paths
+    # var failed_files: Dict<text, bool> = {}
+    # for file_result in result.files:
+    #     if file_result.failed > 0 or file_result.timed_out:
+    #         failed_files[file_result.path] = true
+    #
+    # # Get all features and update status based on test results
+    # val all_features = fdb.all_features()
+    # for feature in all_features:
+    #     val spec = feature.spec_file
+    #     if spec != "" and spec.ends_with(".spl"):
+    #         if failed_files.has(spec):
+    #             # Test failed - mark feature as failed
+    #             fdb.update_feature_status(feature.id, FeatureStatus.Failed)
+    #         else:
+    #             # Check if spec was in test results and passed
+    #             for file_result in result.files:
+    #                 if file_result.path == spec and file_result.failed == 0 and not file_result.timed_out:
+    #                     # Test passed - mark feature as done if not already
+    #                     if feature.pure_status != FeatureStatus.Done:
+    #                         fdb.update_feature_status(feature.id, FeatureStatus.Done)
+
+# =========================================================================
+# Exports
+# =========================================================================

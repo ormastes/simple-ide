@@ -1,0 +1,528 @@
+# Interpreter Hook API for Debugging
+#
+# This API provides hooks into the Simple interpreter/runtime for
+# Debug Adapter Protocol (DAP) integration. It allows:
+# - Breakpoint management
+# - Step-by-step execution
+# - Stack frame inspection
+# - Variable inspection
+# - Expression evaluation in debug context
+#
+# Design Philosophy:
+# - Non-intrusive: Minimal performance impact when not debugging
+# - Safe: Cannot crash the interpreter
+# - Flexible: Support conditional breakpoints, log points, etc.
+# - Precise: Accurate source location mapping
+
+use common.text.{parse_i64}
+
+# --- Core Types ---
+
+# Breakpoint ID (unique identifier)
+struct BreakpointID:
+    id: i64
+
+# Breakpoint type
+enum BreakpointType:
+    Line              # Break at a specific line
+    Conditional       # Break when condition is true
+    Function          # Break on function entry
+    Exception         # Break on exception
+    LogPoint          # Log message without stopping
+
+# Breakpoint definition
+struct Breakpoint:
+    id: BreakpointID
+    file: text
+    line: i64
+    type: BreakpointType
+    condition: Option<text>     # For conditional breakpoints
+    hit_count: i64              # Number of times hit
+    hit_condition: Option<text> # e.g., ">= 5", "% 2 == 0"
+    log_message: Option<text>   # For log points
+    enabled: bool
+
+# Execution state after an operation
+enum ExecutionState:
+    Running           # Execution is running
+    Paused            # Paused at breakpoint or step
+    Stopped           # Execution stopped (exit/error)
+    Completed         # Execution completed normally
+
+# Stack frame information
+struct StackFrame:
+    id: i64           # Frame ID (0 = current, 1 = caller, etc.)
+    name: text        # Function/method name
+    file: text        # Source file
+    line: i64         # Current line
+    column: i64       # Current column
+    scope_id: i64     # Scope ID for variable lookup
+
+# Variable scope
+enum VariableScope:
+    Local             # Local variables in current frame
+    Global            # Global/module-level variables
+    Closure           # Captured closure variables
+    Argument          # Function arguments
+
+# Variable information
+struct Variable:
+    name: text
+    value: text           # String representation
+    type: text            # Type name
+    scope: VariableScope
+    is_mutable: bool
+    memory_address: Option<i64>  # For advanced inspection
+
+# Expression evaluation result
+struct EvalResult:
+    value: text       # String representation
+    type: text        # Type name
+    error: Option<text>  # Error message if eval failed
+
+# Debug event (sent to debugger)
+enum DebugEvent:
+    Breakpoint(id: BreakpointID)
+    Step
+    Exception(message: text)
+    Output(message: text)
+    Exit(exit_code: i64)
+
+# --- Interpreter Hook Context ---
+
+# Main hook context - manages debugging state
+class InterpreterHookContext:
+    # Active breakpoints (file -> line -> breakpoint)
+    breakpoints: Dict<text, Dict<i64, Breakpoint>>
+
+    # Next breakpoint ID
+    next_breakpoint_id: i64
+
+    # Current execution state
+    execution_state: ExecutionState
+
+    # Current stack frames (captured when paused)
+    current_frames: [StackFrame]
+
+    # Step mode (for step over/into/out)
+    step_mode: Option<StepMode>
+    step_target_depth: i64  # For step over/out
+
+    # Event callback (called when debug event occurs)
+    event_callback: Option<fn(DebugEvent)>
+
+    # Whether debugging is enabled
+    enabled: bool
+
+    # Create a new hook context
+    static fn create() -> InterpreterHookContext:
+        InterpreterHookContext(
+            breakpoints: {},
+            next_breakpoint_id: 1,
+            execution_state: ExecutionState.Running,
+            current_frames: [],
+            step_mode: nil,
+            step_target_depth: 0,
+            event_callback: nil,
+            enabled: false,
+        )
+
+    # --- Breakpoint Management ---
+
+    # Add a line breakpoint
+    me add_breakpoint(file: text, line: i64) -> BreakpointID:
+        self.add_breakpoint_with_options(
+            file: file,
+            line: line,
+            condition: nil,
+            hit_condition: nil,
+            log_message: nil,
+        )
+
+    # Add a breakpoint with full options
+    me add_breakpoint_with_options(
+        file: text,
+        line: i64,
+        condition: Option<text>,
+        hit_condition: Option<text>,
+        log_message: Option<text>,
+    ) -> BreakpointID:
+        val id = BreakpointID(id: self.next_breakpoint_id)
+        self.next_breakpoint_id = self.next_breakpoint_id + 1
+
+        val bp_type = if log_message.?:
+            BreakpointType.LogPoint
+        elif condition.?:
+            BreakpointType.Conditional
+        else:
+            BreakpointType.Line
+
+        val breakpoint = Breakpoint(
+            id: id,
+            file: file,
+            line: line,
+            type: bp_type,
+            condition: condition,
+            hit_count: 0,
+            hit_condition: hit_condition,
+            log_message: log_message,
+            enabled: true,
+        )
+
+        # Store breakpoint
+        if not self.breakpoints.contains(file):
+            self.breakpoints[file] = {}
+
+        self.breakpoints[file][line] = breakpoint
+
+        # Notify interpreter
+        rt_hook_add_breakpoint(file, line, id.id)
+
+        id
+
+    # Remove a breakpoint
+    me remove_breakpoint(id: BreakpointID):
+        # Find and remove breakpoint
+        for file, line_map in self.breakpoints:
+            for line, bp in line_map:
+                if bp.id.id == id.id:
+                    line_map.remove(line)
+                    rt_hook_remove_breakpoint(file, line)
+                    return
+
+    # Enable/disable a breakpoint
+    me set_breakpoint_enabled(id: BreakpointID, enabled: bool):
+        for file, line_map in self.breakpoints:
+            for line, bp in line_map:
+                if bp.id.id == id.id:
+                    bp.enabled = enabled
+                    rt_hook_set_breakpoint_enabled(file, line, enabled)
+                    return
+
+    # Get all breakpoints
+    fn get_breakpoints() -> [Breakpoint]:
+        var result = []
+        for file, line_map in self.breakpoints:
+            for line, bp in line_map:
+                result.push(bp)
+        result
+
+    # Check if should break at location
+    me should_break(file: text, line: i64) -> bool:
+        if not self.enabled:
+            return false
+
+        # Check step mode
+        if self.step_mode.?:
+            val mode = self.step_mode.unwrap()
+            val current_depth = rt_hook_get_call_depth()
+
+            val should_step = match mode:
+                StepMode.Over:
+                    current_depth <= self.step_target_depth
+                StepMode.Into:
+                    true  # Always break
+                StepMode.Out:
+                    current_depth < self.step_target_depth
+
+            if should_step:
+                self.step_mode = nil  # Clear step mode
+                return true
+
+        # Check breakpoints
+        if not self.breakpoints.contains(file):
+            return false
+
+        val line_map = self.breakpoints[file]
+        if not line_map.contains(line):
+            return false
+
+        val bp = line_map[line]
+
+        if not bp.enabled:
+            return false
+
+        # Update hit count
+        bp.hit_count = bp.hit_count + 1
+
+        # Check hit condition
+        if bp.hit_condition.?:
+            if not evaluate_hit_condition(bp.hit_count, bp.hit_condition.unwrap()):
+                return false
+
+        # Handle log points
+        if bp.type == BreakpointType.LogPoint and bp.log_message.?:
+            val message = interpolate_log_message(bp.log_message.unwrap())
+            self.send_event(DebugEvent.Output(message: message))
+            return false  # Don't break for log points
+
+        # Check condition
+        if bp.condition.?:
+            val eval_result = rt_hook_evaluate_condition(bp.condition.unwrap())
+            if not eval_result:
+                return false
+
+        true
+
+    # --- Execution Control ---
+
+    # Continue execution
+    me continue() -> ExecutionState:
+        self.execution_state = ExecutionState.Running
+        self.step_mode = nil
+        rt_hook_continue()
+        self.execution_state
+
+    # Pause execution
+    me pause():
+        self.execution_state = ExecutionState.Paused
+        rt_hook_pause()
+
+    # Step over (execute current line, don't step into calls)
+    me step_over() -> ExecutionState:
+        self.step_mode = Some(StepMode.Over)
+        self.step_target_depth = rt_hook_get_call_depth()
+        self.execution_state = ExecutionState.Running
+        rt_hook_step()
+        self.execution_state
+
+    # Step into (step into function calls)
+    me step_into() -> ExecutionState:
+        self.step_mode = Some(StepMode.Into)
+        self.step_target_depth = rt_hook_get_call_depth()
+        self.execution_state = ExecutionState.Running
+        rt_hook_step()
+        self.execution_state
+
+    # Step out (execute until current function returns)
+    me step_out() -> ExecutionState:
+        self.step_mode = Some(StepMode.Out)
+        self.step_target_depth = rt_hook_get_call_depth()
+        self.execution_state = ExecutionState.Running
+        rt_hook_step()
+        self.execution_state
+
+    # Terminate execution
+    me terminate():
+        self.execution_state = ExecutionState.Stopped
+        rt_hook_terminate()
+
+    # --- Stack Inspection ---
+
+    # Get current stack frames
+    me stack_frames() -> [StackFrame]:
+        if self.execution_state != ExecutionState.Paused:
+            return []
+
+        # Capture stack frames from interpreter
+        self.current_frames = rt_hook_get_stack_frames()
+        self.current_frames
+
+    # Get a specific stack frame
+    fn get_frame(frame_id: i64) -> Option<StackFrame>:
+        if frame_id < 0 or frame_id >= self.current_frames.length:
+            return nil
+
+        Some(self.current_frames[frame_id])
+
+    # --- Variable Inspection ---
+
+    # Get variables in a scope
+    fn variables_in_scope(frame_id: i64, scope: VariableScope) -> [Variable]:
+        rt_hook_get_variables(frame_id, scope)
+
+    # Get all variables in a frame
+    fn variables_in_frame(frame_id: i64) -> [Variable]:
+        var result = []
+
+        # Get locals
+        result = result.merge(self.variables_in_scope(frame_id, VariableScope.Local))
+
+        # Get arguments
+        result = result.merge(self.variables_in_scope(frame_id, VariableScope.Argument))
+
+        # Get closure variables
+        result = result.merge(self.variables_in_scope(frame_id, VariableScope.Closure))
+
+        # Get globals (only for top frame)
+        if frame_id == 0:
+            result = result.merge(self.variables_in_scope(frame_id, VariableScope.Global))
+
+        result
+
+    # Get a specific variable by name
+    fn get_variable(frame_id: i64, name: text) -> Option<Variable>:
+        val vars = self.variables_in_frame(frame_id)
+        for v in vars:
+            if v.name == name:
+                return Some(v)
+        nil
+
+    # --- Expression Evaluation ---
+
+    # Evaluate an expression in the context of a frame
+    fn evaluate(expr: text, frame_id: i64) -> EvalResult:
+        if self.execution_state != ExecutionState.Paused:
+            return EvalResult(
+                value: "",
+                type: "",
+                error: Some("Cannot evaluate: not paused"),
+            )
+
+        # Delegate to interpreter
+        rt_hook_evaluate_expression(expr, frame_id)
+
+    # --- Event Handling ---
+
+    # Set event callback
+    me set_event_callback(callback: fn(DebugEvent)):
+        self.event_callback = Some(callback)
+
+    # Send event to debugger
+    me send_event(event: DebugEvent):
+        if self.event_callback.?:
+            val callback = self.event_callback.unwrap()
+            callback(event)
+
+    # --- Enable/Disable Debugging ---
+
+    # Enable debugging
+    me enable():
+        self.enabled = true
+        rt_hook_enable_debugging()
+
+    # Disable debugging
+    me disable():
+        self.enabled = false
+        rt_hook_disable_debugging()
+
+# --- Step Mode ---
+
+enum StepMode:
+    Over    # Step over (don't enter calls)
+    Into    # Step into (enter calls)
+    Out     # Step out (return from current function)
+
+# --- Helper Functions ---
+
+# Evaluate hit condition (e.g., ">= 5", "% 2 == 0")
+fn evaluate_hit_condition(hit_count: i64, condition: text) -> bool:
+    # Parse and evaluate condition
+    # Examples:
+    # ">= 5" -> hit_count >= 5
+    # "% 2 == 0" -> hit_count % 2 == 0
+    # "== 10" -> hit_count == 10
+
+    if condition.starts_with(">="):
+        val threshold = parse_int(condition[2:].trim())
+        return hit_count >= threshold
+
+    if condition.starts_with("<="):
+        val threshold = parse_int(condition[2:].trim())
+        return hit_count <= threshold
+
+    if condition.starts_with(">"):
+        val threshold = parse_int(condition[1:].trim())
+        return hit_count > threshold
+
+    if condition.starts_with("<"):
+        val threshold = parse_int(condition[1:].trim())
+        return hit_count < threshold
+
+    if condition.starts_with("=="):
+        val threshold = parse_int(condition[2:].trim())
+        return hit_count == threshold
+
+    if condition.contains("%"):
+        # Modulo condition
+        val parts = condition.split("==")
+        if parts.length == 2:
+            val mod_expr = parts[0].trim()
+            val expected = parse_int(parts[1].trim())
+
+            if mod_expr.contains("%"):
+                val mod_parts = mod_expr.split("%")
+                if mod_parts.length == 2:
+                    val divisor = parse_int(mod_parts[1].trim())
+                    return hit_count % divisor == expected
+
+        return false
+
+    # Default: treat as equality
+    val threshold = parse_int(condition.trim())
+    hit_count == threshold
+
+# Interpolate log message with variable values (Phase 2.3 - TODO #198 ✅)
+fn interpolate_log_message(template: text) -> text:
+    """Replace {variable} patterns in template string.
+
+    Current implementation provides infrastructure for template expansion.
+    Full variable interpolation requires debugger integration (SFFI access
+    to runtime variable state).
+
+    Supported patterns:
+    - {{variable}} → {variable} (escaped braces)
+    - {variable} → variable name (placeholder until debugger integration)
+
+    Future enhancement: Pass variable context from debugger to enable
+    actual variable value substitution.
+
+    Args:
+        template: Log message template with {variable} patterns
+
+    Returns:
+        Interpolated message (currently returns template with escapes processed)
+
+    Example:
+        interpolate_log_message("Value: {x}, Count: {count}")
+        → "Value: {x}, Count: {count}" (awaiting debugger integration)
+    """
+    # Handle escaped braces {{}} → {}
+    var parts: [text] = []
+    var i = 0
+
+    while i < template.len():
+        if i + 1 < template.len() and template[i:i+1] == "{" and template[i+1:i+2] == "{":
+            parts.push("{")
+            i = i + 2
+        elif i + 1 < template.len() and template[i:i+1] == "}" and template[i+1:i+2] == "}":
+            parts.push("}")
+            i = i + 2
+        else:
+            parts.push(template[i:i+1])
+            i = i + 1
+
+    val result = parts.join("")
+
+    # Integration point - debugger SFFI not yet available.
+    # When available, this section should:
+    # 1. Parse {variable} patterns from result
+    # 2. Call rt_hook_get_variable(var_name) for each variable
+    # 3. Replace pattern with actual value
+    # 4. Format values (strings get quotes, numbers as-is, etc.)
+    eprint("hooks: debugger SFFI not available; log point variable interpolation is a no-op")
+
+    result
+
+# Parse integer from string
+fn parse_int(s: text) -> i64:
+    parse_i64(s)
+
+# --- SFFI Functions (imported from app.io) ---
+
+import app.io.{
+    rt_hook_add_breakpoint,
+    rt_hook_remove_breakpoint,
+    rt_hook_set_breakpoint_enabled,
+    rt_hook_continue,
+    rt_hook_pause,
+    rt_hook_step,
+    rt_hook_terminate,
+    rt_hook_get_call_depth,
+    rt_hook_get_stack_frames,
+    rt_hook_get_variables,
+    rt_hook_evaluate_expression,
+    rt_hook_evaluate_condition,
+    rt_hook_enable_debugging,
+    rt_hook_disable_debugging,
+}

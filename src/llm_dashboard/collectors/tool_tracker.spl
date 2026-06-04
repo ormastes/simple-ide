@@ -1,0 +1,143 @@
+# Tool Tracker
+#
+# Tracks which tools each agent uses and provides usage statistics.
+
+use app.llm_dashboard.data.types.{RoomKind, tool_to_room, room_name, unique_texts, truncate_text}
+
+# =========================================================================
+# Tool Usage Entry
+# =========================================================================
+
+class ToolUsageEntry:
+    agent_id: text
+    tool_name: text
+    count: i32
+    last_used: i64
+
+    static fn new(agent_id: text, tool_name: text, timestamp: i64) -> ToolUsageEntry:
+        return ToolUsageEntry(
+            agent_id: agent_id,
+            tool_name: tool_name,
+            count: 1,
+            last_used: timestamp
+        )
+
+# =========================================================================
+# Tool Tracker
+# =========================================================================
+
+class ToolTracker:
+    entries: [ToolUsageEntry]
+
+    static fn new() -> ToolTracker:
+        return ToolTracker(entries: [])
+
+impl ToolTracker:
+
+    me record(agent_id: text, tool_name: text, timestamp: i64):
+        """Record a tool usage event."""
+        # Find existing entry
+        var i = 0
+        while i < self.entries.len():
+            if self.entries[i].agent_id == agent_id and self.entries[i].tool_name == tool_name:
+                self.entries[i].count = self.entries[i].count + 1
+                self.entries[i].last_used = timestamp
+                return
+            i = i + 1
+        # Create new entry
+        self.entries.push(ToolUsageEntry.new(agent_id, tool_name, timestamp))
+
+    fn total_calls() -> i32:
+        var total = 0
+        for e in self.entries:
+            total = total + e.count
+        return total
+
+    fn unique_tools() -> [text]:
+        """Get unique tool names."""
+        var names: [text] = []
+        for e in self.entries:
+            names.push(e.tool_name)
+        return unique_texts(names)
+
+    fn calls_for_tool(tool_name: text) -> i32:
+        """Total calls for a specific tool across all agents."""
+        var total = 0
+        for e in self.entries:
+            if e.tool_name == tool_name:
+                total = total + e.count
+        return total
+
+    fn calls_for_agent(agent_id: text) -> i32:
+        """Total tool calls for a specific agent."""
+        var total = 0
+        for e in self.entries:
+            if e.agent_id == agent_id:
+                total = total + e.count
+        return total
+
+    fn tools_for_agent(agent_id: text) -> [text]:
+        """Get tools used by a specific agent."""
+        var tools: [text] = []
+        for e in self.entries:
+            if e.agent_id == agent_id:
+                tools.push(e.tool_name)
+        return tools
+
+    fn calls_by_room() -> [(text, i32)]:
+        """Aggregate tool calls by room."""
+        var room_counts: [(text, i32)] = []
+        val tools = self.unique_tools()
+        for tool_name in tools:
+            val room = tool_to_room(tool_name)
+            val rname = room_name(room)
+            val count = self.calls_for_tool(tool_name)
+            # Find or create room entry
+            var found = false
+            var i = 0
+            while i < room_counts.len():
+                if room_counts[i].0 == rname:
+                    room_counts[i] = (rname, room_counts[i].1 + count)
+                    found = true
+                i = i + 1
+            if not found:
+                room_counts.push((rname, count))
+        return room_counts
+
+    fn format_skills_room(max_lines: i32) -> [text]:
+        """Format tool usage for the Skills room display."""
+        var lines: [text] = []
+        val tools = self.unique_tools()
+        var count = 0
+        for tool_name in tools:
+            if count >= max_lines:
+                return lines
+            val room = tool_to_room(tool_name)
+            match room:
+                RoomKind.Skills:
+                    val calls = self.calls_for_tool(tool_name)
+                    lines.push("  /{tool_name} ({calls})")
+                    count = count + 1
+                _: pass_dn
+        return lines
+
+    fn format_server_room(max_lines: i32) -> [text]:
+        """Format tool usage for the Servers room display."""
+        var lines: [text] = []
+        val tools = self.unique_tools()
+        var count = 0
+        for tool_name in tools:
+            if count >= max_lines:
+                return lines
+            val room = tool_to_room(tool_name)
+            match room:
+                RoomKind.Server:
+                    val calls = self.calls_for_tool(tool_name)
+                    var display = tool_name
+                    if display.starts_with("mcp__"):
+                        display = display.slice(5)
+                    display = truncate_text(display, 30)
+                    lines.push("  {display} ({calls})")
+                    count = count + 1
+                _: pass_dn
+        return lines

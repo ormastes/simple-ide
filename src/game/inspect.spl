@@ -1,0 +1,52 @@
+# `simple game inspect <target>` — diagnostics about the project (AC-7).
+#
+# Supported targets:
+#   assets — parse `data/assets.sdn`, list every declared asset, warn on
+#            files in `asset/` not referenced.
+
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_dir_list(path: text) -> [text]
+
+
+fn _read(path: text) -> text:
+    if rt_file_exists(path):
+        rt_file_read_text(path)
+    else:
+        ""
+
+
+fn _list(path: text) -> [text]:
+    rt_dir_list(path)
+
+
+fn _inspect_assets() -> i64:
+    val src = _read("data/assets.sdn")
+    if src.len() == 0:
+        print "error: no `data/assets.sdn` in current directory (exit 2)"
+        return 2
+    print "Declared assets (data/assets.sdn):"
+    val lines = src.split("\n")
+    var i: i64 = 0
+    var declared: [text] = []
+    while i < (lines.len() as i64):
+        val line = lines[i as i32].trim()
+        if line.starts_with("image ") or line.starts_with("sound ") or line.starts_with("font "):
+            print "  {line}"
+            declared = declared.push(line)
+        i = i + 1
+    val files = _list("asset")
+    var j: i64 = 0
+    while j < (files.len() as i64):
+        val f = files[j as i32]
+        if not src.contains(f):
+            print "warn: `asset/{f}` exists but is not referenced in assets.sdn"
+        j = j + 1
+    0
+
+
+fn cmd_inspect(target: text) -> i64:
+    if target == "assets":
+        return _inspect_assets()
+    print "error: unknown inspect target `{target}` (try: assets)"
+    2

@@ -1,0 +1,123 @@
+# DAP Types - Configuration and State Types
+# Supporting types for the DAP server implementation
+
+import app.dap.hooks.{StackFrame, Variable, VariableScope, ExecutionState, EvalResult}
+
+# Launch configuration parsed from DAP launch request
+class LaunchConfig:
+    program: String               # Path to the program to debug
+    args: [String]            # Command line arguments
+    cwd: Option<String>           # Working directory
+    stop_on_entry: Bool           # Stop at program entry
+    no_debug: Bool                # Run without debugging
+
+    static fn default() -> LaunchConfig:
+        LaunchConfig(
+            program: "",
+            args: [],
+            cwd: nil,
+            stop_on_entry: true,
+            no_debug: false
+        )
+
+    static fn from_json(args: Dict) -> LaunchConfig:
+        var config = LaunchConfig.default()
+
+        # Parse program path (required)
+        match args.get("program"):
+            Some(p):
+                config.program = p
+            nil:
+                pass
+
+        # Parse arguments (optional)
+        match args.get("args"):
+            Some(a):
+                config.args = a
+            nil:
+                pass
+
+        # Parse working directory (optional)
+        match args.get("cwd"):
+            Some(c):
+                config.cwd = Some(c)
+            nil:
+                pass
+
+        # Parse stopOnEntry (optional, default true)
+        match args.get("stopOnEntry"):
+            Some(s):
+                config.stop_on_entry = s
+            nil:
+                pass
+
+        # Parse noDebug (optional, default false)
+        match args.get("noDebug"):
+            Some(n):
+                config.no_debug = n
+            nil:
+                pass
+
+        config
+
+# Debug context capturing interpreter state
+class DebugContext:
+    source_path: String           # Current source file
+    current_line: Int             # Current line number
+    current_column: Int           # Current column
+    call_stack: [StackEntry]  # Call stack frames
+    local_variables: Dict<String, VariableInfo>   # Local scope variables
+    global_variables: Dict<String, VariableInfo>  # Global scope variables
+
+    static fn new() -> DebugContext:
+        DebugContext(
+            source_path: "",
+            current_line: 1,
+            current_column: 0,
+            call_stack: [],
+            local_variables: {},
+            global_variables: {}
+        )
+
+# Stack entry for call stack
+class StackEntry:
+    name: String                  # Function/method name
+    source_path: String           # Source file path
+    line: Int                     # Line number
+    column: Int                   # Column number
+
+    fn new(name: String, source_path: String, line: Int, column: Int) -> StackEntry:
+        StackEntry(name: name, source_path: source_path, line: line, column: column)
+
+# Variable info for inspection
+class VariableInfo:
+    name: String
+    value: String
+    type_name: String
+    variables_reference: Int      # Non-zero if this variable has children
+
+    fn new(name: String, value: String, type_name: String) -> VariableInfo:
+        VariableInfo(name: name, value: value, type_name: type_name, variables_reference: 0)
+
+    fn with_children(variables_reference: Int) -> VariableInfo:
+        VariableInfo(
+            name: self.name,
+            value: self.value,
+            type_name: self.type_name,
+            variables_reference: variables_reference
+        )
+
+# Debugger state
+enum DebuggerState:
+    Uninitialized
+    Initialized
+    Launched
+    Running
+    Stopped
+    Terminated
+
+# Step mode for stepping commands
+enum StepMode:
+    StepOver    # Next line in current function
+    StepIn      # Step into function calls
+    StepOut     # Step out of current function

@@ -1,0 +1,87 @@
+"""
+Workspace Configuration for the Simple VSCode Extension.
+
+Manages workspace-level settings: server path overrides, feature
+toggles, and file watcher patterns. The TypeScript extension host
+reads these values when initializing the LSP client.
+"""
+
+struct FeatureToggles:
+    enable_diagnostics: bool
+    enable_code_actions: bool
+    enable_formatting: bool
+    enable_semantic_tokens: bool
+    enable_debug_adapter: bool
+    enable_code_lens: bool
+
+struct WorkspaceConfig:
+    server_path_override: text
+    root_path: text
+    feature_toggles: FeatureToggles
+    file_watch_patterns: [text]
+    max_file_size_kb: i64
+    log_level: text
+
+fn feature_toggles_default() -> FeatureToggles:
+    """All features enabled by default."""
+    FeatureToggles(
+        enable_diagnostics: true,
+        enable_code_actions: true,
+        enable_formatting: true,
+        enable_semantic_tokens: true,
+        enable_debug_adapter: true,
+        enable_code_lens: true
+    )
+
+fn workspace_config_create() -> WorkspaceConfig:
+    """Create workspace config with sensible defaults."""
+    WorkspaceConfig(
+        server_path_override: "",
+        root_path: ".",
+        feature_toggles: feature_toggles_default(),
+        file_watch_patterns: workspace_config_watch_patterns(),
+        max_file_size_kb: 1024,
+        log_level: "error"
+    )
+
+fn workspace_config_watch_patterns() -> [text]:
+    var patterns: [text] = []
+    patterns.push("**/*.spl")
+    patterns.push("**/*.shs")
+    patterns.push("**/*.sdn")
+    patterns.push("**/*.smf")
+    patterns
+
+fn workspace_config_server_path(cfg: WorkspaceConfig) -> text:
+    """Return override path if set, otherwise the default."""
+    if cfg.server_path_override != "":
+        return cfg.server_path_override
+    "bin/simple_lsp_server"
+
+fn workspace_config_is_feature_enabled(cfg: WorkspaceConfig, feature: text) -> bool:
+    """Check if a named feature is enabled."""
+    val t = cfg.feature_toggles
+    if feature == "diagnostics":
+        return t.enable_diagnostics
+    if feature == "code_actions":
+        return t.enable_code_actions
+    if feature == "formatting":
+        return t.enable_formatting
+    if feature == "semantic_tokens":
+        return t.enable_semantic_tokens
+    if feature == "debug_adapter":
+        return t.enable_debug_adapter
+    if feature == "code_lens":
+        return t.enable_code_lens
+    false
+
+fn workspace_config_with_override(cfg: WorkspaceConfig, path: text) -> WorkspaceConfig:
+    """Return a new config with the server path overridden."""
+    WorkspaceConfig(
+        server_path_override: path,
+        root_path: cfg.root_path,
+        feature_toggles: cfg.feature_toggles,
+        file_watch_patterns: cfg.file_watch_patterns,
+        max_file_size_kb: cfg.max_file_size_kb,
+        log_level: cfg.log_level
+    )

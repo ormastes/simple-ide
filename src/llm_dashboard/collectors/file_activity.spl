@@ -1,0 +1,72 @@
+# File Activity Collector
+#
+# Extracts and aggregates file read/write/edit events from the dashboard store.
+# Provides per-agent and per-room file activity views.
+
+use app.llm_dashboard.data.types.{FileActivity, RoomKind, ActivityEntry, unique_texts, shorten_path}
+
+# =========================================================================
+# File Activity Collector
+# =========================================================================
+
+class FileActivityCollector:
+    activities: [FileActivity]
+    max_entries: i32
+
+    static fn new() -> FileActivityCollector:
+        return FileActivityCollector(activities: [], max_entries: 500)
+
+impl FileActivityCollector:
+
+    me add(activity: FileActivity):
+        """Add a file activity entry."""
+        self.activities.push(activity)
+        if self.activities.len() > self.max_entries:
+            self.activities = self.activities.slice(self.activities.len() - self.max_entries)
+
+    fn recent(count: i32) -> [FileActivity]:
+        """Get most recent file activities."""
+        if count >= self.activities.len():
+            return self.activities
+        return self.activities.slice(self.activities.len() - count)
+
+    fn for_agent(agent_id: text) -> [FileActivity]:
+        """Get file activities for a specific agent."""
+        var result: [FileActivity] = []
+        for a in self.activities:
+            if a.agent_id == agent_id:
+                result.push(a)
+        return result
+
+    fn reads_count() -> i32:
+        var count = 0
+        for a in self.activities:
+            if a.operation == "read":
+                count = count + 1
+        return count
+
+    fn writes_count() -> i32:
+        var count = 0
+        for a in self.activities:
+            if a.operation == "write" or a.operation == "edit":
+                count = count + 1
+        return count
+
+    fn unique_files() -> [text]:
+        """Get unique file paths across all activities."""
+        var paths: [text] = []
+        for a in self.activities:
+            paths.push(a.path)
+        return unique_texts(paths)
+
+    fn format_for_room(max_lines: i32) -> [text]:
+        """Format recent file activities as display lines for the Code room."""
+        val recent_items = self.recent(max_lines)
+        var lines: [text] = []
+        for a in recent_items:
+            val icon = if a.operation == "read": "R" else: "W"
+            val short_path = shorten_path(a.path, 40)
+            lines.push("  {icon} {short_path}")
+        return lines
+
+# shorten_path imported from data.types

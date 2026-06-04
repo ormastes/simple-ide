@@ -1,0 +1,163 @@
+# Room Layout HTML
+#
+# Generates HTML for the room-based grid layout in the GUI dashboard.
+
+use app.llm_dashboard.data.types.{RoomKind, room_name, ActivityEntry, format_timestamp,
+    AgentNode, LLMProvider, AgentActivity, LLMStatus,
+    provider_name, activity_label, format_tokens, truncate_text, total_tokens}
+use app.llm_dashboard.data.store.{AgentDashboardStore}
+use app.llm_dashboard.data.agent_tree.{AgentTree}
+use std.json.builder.{escape_json}
+
+# =========================================================================
+# Room Grid HTML
+# =========================================================================
+
+fn generate_room_grid(store: AgentDashboardStore) -> text:
+    """Generate HTML for the room grid layout."""
+    val research = generate_room_div(room_class: "research", title: "Research", entries_html: build_room_entries(store, RoomKind.Research))
+    val code = generate_room_div(room_class: "code", title: "Code", entries_html: build_room_entries(store, RoomKind.Code))
+    val skills = generate_room_div(room_class: "skills", title: "Skills", entries_html: build_room_entries(store, RoomKind.Skills))
+    val server = generate_room_div(room_class: "server", title: "Servers", entries_html: build_room_entries(store, RoomKind.Server))
+    val chat = generate_room_div(room_class: "chat", title: "Chat", entries_html: build_room_entries(store, RoomKind.Chat))
+    val testlab = generate_room_div(room_class: "testlab", title: "TestLab", entries_html: build_room_entries(store, RoomKind.TestLab))
+
+    return "<div class=\"room-grid\">{research}{code}{skills}{server}{chat}{testlab}</div>"
+
+fn generate_room_div(room_class: text, title: text, entries_html: text) -> text:
+    """Generate a single room div."""
+    return "<div class=\"room room-{room_class}\"><div class=\"room-title\">{title}</div>{entries_html}</div>"
+
+fn build_room_entries(store: AgentDashboardStore, room: RoomKind) -> text:
+    """Build HTML for room entries."""
+    val entries = store.get_feed_for_room(room, 20)
+    var html = ""
+    for entry in entries:
+        val time = format_timestamp(entry.timestamp)
+        val summary = escape_json(entry.summary)
+        html = "{html}<div class=\"activity-item\">{time} {summary}</div>"
+    if entries.len() == 0:
+        html = "<div class=\"activity-item\" style=\"color:#555\">No activity</div>"
+    return html
+
+# =========================================================================
+# Agent Tree HTML
+# =========================================================================
+
+fn generate_agent_tree_html(store: AgentDashboardStore) -> text:
+    """Generate HTML for the agent hierarchy tree."""
+    val roots = store.get_root_agents()
+    if roots.len() == 0:
+        return "<div class=\"agent-tree\"><div style=\"color:#555\">No agents detected. Waiting for JSONL transcripts...</div></div>"
+
+    var html = "<div class=\"agent-tree\">"
+    for root in roots:
+        html = "{html}{generate_agent_node_html(store, root, true)}"
+    html = "{html}</div>"
+    return html
+
+fn generate_agent_node_html(store: AgentDashboardStore, agent: AgentNode, is_root: bool) -> text:
+    """Generate HTML for a single agent tree node."""
+    val provider_class = match agent.provider:
+        LLMProvider.Claude: "agent-claude"
+        LLMProvider.Codex: "agent-codex"
+        LLMProvider.Gemini: "agent-gemini"
+        _: "agent-unknown"
+
+    val state_class = match agent.activity:
+        AgentActivity.Thinking: "state-thinking"
+        AgentActivity.Reading(_): "state-reading"
+        AgentActivity.Writing(_): "state-writing"
+        AgentActivity.Searching(_): "state-searching"
+        AgentActivity.Idle: "state-idle"
+        AgentActivity.Error(_): "state-error"
+        AgentActivity.Finished: "state-finished"
+        _: ""
+
+    val label = activity_label(agent.activity)
+    val pname = provider_name(agent.provider)
+    val tokens = format_tokens(total_tokens(agent))
+    val files_r = agent.files_read.len()
+    val files_w = agent.files_written.len()
+
+    val node_class = if is_root: "tree-node tree-node-root" else: "tree-node"
+
+    var model_str = ""
+    if agent.model != "":
+        val short_model = truncate_text(agent.model, 20)
+        model_str = " <span style=\"color:#555\">({short_model})</span>"
+    val stats = " <span style=\"color:#555\">{tokens} tok, {files_r}R/{files_w}W</span>"
+
+    var html = "<div class=\"{node_class}\">"
+    html = "{html}<div class=\"{provider_class} {state_class}\">"
+    html = "{html}<span class=\"agent-head\" style=\"display:inline;font-size:inherit\">{pname}</span>"
+    html = "{html}{model_str} <span style=\"color:#8b949e\">[{label}]</span>{stats}"
+    html = "{html}</div>"
+
+    # Recurse children
+    val children = store.get_children(agent.id)
+    for child in children:
+        html = "{html}{generate_agent_node_html(store, child, false)}"
+
+    html = "{html}</div>"
+    return html
+
+# =========================================================================
+# Status Bar HTML
+# =========================================================================
+
+fn generate_status_bar_html(store: AgentDashboardStore) -> text:
+    """Generate HTML for the bottom status bar."""
+    var html = "<div class=\"status-bar\">"
+
+    for status in store.llm_statuses:
+        val pname = provider_name(status.provider)
+        val dot_class = if status.connected: "connected" else: "disconnected"
+        val tokens = format_tokens(status.tokens_used)
+        html = "{html}<div class=\"status-provider\">"
+        html = "{html}<span class=\"status-dot {dot_class}\"></span>"
+        html = "{html}<span>{pname}</span>"
+        if status.connected:
+            html = "{html}<span style=\"color:#555\">{tokens} tok</span>"
+        html = "{html}</div>"
+
+    val reads = store.total_files_read()
+    val writes = store.total_files_written()
+    val urls = store.total_urls()
+    val agents = store.tree.agent_count()
+
+    html = "{html}<div>Files: {reads}R {writes}W</div>"
+    html = "{html}<div>URLs: {urls}</div>"
+    html = "{html}<div>Agents: {agents}</div>"
+    html = "{html}</div>"
+    return html
+
+# =========================================================================
+# Activity Feed HTML
+# =========================================================================
+
+fn generate_feed_html(store: AgentDashboardStore, max_entries: i32) -> text:
+    """Generate HTML for the activity feed."""
+    val entries = store.get_feed(max_entries)
+    var html = "<div class=\"activity-feed\">"
+
+    if entries.len() == 0:
+        html = "{html}<div class=\"feed-entry\" style=\"color:#555\">No activity yet</div>"
+    else:
+        var i = entries.len() - 1
+        while i >= 0:
+            val e = entries[i]
+            val time = format_timestamp(e.timestamp)
+            val rname = room_name(e.room)
+            val summary = truncate_text(escape_json(e.summary), 60)
+            val agent = truncate_text(e.agent_id, 12)
+
+            html = "{html}<div class=\"feed-entry\">"
+            html = "{html}<span class=\"feed-time\">{time}</span>"
+            html = "{html}<span class=\"feed-agent\">{agent}</span>"
+            html = "{html}<span class=\"feed-summary\">{summary}</span>"
+            html = "{html}<span class=\"feed-room\">{rname}</span>"
+            html = "{html}</div>"
+            i = i - 1
+        html = "{html}</div>"
+    return html

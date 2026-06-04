@@ -1,0 +1,224 @@
+# test_runner_single.spl - Lightweight single-file test entry point
+#
+# Used when running a single test file: bin/simple test path/to/spec.spl
+# Skips database, coverage, doc generation, sdoctest, and parallel overhead.
+#
+# Imports 6 modules vs test_runner_main.spl's 29+, cutting startup from ~56s to <2s.
+
+use std.io.{env_set, env_get}
+use std.sffi.cli.{cli_get_args}
+use std.io.{file_read}
+use std.test_runner.test_runner_types.{TestExecutionMode, TestFileResult, TestOptions, TestRunResult}
+use std.test_runner.test_runner_args.parse_test_args
+use std.test_runner.test_runner_files.{discover_test_files, file_has_di_test_tag, print_discovery_summary, is_skip_marker_file, count_skip_marker_cases}
+use std.test_runner.test_runner_execute.{run_test_file_interpreter, run_test_file_smf, run_test_file_native, run_test_file_safe_mode, run_test_file_composite}
+use std.test_runner.test_runner_output.{print_result, print_summary}
+
+# =========================================================================
+# Helpers (inlined from test_runner_main.spl to avoid extra import)
+# =========================================================================
+
+fn mode_to_str(mode: TestExecutionMode) -> text:
+    match mode:
+        case TestExecutionMode.Interpreter:
+            "interpreter"
+        case TestExecutionMode.Smf:
+            "smf"
+        case TestExecutionMode.Native:
+            "native"
+        case TestExecutionMode.Composite(spec):
+            spec
+
+fn get_cli_args_single() -> [text]:
+    val all_args = cli_get_args()
+    var args: [text] = []
+    var start_idx = 1
+    if all_args.len() > 1 and all_args[1].ends_with("test_runner_single.spl"):
+        start_idx = 2
+    var i = start_idx
+    while i < all_args.len():
+        args = args.push(all_args[i])
+        i = i + 1
+    args
+
+fn current_rss_kb() -> i64:
+    # Linux fast path: read resident memory from /proc/self/status.
+    val status = file_read("/proc/self/status") ?? ""
+    if status == "":
+        return 0
+    val lines = status.split("\n")
+    for line in lines:
+        if line.starts_with("VmRSS:"):
+            val parts = line.split(" ")
+            for part in parts:
+                val trimmed = part.trim()
+                if trimmed.len() > 0:
+                    val ch = trimmed[0:1]
+                    if ch >= "0" and ch <= "9":
+                        return to_int(trimmed)
+    0
+
+# =========================================================================
+# Single Test Execution
+# =========================================================================
+
+fn run_one_test(file_path: text, options: TestOptions) -> TestFileResult:
+    if is_skip_marker_file(file_path):
+        val skipped = count_skip_marker_cases(file_path)
+        return TestFileResult(path: file_path, passed: 0, failed: 0, skipped: skipped, pending: 0, duration_ms: 0, setup_ms: 0, error: "", timed_out: false, cached: false)
+
+    val mode_str = mode_to_str(options.mode)
+    env_set("SIMPLE_RUNTIME_MODE", mode_str)
+
+    val is_system = file_path.contains("/system/") or file_path.contains("/feature/")
+    if is_system:
+        env_set("SIMPLE_SYSTEM_TEST", "1")
+    else:
+        env_set("SIMPLE_SYSTEM_TEST", "0")
+    if is_system and file_has_di_test_tag(file_path):
+        env_set("SIMPLE_DI_TEST", "1")
+    else:
+        env_set("SIMPLE_DI_TEST", "0")
+
+    var effective_options = options
+    if options.fuzz_mode:
+        val fuzz_timeout = options.fuzz_time_secs + 30
+        if fuzz_timeout > effective_options.timeout:
+            effective_options.timeout = fuzz_timeout
+    if options.chaos_mode:
+        var chaos_timeout = options.chaos_trials * 2
+        if chaos_timeout < 300:
+            chaos_timeout = 300
+        if chaos_timeout > effective_options.timeout:
+            effective_options.timeout = chaos_timeout
+
+    if effective_options.safe_mode:
+        return run_test_file_safe_mode(file_path, effective_options)
+    match effective_options.mode:
+        case TestExecutionMode.Interpreter:
+            run_test_file_interpreter(file_path, effective_options)
+        case TestExecutionMode.Smf:
+            run_test_file_smf(file_path, effective_options)
+        case TestExecutionMode.Native:
+            run_test_file_native(file_path, effective_options)
+        case TestExecutionMode.Composite(spec):
+            run_test_file_composite(file_path, effective_options, spec)
+
+# =========================================================================
+# Main Entry Point
+# =========================================================================
+
+fn main() -> i64:
+    env_set("SIMPLE_TEST_RUNNER_RUST", "1")
+
+    val all_args = get_cli_args_single()
+
+    # Filter out "test" command if present (from CLI dispatch)
+    var args: [text] = []
+    var skip_first = all_args.len() > 0 and all_args[0] == "test"
+    var i = 0
+    if skip_first:
+        i = 1
+    while i < all_args.len():
+        args = args.push(all_args[i])
+        i = i + 1
+
+    val options = parse_test_args(args)
+
+    val mode_str = mode_to_str(options.mode)
+    env_set("SIMPLE_TEST_MODE", mode_str)
+
+    print "Simple Test Runner v0.4.0"
+    print ""
+
+    val files = discover_test_files(options.path, options)
+
+    if options.list:
+        print_discovery_summary(files, options)
+        return 0
+
+    if files.len() == 0:
+        print "No test files found in {options.path}"
+        return 1
+
+    # Memory tracking support for fast single-runner path.
+    # This keeps --mem-check functional even when bin/simple routes here.
+    var do_mem_check = options.mem_check
+    val memtrack_env = env_get("SIMPLE_MEMTRACK") ?? ""
+    if memtrack_env == "1":
+        do_mem_check = true
+
+    val rss_before_tests = current_rss_kb()
+    if do_mem_check:
+        print "Memory tracking enabled (per-file checkpoints)"
+        print "  [MEMCHK] isolation: each test file runs in a child process"
+        print "  [MEMCHK] JIT/module state is reclaimed when child exits"
+        print "  [MEMCHK] START test-run: rss={rss_before_tests} kB"
+        print ""
+
+    # MEMORY GROWTH: results accumulates every TestFileResult for the entire run.
+    # After 1000 test files this array holds 1000 live objects (path text, error text,
+    # counters). This is intentional (needed for print_summary) but is O(n) growth.
+    # If RSS grows proportionally to test count here, this is the cause.
+    var results: [TestFileResult] = []
+    var total_passed = 0
+    var total_failed = 0
+    var total_skipped = 0
+    var total_pending = 0
+    var total_timed_out = 0
+    var total_duration_ms = 0
+
+    for file_path in files:
+        val file_rss_before = current_rss_kb()
+        if do_mem_check:
+            print "  [MEMCHK] START {file_path}: rss={file_rss_before} kB"
+
+        val result = run_one_test(file_path, options)
+        print_result(result, options.format)
+
+        if do_mem_check:
+            val file_rss_after = current_rss_kb()
+            val file_delta = file_rss_after - file_rss_before
+            print "  [MEMCHK] END   {file_path}: rss={file_rss_after} kB"
+            print "  [MEMDIFF] {file_path}: {file_delta} kB"
+
+        # MEMORY GROWTH: push return value must be assigned (push returns new array).
+        results = results.push(result)
+        total_passed = total_passed + result.passed
+        total_failed = total_failed + result.failed
+        total_skipped = total_skipped + result.skipped
+        total_pending = total_pending + result.pending
+        if result.timed_out:
+            total_timed_out = total_timed_out + 1
+        total_duration_ms = total_duration_ms + result.duration_ms
+        if options.fail_fast and (result.failed > 0 or result.timed_out):
+            break
+
+    if do_mem_check:
+        val rss_after_tests = current_rss_kb()
+        val total_delta = rss_after_tests - rss_before_tests
+        print ""
+        print "=== Memory Check Summary ==="
+        print "  START rss: {rss_before_tests} kB"
+        print "  END   rss: {rss_after_tests} kB"
+        print "  DELTA rss: {total_delta} kB"
+        print "============================"
+
+    val run_result = TestRunResult(
+        files: results,
+        total_passed: total_passed,
+        total_failed: total_failed,
+        total_skipped: total_skipped,
+        total_pending: total_pending,
+        total_timed_out: total_timed_out,
+        total_duration_ms: total_duration_ms,
+        total_setup_ms: 0,
+        total_cached: 0
+    )
+
+    print ""
+    print_summary(run_result, options.format)
+
+    if run_result.is_ok():
+        return 0
+    return 1

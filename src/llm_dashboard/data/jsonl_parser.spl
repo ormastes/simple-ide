@@ -1,0 +1,364 @@
+# JSONL Parser
+#
+# Parses Claude Code JSONL transcript lines into typed dashboard events.
+# Each line in a transcript is a JSON object with type, name, and content fields.
+# Uses string-based JSON extraction (no std.json dependency for interpreter compat).
+
+use app.llm_dashboard.data.types.{
+    AgentActivity, LLMProvider, RoomKind, FileActivity, URLActivity, ActivityEntry,
+    tool_to_room, provider_from_text, truncate_text
+}
+
+# =========================================================================
+# Parsed Event
+# =========================================================================
+
+enum DashboardEvent:
+    ToolCall(agent_id: text, tool_name: text, args: [text], timestamp: i64)
+    AgentSpawn(parent_id: text, child_id: text, description: text, prompt: text, timestamp: i64)
+    ToolResponse(agent_id: text, tool_name: text, response_preview: text, timestamp: i64)
+    AssistantMessage(agent_id: text, input_tokens: i64, output_tokens: i64, cache_read: i64, cache_create: i64, timestamp: i64)
+    UserMessage(agent_id: text, timestamp: i64)
+    SessionStart(session_id: text, model: text, provider: text, timestamp: i64)
+    SessionEnd(session_id: text, timestamp: i64)
+    Error(agent_id: text, message: text, timestamp: i64)
+    Unknown
+
+# =========================================================================
+# Parser
+# =========================================================================
+
+class JsonlParser:
+    session_id: text
+
+    static fn new(session_id: text) -> JsonlParser:
+        return JsonlParser(session_id: session_id)
+
+fn parse_line(parser: JsonlParser, line: text) -> DashboardEvent:
+    """Parse a single JSONL line into a DashboardEvent."""
+    val trimmed = line.trim()
+    if trimmed == "" or trimmed.starts_with("#"):
+        return DashboardEvent.Unknown
+    if not trimmed.starts_with("{"):
+        return DashboardEvent.Unknown
+    return classify_event(parser.session_id, trimmed)
+
+fn parse_lines(parser: JsonlParser, lines: [text]) -> [DashboardEvent]:
+    """Parse multiple JSONL lines, filtering out Unknown events."""
+    var events: [DashboardEvent] = []
+    for line in lines:
+        val event = parse_line(parser, line)
+        match event:
+            DashboardEvent.Unknown: pass_dn
+            _: events.push(event)
+    return events
+
+# =========================================================================
+# Event Classification
+# =========================================================================
+
+fn classify_event(agent_id: text, json: text) -> DashboardEvent:
+    """Classify a JSON object into a dashboard event type."""
+    val msg_type = json_str(json, "type")
+    val timestamp = json_int(json, "timestamp")
+
+    match msg_type:
+        "tool_use" => classify_tool_use(agent_id, json, timestamp)
+        "tool_result" => classify_tool_result(agent_id, json, timestamp)
+        "assistant" => classify_assistant(agent_id, json, timestamp)
+        "human" => DashboardEvent.UserMessage(agent_id: agent_id, timestamp: timestamp)
+        "user" => DashboardEvent.UserMessage(agent_id: agent_id, timestamp: timestamp)
+        "system" => classify_system(agent_id, json, timestamp)
+        "error" =>
+            val msg = json_str(json, "message")
+            DashboardEvent.Error(agent_id: agent_id, message: msg, timestamp: timestamp)
+        _ => DashboardEvent.Unknown
+
+fn classify_tool_use(agent_id: text, json: text, timestamp: i64) -> DashboardEvent:
+    """Classify a tool_use message."""
+    val tool_name = json_str(json, "name")
+    var args: [text] = []
+
+    val input_obj = json_obj(json, "input")
+    match tool_name:
+        "Read" =>
+            val path = json_str(input_obj, "file_path")
+            args.push(path)
+        "Write" =>
+            val path = json_str(input_obj, "file_path")
+            args.push(path)
+        "Edit" =>
+            val path = json_str(input_obj, "file_path")
+            args.push(path)
+        "Grep" =>
+            val pattern = json_str(input_obj, "pattern")
+            args.push(pattern)
+        "Glob" =>
+            val pattern = json_str(input_obj, "pattern")
+            args.push(pattern)
+        "WebFetch" =>
+            val url = json_str(input_obj, "url")
+            args.push(url)
+        "WebSearch" =>
+            val query = json_str(input_obj, "query")
+            args.push(query)
+        "Bash" =>
+            val cmd = json_str(input_obj, "command")
+            if cmd.len() > 60:
+                args.push("{cmd.slice(0, 57)}...")
+            else:
+                args.push(cmd)
+        "Agent" =>
+            val desc = json_str(input_obj, "description")
+            val prompt_raw = json_str(input_obj, "prompt")
+            val prompt = truncate_text(prompt_raw, 500)
+            return DashboardEvent.AgentSpawn(
+                parent_id: agent_id,
+                child_id: "{agent_id}#{desc}",
+                description: desc,
+                prompt: prompt,
+                timestamp: timestamp
+            )
+        "Skill" =>
+            val skill = json_str(input_obj, "skill")
+            args.push(skill)
+        _ =>
+            pass_dn
+
+    return DashboardEvent.ToolCall(
+        agent_id: agent_id,
+        tool_name: tool_name,
+        args: args,
+        timestamp: timestamp
+    )
+
+fn classify_assistant(agent_id: text, json: text, timestamp: i64) -> DashboardEvent:
+    """Classify an assistant message — extract full token usage breakdown."""
+    val usage = json_obj(json, "usage")
+    var input_tokens: i64 = 0
+    var output_tokens: i64 = 0
+    var cache_read: i64 = 0
+    var cache_create: i64 = 0
+    if usage != "":
+        input_tokens = json_int(usage, "input_tokens")
+        output_tokens = json_int(usage, "output_tokens")
+        cache_read = json_int(usage, "cache_read_input_tokens")
+        cache_create = json_int(usage, "cache_creation_input_tokens")
+
+    val model = json_str(json, "model")
+    if model != "":
+        return DashboardEvent.SessionStart(
+            session_id: agent_id,
+            model: model,
+            provider: model,
+            timestamp: timestamp
+        )
+
+    return DashboardEvent.AssistantMessage(
+        agent_id: agent_id,
+        input_tokens: input_tokens,
+        output_tokens: output_tokens,
+        cache_read: cache_read,
+        cache_create: cache_create,
+        timestamp: timestamp
+    )
+
+fn classify_tool_result(agent_id: text, json: text, timestamp: i64) -> DashboardEvent:
+    """Classify a tool_result message — capture response preview."""
+    val tool_name = json_str(json, "name")
+    val content = json_str(json, "content")
+    val preview = truncate_text(content, 200)
+    if preview == "" and tool_name == "":
+        return DashboardEvent.Unknown
+    return DashboardEvent.ToolResponse(
+        agent_id: agent_id,
+        tool_name: tool_name,
+        response_preview: preview,
+        timestamp: timestamp
+    )
+
+fn classify_system(agent_id: text, json: text, timestamp: i64) -> DashboardEvent:
+    """Classify system messages — detect session start/end."""
+    val content = json_str(json, "content")
+    if content.contains("session started") or content.contains("init"):
+        val model = json_str(json, "model")
+        return DashboardEvent.SessionStart(
+            session_id: agent_id,
+            model: model,
+            provider: model,
+            timestamp: timestamp
+        )
+    if content.contains("session ended") or content.contains("goodbye"):
+        return DashboardEvent.SessionEnd(
+            session_id: agent_id,
+            timestamp: timestamp
+        )
+    return DashboardEvent.Unknown
+
+# =========================================================================
+# String-Based JSON Helpers
+# =========================================================================
+
+fn json_str(json: text, key: text) -> text:
+    """Extract a string value for a key from raw JSON text."""
+    val needle = "\"{key}\":"
+    val idx = json.index_of(needle)
+    match idx:
+        nil: return ""
+        Some(pos):
+            val after = pos + needle.len()
+            if after >= json.len():
+                return ""
+            val rest = json.slice(after, json.len()).trim()
+            if rest.len() == 0:
+                return ""
+            if rest.starts_with("\""):
+                # String value — find closing unescaped quote
+                var i = 1
+                var result = ""
+                while i < rest.len():
+                    val ch = rest.slice(i, i + 1)
+                    if ch == "\\" and i + 1 < rest.len():
+                        val next_ch = rest.slice(i + 1, i + 2)
+                        result = "{result}{next_ch}"
+                        i = i + 2
+                    elif ch == "\"":
+                        return result
+                    else:
+                        result = "{result}{ch}"
+                        i = i + 1
+                return result
+            # Not a string — return raw token up to comma/brace
+            var end_pos = 0
+            while end_pos < rest.len():
+                val ch = rest.slice(end_pos, end_pos + 1)
+                if ch == "," or ch == "}" or ch == "]":
+                    return rest.slice(0, end_pos).trim()
+                end_pos = end_pos + 1
+            return rest.trim()
+
+fn json_int(json: text, key: text) -> i64:
+    """Extract an integer value for a key from raw JSON text."""
+    val raw = json_str(json, key)
+    if raw == "":
+        return 0
+    var digits = ""
+    for ch in raw:
+        if ch >= "0" and ch <= "9":
+            digits = "{digits}{ch}"
+        elif digits.len() > 0:
+            break
+    if digits.len() == 0:
+        return 0
+    return digits.to_i64() ?? 0
+
+fn json_obj(json: text, key: text) -> text:
+    """Extract a nested JSON object for a key, returned as raw text."""
+    val needle = "\"{key}\":"
+    val idx = json.index_of(needle)
+    match idx:
+        nil: return ""
+        Some(pos):
+            val after = pos + needle.len()
+            if after >= json.len():
+                return ""
+            val rest = json.slice(after, json.len()).trim()
+            if not rest.starts_with("{"):
+                return ""
+            # Match braces
+            var depth = 0
+            var i = 0
+            while i < rest.len():
+                val ch = rest.slice(i, i + 1)
+                if ch == "{":
+                    depth = depth + 1
+                elif ch == "}":
+                    depth = depth - 1
+                    if depth == 0:
+                        return rest.slice(0, i + 1)
+                elif ch == "\"":
+                    # Skip string contents
+                    i = i + 1
+                    while i < rest.len():
+                        val sc = rest.slice(i, i + 1)
+                        if sc == "\\":
+                            i = i + 1
+                        elif sc == "\"":
+                            break
+                        i = i + 1
+                i = i + 1
+            return ""
+
+# =========================================================================
+# Activity Mapping
+# =========================================================================
+
+fn event_to_activity(event: DashboardEvent) -> AgentActivity:
+    """Convert a dashboard event to an agent activity state."""
+    match event:
+        DashboardEvent.ToolCall(_, tool_name, args, _):
+            match tool_name:
+                "Read" =>
+                    val path = if args.len() > 0: args[0] else: ""
+                    AgentActivity.Reading(path: path)
+                "Write" =>
+                    val path = if args.len() > 0: args[0] else: ""
+                    AgentActivity.Writing(path: path)
+                "Edit" =>
+                    val path = if args.len() > 0: args[0] else: ""
+                    AgentActivity.Writing(path: path)
+                "Grep" =>
+                    val query = if args.len() > 0: args[0] else: ""
+                    AgentActivity.Searching(query: query)
+                "Glob" =>
+                    val query = if args.len() > 0: args[0] else: ""
+                    AgentActivity.Searching(query: query)
+                "WebFetch" =>
+                    val url = if args.len() > 0: args[0] else: ""
+                    AgentActivity.WebFetch(url: url)
+                "WebSearch" =>
+                    val query = if args.len() > 0: args[0] else: ""
+                    AgentActivity.Searching(query: query)
+                _ => AgentActivity.ToolUse(tool: tool_name)
+        DashboardEvent.AgentSpawn(_, child_id, _, _, _):
+            AgentActivity.SubAgentSpawn(child_id: child_id)
+        DashboardEvent.AssistantMessage(_, _, _, _, _, _):
+            AgentActivity.Thinking
+        DashboardEvent.Error(_, msg, _):
+            AgentActivity.Error(msg: msg)
+        DashboardEvent.SessionEnd(_, _):
+            AgentActivity.Finished
+        _:
+            AgentActivity.Idle
+
+fn event_to_activity_entry(event: DashboardEvent) -> ActivityEntry?:
+    """Convert a dashboard event to an activity feed entry."""
+    match event:
+        DashboardEvent.ToolCall(agent_id, tool_name, args, timestamp):
+            val room = tool_to_room(tool_name)
+            val summary = if args.len() > 0: "{tool_name} {args[0]}" else: tool_name
+            return ActivityEntry.new(
+                agent_id: agent_id,
+                room: room,
+                tool_name: tool_name,
+                summary: summary,
+                timestamp: timestamp
+            )
+        DashboardEvent.AgentSpawn(parent_id, child_id, description, prompt, timestamp):
+            val preview = if prompt != "": " \"{truncate_text(prompt, 40)}\"" else: ""
+            return ActivityEntry.new(
+                agent_id: parent_id,
+                room: RoomKind.Chat,
+                tool_name: "Agent",
+                summary: "spawn -> {description}{preview}",
+                timestamp: timestamp
+            )
+        DashboardEvent.Error(agent_id, message, timestamp):
+            return ActivityEntry.new(
+                agent_id: agent_id,
+                room: RoomKind.Code,
+                tool_name: "error",
+                summary: message,
+                timestamp: timestamp
+            )
+        _: return nil

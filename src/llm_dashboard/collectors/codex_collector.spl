@@ -1,0 +1,6 @@
+# Codex Collector — delegates to unified collector
+#
+# Re-exports collect_codex_status from the unified claude_collector module.
+# Kept for import compatibility; all logic lives in claude_collector.spl.
+
+use app.llm_dashboard.collectors.claude_collector.{collect_codex_status, collect_provider_status}

@@ -1,0 +1,41 @@
+# IDE spreadsheet compatibility surface.
+#
+# Thin checks over the existing office sheets model. This module gives the IDE
+# a tabular/Excel-like capability contract without introducing a second sheet
+# or formula implementation.
+
+use app.office.sheets.spreadsheet.{Workbook}
+use app.office.sheets.cell.{Cell, cell_display_text, default_style, text_cell}
+use app.office.sheets.formula.{evaluate_formula, evaluate_formula_display_text}
+
+struct IdeSheetCompat:
+    app_id: text
+    owner_module: text
+    compatible_formats: [text]
+    sample_range: text
+    formula_probe: text
+    formula_evaluator_ok: bool
+
+fn ide_sheet_compat_probe() -> IdeSheetCompat:
+    var workbook = Workbook.new("IDE Spreadsheet")
+    var sheet = workbook.active()
+    sheet.set_cell("A1", text_cell("2"))
+    sheet.set_cell("B1", text_cell("3"))
+    sheet.set_value("C1", "=A1+B1")
+    val result = evaluate_formula("A1+B1", sheet)
+    val rendered_result = cell_display_text(Cell(value: result, style: default_style()))
+    val display_result = evaluate_formula_display_text("2+3", sheet)
+    val evaluator_ok = display_result == "5"
+    val formula_probe = if evaluator_ok then display_result else: rendered_result
+    IdeSheetCompat(
+        app_id: "sheets",
+        owner_module: "app.office.sheets",
+        compatible_formats: ["excel", "xlsx", "csv", "tabular"],
+        sample_range: sheet.used_range(),
+        formula_probe: formula_probe,
+        formula_evaluator_ok: evaluator_ok
+    )
+
+fn ide_sheet_compat_summary() -> text:
+    val compat = ide_sheet_compat_probe()
+    "sheets: {compat.owner_module} formats={compat.compatible_formats.join(\",\")} range={compat.sample_range} formula={compat.formula_probe} evaluator={compat.formula_evaluator_ok}"

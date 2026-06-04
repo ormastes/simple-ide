@@ -1,0 +1,180 @@
+# Editor Markdown Helpers
+#
+# Markdown quickfix, heading, link resolution, wiki index, property, and task helpers.
+
+use std.editor.core.session.*
+use std.editor.services.md_diagnostics.*
+use std.editor.services.md_wiki_index.*
+use std.editor.view.diagnostics_panel.*
+use std.editor.view.wiki_panel.*
+use app.editor.editor_path_text_helpers.*
+
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_dir_walk(path: text) -> [text]
+
+fn _editor_markdown_quickfix_line(line: text) -> text:
+    val trimmed = line.trim()
+    if trimmed.starts_with("#"):
+        var level = 0
+        while level < trimmed.len() and trimmed.char_at(level) == "#":
+            level = level + 1
+        if level < trimmed.len() and trimmed.char_at(level) != " ":
+            return trimmed.slice(0, level) + " " + trimmed.slice(level, trimmed.len())
+    val empty_link = _editor_find_text(line, "[]()")
+    if empty_link >= 0:
+        return line.slice(0, empty_link) + "[text](url)" + line.slice(empty_link + 4, line.len())
+    if line.ends_with(" ") or line.ends_with("\t"):
+        return line.trim()
+    line
+
+fn _editor_markdown_heading_level(line: text) -> i64:
+    val trimmed = line.trim()
+    var level = 0
+    while level < trimmed.len() and trimmed.char_at(level) == "#":
+        level = level + 1
+    if level == 0 or level > 6:
+        return 0
+    if level < trimmed.len() and trimmed.char_at(level) == " ":
+        return level
+    0
+
+fn _editor_resolve_markdown_link_path(raw_target: text, active_path: text, session: EditSession) -> text:
+    var target = raw_target.trim()
+    if target.starts_with("file://"):
+        target = target.slice(7, target.len())
+    val parsed = md_wiki_parse_link_target(target)
+    target = parsed.0
+    val heading = _editor_find_text(target, "#")
+    if heading >= 0:
+        target = target.slice(0, heading).trim()
+    if target == "":
+        return ""
+    if target.starts_with("/"):
+        return target
+    if target.ends_with(".md") or target.ends_with(".markdown"):
+        val base_dir = _editor_dirname(active_path)
+        if base_dir == "":
+            return target
+        return _editor_join_path(base_dir, target)
+    val slug = md_wiki_slug(target)
+    for doc in session.documents:
+        if md_wiki_slug(md_wiki_title_from_path(doc.path())) == slug:
+            return doc.path()
+    val dir = _editor_dirname(active_path)
+    if dir == "":
+        return target + ".md"
+    _editor_join_path(dir, target + ".md")
+
+fn _editor_markdown_link_should_create_note(raw_target: text, path: text) -> bool:
+    if path == "":
+        return false
+    if rt_file_exists(path):
+        return false
+    var target = raw_target.trim()
+    if target.starts_with("file://"):
+        return false
+    val parsed = md_wiki_parse_link_target(target)
+    target = parsed.0.trim()
+    if target == "":
+        return false
+    if target.starts_with("/") or target.ends_with(".md") or target.ends_with(".markdown"):
+        return false
+    true
+
+fn _editor_property_schema_rule_from_payload(payload: text) -> MdPropertySchemaRule:
+    val key = _editor_payload_part(payload, 0).trim()
+    val required_text = _editor_payload_part(payload, 1).trim()
+    val allowed_text = _editor_payload_part(payload, 2).trim()
+    val required = required_text == "required" or required_text == "true" or required_text == "yes"
+    val allowed = _editor_payload_csv(allowed_text)
+    md_property_schema_rule(key, required, allowed)
+
+fn _editor_markdown_property_content(content: text, key: text, value: text) -> text:
+    if key == "":
+        return content
+    val line = key + ": " + value
+    val lines = content.split("\n")
+    if lines.len() == 0:
+        return "---\n" + line + "\n---\n" + content
+    val first_line = lines[0]
+    if first_line.trim() != "---":
+        return "---\n" + line + "\n---\n" + content
+    var out = "---"
+    var i = 1
+    var found = false
+    var closed = false
+    while i < lines.len():
+        val raw = lines[i]
+        val trimmed = raw.trim()
+        if not closed and trimmed == "---":
+            if not found:
+                out = out + "\n" + line
+            out = out + "\n---"
+            closed = true
+        elif not closed:
+            val sep = _editor_find_text(trimmed, ":")
+            val existing_key = if sep > 0 then trimmed.slice(0, sep).trim() else: ""
+            if existing_key == key:
+                out = out + "\n" + line
+                found = true
+            else:
+                out = out + "\n" + raw
+        else:
+            out = out + "\n" + raw
+        i = i + 1
+    if not closed:
+        if not found:
+            out = out + "\n" + line
+        out = out + "\n---"
+    out
+
+fn _editor_tasks_matching(tasks: [MdWikiTask], query: text) -> [MdWikiTask]:
+    if query == "":
+        return tasks
+    var result: [MdWikiTask] = []
+    for task in tasks:
+        if _editor_find_text(task.text_content.to_lower(), query) >= 0 or _editor_find_text(task.path.to_lower(), query) >= 0:
+            result.push(task)
+    result
+
+fn _editor_problem_visible_count(panel: DiagnosticsPanel) -> i64:
+    var count = 0
+    for row in panel.rows:
+        if row.path != "":
+            count = count + 1
+    count
+
+fn _editor_wiki_properties_for_key(index: MdWikiIndex, key: text) -> [MdWikiProperty]:
+    var props: [MdWikiProperty] = []
+    for prop in index.properties:
+        if prop.key == key:
+            props.push(prop)
+    props
+
+fn _editor_wiki_index_open_documents(session: EditSession) -> MdWikiIndex:
+    var docs: [MdWikiDocument] = []
+    for doc in session.documents:
+        if doc.language_id == "markdown":
+            docs.push(md_wiki_document(doc.path(), doc.buffer.to_text()))
+    md_wiki_index_documents(docs)
+
+fn _editor_wiki_docs_has_path(docs: [MdWikiDocument], path: text) -> bool:
+    for doc in docs:
+        if doc.path == path:
+            return true
+    false
+
+fn _editor_markdown_vault_documents(root: text) -> [MdWikiDocument]:
+    var docs: [MdWikiDocument] = []
+    val files = rt_dir_walk(root)
+    for file in files:
+        val lower = file.to_lower()
+        if lower.ends_with(".md") or lower.ends_with(".markdown"):
+            docs.push(md_wiki_document(file, rt_file_read_text(file) ?? ""))
+    docs
+
+fn _editor_vault_search_cache_path(root: text) -> text:
+    if root.ends_with("/"):
+        return root + ".simple-vault-search.cache"
+    root + "/.simple-vault-search.cache"

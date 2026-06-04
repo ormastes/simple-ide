@@ -1,0 +1,178 @@
+# Layout Manager
+#
+# Manages the room-based grid layout for the TUI dashboard.
+# Supports full-screen (2x3 grid + tree + feed) and compact (tabbed) modes.
+
+use app.ui.tui.screen.{Screen, get_terminal_size}
+use app.llm_dashboard.tui.colors.{room_color}
+use app.llm_dashboard.tui.rooms.{RoomState, render_room_content, render_room_header}
+use app.llm_dashboard.data.types.{RoomKind, room_name}
+use app.ui.render.ansi.{RESET, BOLD, DIM, CYAN, WHITE}
+
+# =========================================================================
+# Layout Mode
+# =========================================================================
+
+enum LayoutMode:
+    Full         # 120x40+ : grid + tree + feed
+    Compact      # 80x24  : tabbed rooms
+
+fn detect_layout_mode(width: i32, height: i32) -> LayoutMode:
+    if width >= 100 and height >= 30:
+        return LayoutMode.Full
+    return LayoutMode.Compact
+
+# =========================================================================
+# Layout Dimensions
+# =========================================================================
+
+class LayoutDims:
+    screen_w: i32
+    screen_h: i32
+    room_w: i32
+    room_h: i32
+    tree_w: i32
+    tree_h: i32
+    feed_h: i32
+    status_h: i32
+    mode: LayoutMode
+
+fn compute_layout(width: i32, height: i32) -> LayoutDims:
+    """Compute layout dimensions based on terminal size."""
+    val mode = detect_layout_mode(width: width, height: height)
+    match mode:
+        LayoutMode.Full:
+            # 2 room columns left + tree panel right
+            val room_w = (width - 2) / 3        # 3 columns
+            val tree_w = width - (room_w * 2) - 3
+            val room_h = (height - 10) / 2       # 2 rows of rooms
+            val feed_h = height - (room_h * 2) - 4  # remaining for feed
+            return LayoutDims(
+                screen_w: width, screen_h: height,
+                room_w: room_w, room_h: room_h,
+                tree_w: tree_w, tree_h: room_h * 2,
+                feed_h: feed_h, status_h: 2,
+                mode: LayoutMode.Full
+            )
+        LayoutMode.Compact:
+            val room_w = width - 2
+            val room_h = height - 6
+            return LayoutDims(
+                screen_w: width, screen_h: height,
+                room_w: room_w, room_h: room_h,
+                tree_w: room_w, tree_h: room_h,
+                feed_h: 4, status_h: 2,
+                mode: LayoutMode.Compact
+            )
+
+# =========================================================================
+# Full Layout Rendering
+# =========================================================================
+
+fn render_full_layout(screen: Screen, dims: LayoutDims, rooms: [RoomState],
+                      tree_lines: [text], feed_lines: [text], status_line: text) -> Screen:
+    """Render the full-screen layout with room grid, tree, and feed."""
+    var s = screen
+
+    # Title bar
+    s = s.put_styled(0, 1, " LLM Agent Dashboard ", "{BOLD}{CYAN}")
+
+    # Row 1: Research | Code | Agent Tree
+    if rooms.len() >= 2:
+        s = render_room_box(s, row: 1, col: 0, w: dims.room_w, h: dims.room_h, room: rooms[0])
+        s = render_room_box(s, row: 1, col: dims.room_w + 1, w: dims.room_w, h: dims.room_h, room: rooms[1])
+
+    # Agent Tree panel (right column, full height)
+    val tree_col = (dims.room_w + 1) * 2
+    s = s.draw_box(1, tree_col, dims.tree_w, dims.tree_h + 2, "Agent Tree")
+    var tree_row = 2
+    for line in tree_lines:
+        if tree_row < dims.tree_h + 2:
+            s = s.put_text(tree_row, tree_col + 1, line)
+            tree_row = tree_row + 1
+
+    # Row 2: Skills | Servers
+    val row2_y = 1 + dims.room_h
+    if rooms.len() >= 4:
+        s = render_room_box(s, row: row2_y, col: 0, w: dims.room_w, h: dims.room_h, room: rooms[2])
+        s = render_room_box(s, row: row2_y, col: dims.room_w + 1, w: dims.room_w, h: dims.room_h, room: rooms[3])
+
+    # Activity Feed (bottom)
+    val feed_y = 1 + dims.room_h * 2
+    s = s.draw_box(feed_y, 0, dims.screen_w, dims.feed_h, "Activity Feed")
+    var feed_row = feed_y + 1
+    for line in feed_lines:
+        if feed_row < feed_y + dims.feed_h - 1:
+            s = s.put_text(feed_row, 1, line)
+            feed_row = feed_row + 1
+
+    # Status bar (bottom)
+    val status_y = dims.screen_h - 2
+    s = s.put_text(status_y, 1, status_line)
+
+    # Key hints
+    val hint = " [1]Research [2]Code [3]Skills [4]Servers [5]Tree [6]Feed [7]Tasks  /filter  q:quit  r:refresh"
+    s = s.put_styled(dims.screen_h - 1, 1, hint, DIM)
+
+    return s
+
+# =========================================================================
+# Compact Layout Rendering
+# =========================================================================
+
+fn render_compact_layout(screen: Screen, dims: LayoutDims, active_room: RoomState,
+                         active_tab: i32, status_line: text) -> Screen:
+    """Render a compact tabbed layout for small terminals."""
+    var s = screen
+
+    # Tab bar
+    var tab_bar = ""
+    val tab_names = ["Research", "Code", "Skills", "Servers", "Tree", "Feed", "Tasks"]
+    var i = 0
+    for name in tab_names:
+        if i == active_tab:
+            tab_bar = "{tab_bar} {BOLD}[{name}]{RESET}"
+        else:
+            tab_bar = "{tab_bar} {DIM}{name}{RESET}"
+        i = i + 1
+    s = s.put_text(0, 0, tab_bar)
+
+    # Active room content
+    s = render_room_box(s, row: 1, col: 0, w: dims.room_w, h: dims.room_h, room: active_room)
+
+    # Status bar
+    val status_y = dims.screen_h - 2
+    s = s.put_text(status_y, 1, status_line)
+
+    # Key hints
+    s = s.put_styled(dims.screen_h - 1, 1, " Tab:switch  q:quit  r:refresh", DIM)
+
+    return s
+
+# =========================================================================
+# Room Box Rendering
+# =========================================================================
+
+fn render_room_box(screen: Screen, row: i32, col: i32, w: i32, h: i32, room: RoomState) -> Screen:
+    """Render a single room as a box with title and content."""
+    var s = screen
+
+    # Draw box
+    val color = room_color(room.kind)
+    s = s.draw_box(row, col, w, h, room.title)
+    # Color the title
+    s = s.put_text(row, col + 2, render_room_header(room))
+
+    # Render content lines
+    val content = render_room_content(room, h - 2)
+    var content_row = row + 1
+    for line in content:
+        if content_row < row + h - 1:
+            # Truncate line to fit room width
+            var display = line
+            if display.len() > w - 2:
+                display = "{display.slice(0, w - 5)}..."
+            s = s.put_text(content_row, col + 1, display)
+            content_row = content_row + 1
+
+    return s

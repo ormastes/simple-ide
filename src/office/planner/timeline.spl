@@ -1,0 +1,177 @@
+# Timeline View
+#
+# Text-based Gantt chart rendering for project tasks.
+
+use common.ui.widget.{WidgetNode}
+use common.ui.builder.{column, row, panel, label, text_widget, with_flex, with_width}
+use app.office.planner.task.{Task, priority_icon}
+use app.office.planner.board.{Project}
+
+# =========================================================================
+# Timeline Builder
+# =========================================================================
+
+fn build_timeline_view(project: Project) -> WidgetNode:
+    """Build a text-based Gantt chart showing task bars on a timeline."""
+    if project.tasks.len() == 0:
+        return panel("timeline_view", "Timeline", [
+            label("timeline_empty", "No tasks to display")
+        ])
+
+    # Determine date range
+    val date_range = _compute_date_range(project)
+    val start_date = date_range.start
+    val end_date = date_range.end
+    val span_days = _days_between(start_date, end_date)
+
+    # Header row with date markers
+    val header = _build_timeline_header(start_date, span_days)
+
+    # Task rows
+    var task_rows: [WidgetNode] = []
+    task_rows = task_rows.push(header)
+    var t_idx: i32 = 0
+    for task in project.tasks:
+        val task_row = _build_task_row(task, start_date, span_days, t_idx)
+        task_rows = task_rows.push(task_row)
+        t_idx = t_idx + 1
+
+    return panel("timeline_view", "Timeline", task_rows)
+
+# =========================================================================
+# Row Builders
+# =========================================================================
+
+fn _build_timeline_header(start_date: text, span_days: i32) -> WidgetNode:
+    """Build a header row with date labels across the span."""
+    var cells: [WidgetNode] = []
+    # Task name column
+    var name_cell = label("tl_header_name", "Task")
+    name_cell = with_width(name_cell, 200)
+    cells = cells.push(name_cell)
+    # Date cells (show every 7 days or at least endpoints)
+    val bar_width = if span_days > 0: span_days else: 1
+    var day: i32 = 0
+    while day <= bar_width:
+        if day % 7 == 0 or day == bar_width:
+            var date_label = label("tl_hdr_{day}", "D{day}")
+            date_label = with_width(date_label, 20)
+            cells = cells.push(date_label)
+        day = day + 1
+    return row("tl_header", cells)
+
+fn _build_task_row(task: Task, start_date: text, span_days: i32, t_idx: i32) -> WidgetNode:
+    """Build a single task's Gantt bar row."""
+    val prio = priority_icon(task.priority)
+    val bar_width = if span_days > 0: span_days else: 1
+
+    var cells: [WidgetNode] = []
+    # Task name
+    var name_cell = label("tl_task_{t_idx}_name", "{prio} {task.title}")
+    name_cell = with_width(name_cell, 200)
+    cells = cells.push(name_cell)
+
+    # Gantt bar: render as text characters
+    val bar = _render_gantt_bar(task, start_date, bar_width)
+    val bar_widget = text_widget("tl_task_{t_idx}_bar", bar)
+    cells = cells.push(bar_widget)
+
+    return row("tl_task_{t_idx}", cells)
+
+# =========================================================================
+# Gantt Bar Rendering
+# =========================================================================
+
+fn _render_gantt_bar(task: Task, start_date: text, span_days: i32) -> text:
+    """Render a text-based Gantt bar for a task.
+
+    Uses '-' for empty days, '#' for the task's created-to-due range,
+    and '*' for the due date itself.
+    """
+    val created_offset = if task.created_date != "": _days_between(start_date, task.created_date) else: 0
+    val due_offset = if task.due_date != "": _days_between(start_date, task.due_date) else: span_days
+
+    val bar_start = if created_offset >= 0: created_offset else: 0
+    val bar_end = if due_offset <= span_days: due_offset else: span_days
+
+    var bar = ""
+    var d: i32 = 0
+    while d <= span_days:
+        if d >= bar_start and d <= bar_end:
+            if d == bar_end:
+                bar = "{bar}*"
+            else:
+                bar = "{bar}#"
+        else:
+            bar = "{bar}-"
+        d = d + 1
+    return bar
+
+# =========================================================================
+# Date Range Helpers
+# =========================================================================
+
+struct DateRange:
+    start: text
+    end: text
+
+fn _compute_date_range(project: Project) -> DateRange:
+    """Find the earliest created_date and latest due_date across all tasks."""
+    var earliest = "9999-12-31"
+    var latest = "0000-01-01"
+    for task in project.tasks:
+        if task.created_date != "" and task.created_date < earliest:
+            earliest = task.created_date
+        if task.due_date != "" and task.due_date < earliest:
+            earliest = task.due_date
+        if task.due_date != "" and task.due_date > latest:
+            latest = task.due_date
+        if task.created_date != "" and task.created_date > latest:
+            latest = task.created_date
+    if earliest == "9999-12-31":
+        earliest = "2026-01-01"
+    if latest == "0000-01-01":
+        latest = "2026-01-31"
+    return DateRange(start: earliest, end: latest)
+
+fn _days_between(start: text, end: text) -> i32:
+    """Estimate the number of days between two YYYY-MM-DD dates.
+
+    Uses a simplified calculation based on year/month/day parsing.
+    Accurate for date offsets in Gantt chart rendering.
+    """
+    val start_total = _date_to_day_number(start)
+    val end_total = _date_to_day_number(end)
+    val diff = end_total - start_total
+    if diff < 0:
+        return 0
+    return diff
+
+fn _date_to_day_number(date: text) -> i32:
+    """Convert a YYYY-MM-DD date to an approximate day number for offset calculations."""
+    if date.len() < 10:
+        return 0
+    val year_str = date.substring(0, 4)
+    val month_str = date.substring(5, 7)
+    val day_str = date.substring(8, 10)
+    val year = _parse_int(year_str)
+    val month = _parse_int(month_str)
+    val day = _parse_int(day_str)
+    # Approximate: 365.25 * year + 30.44 * month + day
+    return year * 365 + month * 30 + day
+
+fn _parse_int(s: text) -> i32:
+    """Parse a non-negative integer from text. Returns 0 on failure."""
+    if s.len() == 0:
+        return 0
+    var result: i32 = 0
+    var i: i32 = 0
+    while i < s.len():
+        val c = s.char_at(i)
+        val code = c.char_code_at(0)
+        if code >= 48 and code <= 57:
+            result = result * 10 + (code - 48)
+        else:
+            return 0
+        i = i + 1
+    return result

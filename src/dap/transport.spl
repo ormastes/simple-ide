@@ -1,0 +1,60 @@
+# DAP Transport Layer
+# Delegates to shared protocol transport for Content-Length I/O
+
+import sys
+import io.stdio as stdio
+import core.json as json
+use app.protocol.transport.{read_message, write_message, log_debug_with_prefix, log_error_with_prefix}
+
+# Re-export shared functions
+
+# Write a DAP response
+fn write_response(request_seq: Int, success: Bool, command: String, body: Option<Dict>) -> Result<Nil, String>:
+    var response = {
+        "type": "response",
+        "request_seq": request_seq,
+        "success": success,
+        "command": command,
+        "seq": generate_seq()
+    }
+
+    match body:
+        case Some(b):
+            response["body"] = b
+        case nil:
+            pass
+
+    write_message(response)
+
+# Write a DAP event
+fn write_event(event: String, body: Dict) -> Result<Nil, String>:
+    val event_msg = {
+        "type": "event",
+        "event": event,
+        "seq": generate_seq(),
+        "body": body
+    }
+    write_message(event_msg)
+
+# Global sequence counter
+var SEQUENCE_COUNTER = 0
+
+fn generate_seq() -> Int:
+    SEQUENCE_COUNTER = SEQUENCE_COUNTER + 1
+    SEQUENCE_COUNTER
+
+# Helper: Log a message to stderr for debugging
+fn log_debug(message: String):
+    log_debug_with_prefix("SIMPLE_DAP_DEBUG", "DAP", message)
+
+# Helper: Log an error to stderr
+fn log_error(message: String):
+    log_error_with_prefix("DAP", message)
+
+# Parse message type
+fn parse_message_type(data: Dict) -> Result<String, String>:
+    match data.get("type"):
+        case Ok(msg_type):
+            Ok(msg_type)
+        case Err(_):
+            Err("Missing 'type' field in message")

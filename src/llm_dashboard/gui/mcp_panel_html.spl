@@ -1,0 +1,53 @@
+# MCP Panel HTML
+#
+# MCP server statistics table for the Observability tab.
+# Shows per-server call counts, latency, and estimated token usage.
+
+use app.llm_dashboard.data.store.{AgentDashboardStore}
+use app.llm_dashboard.data.types.{McpStats, mcp_avg_latency, format_tokens}
+
+# =========================================================================
+# MCP Panel CSS
+# =========================================================================
+
+fn generate_mcp_panel_css() -> text:
+    return """
+.mcp-panel { padding: 16px; }
+.mcp-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.mcp-table th { text-align: left; color: #8b949e; border-bottom: 1px solid #30363d; padding: 8px; }
+.mcp-table td { padding: 7px 8px; border-bottom: 1px solid #21262d; color: #e6edf3; }
+.mcp-table tr:hover td { background: #161b22; }
+.mcp-server-name { font-weight: 600; color: #58a6ff; }
+.mcp-count { font-variant-numeric: tabular-nums; }
+.latency-fast { color: #3fb950; }
+.latency-med  { color: #d29922; }
+.latency-slow { color: #f85149; }
+.mcp-no-data { color: #8b949e; font-size: 0.85rem; padding: 16px; }
+.mcp-last-call { color: #8b949e; font-size: 0.78rem; }
+"""
+
+# =========================================================================
+# MCP Panel HTML
+# =========================================================================
+
+fn generate_mcp_panel_html(store: AgentDashboardStore) -> text:
+    val stats = store.get_mcp_stats()
+
+    if stats.len() == 0:
+        return """<div class="mcp-panel"><p class="mcp-no-data">No MCP server calls captured yet.<br>Calls to mcp__* tools will appear here.</p></div>"""
+
+    var rows = ""
+    for s in stats:
+        val avg_ms = mcp_avg_latency(s)
+        val lat_class = if avg_ms < 100: "latency-fast" elif avg_ms < 500: "latency-med" else: "latency-slow"
+        val lat_str = if avg_ms > 0: "{avg_ms}ms" else: "—"
+        val tok_str = if s.estimated_tokens > 0: format_tokens(s.estimated_tokens) else: "—"
+        val last = if s.last_tool != "": "<span class=\"mcp-last-call\">{s.last_tool}</span>" else: "—"
+        rows = "{rows}<tr><td class=\"mcp-server-name\">{s.server_name}</td><td class=\"mcp-count\">{s.call_count}</td><td class=\"{lat_class}\">{lat_str}</td><td>{tok_str}</td><td>{last}</td></tr>"
+
+    return """<div class="mcp-panel">
+<table class="mcp-table">
+  <tr><th>Server</th><th>Calls</th><th>Avg Latency</th><th>Est. Tokens</th><th>Last Tool</th></tr>
+  {rows}
+</table>
+</div>"""

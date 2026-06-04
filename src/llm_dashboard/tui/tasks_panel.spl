@@ -1,0 +1,53 @@
+# Tasks Panel — TUI
+#
+# Renders managed tasks (loops, schedules, daemons, jobs, remote sessions)
+# as TUI lines. Follows the same pattern as stats_panel.spl.
+
+use app.ui.render.ansi.{RESET, BOLD, DIM, FG_GREEN, FG_YELLOW, FG_RED, FG_CYAN}
+use app.llm_dashboard.data.types.{
+    ManagedTask, TaskKind, TaskState,
+    task_kind_name, task_state_name
+}
+
+fn render_tasks_panel(tasks: [ManagedTask], max_lines: i64) -> [text]:
+    """Render managed tasks as TUI lines."""
+    var lines: [text] = []
+
+    lines.push(BOLD + FG_CYAN + "Tasks" + RESET)
+    lines.push("")
+
+    if tasks.len() == 0:
+        lines.push(DIM + "  (no active tasks)" + RESET)
+    else:
+        for task in tasks:
+            val state = task_state_name(task.state)
+            val kind = task_kind_name(task.kind)
+            val state_color = _state_color(task.state)
+            val id_part = DIM + "[{kind}]" + RESET
+            val state_part = state_color + state + RESET
+            val cmd = if task.command.len() > 40:
+                "{task.command.slice(0, 37)}..."
+            else:
+                task.command
+            lines.push("  {id_part} {BOLD}{task.id}{RESET}  {state_part}")
+            if cmd.len() > 0:
+                lines.push("    " + DIM + cmd + RESET)
+
+    if lines.len() > max_lines:
+        var truncated: [text] = []
+        var i = 0
+        while i < max_lines - 1:
+            truncated.push(lines[i])
+            i = i + 1
+        truncated.push(DIM + "..." + RESET)
+        return truncated
+
+    lines
+
+fn _state_color(state: TaskState) -> text:
+    match state:
+        TaskState.Active: FG_GREEN
+        TaskState.Paused: FG_YELLOW
+        TaskState.Completed: DIM
+        TaskState.Failed: FG_RED
+        TaskState.Cancelled: DIM

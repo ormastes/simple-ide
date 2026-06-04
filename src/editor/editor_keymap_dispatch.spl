@@ -1,0 +1,87 @@
+# Editor Keymap Dispatch
+#
+# Vim-style key dispatch for normal, insert, and command modes.
+
+use std.editor.buffer.buffer.*
+use app.editor.editor_controller_types.*
+use app.editor.commands.*
+
+fn ctrl_handle_normal_key(buffer: EditorBuffer, key: text) -> NormalKeyResult:
+    if key == "q":
+        return NormalKeyResult(message: "quit", quit: true, enter_insert: false, enter_command: false)
+    if key == "i":
+        return NormalKeyResult(message: "-- INSERT --", quit: false, enter_insert: true, enter_command: false)
+    if key == "a":
+        buffer.move_relative(0, 1)
+        return NormalKeyResult(message: "-- INSERT --", quit: false, enter_insert: true, enter_command: false)
+    if key == "o":
+        buffer.move_to_line_end()
+        buffer.insert_at_cursor("\n")
+        return NormalKeyResult(message: "-- INSERT --", quit: false, enter_insert: true, enter_command: false)
+    if key == ":":
+        return NormalKeyResult(message: "", quit: false, enter_insert: false, enter_command: true)
+    if key == "h":
+        val result = editor_dispatch(buffer, editor_cmd("move-left"))
+        return NormalKeyResult(message: result.message, quit: false, enter_insert: false, enter_command: false)
+    if key == "j":
+        val result = editor_dispatch(buffer, editor_cmd("move-down"))
+        return NormalKeyResult(message: result.message, quit: false, enter_insert: false, enter_command: false)
+    if key == "k":
+        val result = editor_dispatch(buffer, editor_cmd("move-up"))
+        return NormalKeyResult(message: result.message, quit: false, enter_insert: false, enter_command: false)
+    if key == "l":
+        val result = editor_dispatch(buffer, editor_cmd("move-right"))
+        return NormalKeyResult(message: result.message, quit: false, enter_insert: false, enter_command: false)
+    if key == "0":
+        buffer.move_to_line_start()
+        return NormalKeyResult(message: "home", quit: false, enter_insert: false, enter_command: false)
+    if key == "$":
+        buffer.move_to_line_end()
+        return NormalKeyResult(message: "end", quit: false, enter_insert: false, enter_command: false)
+    if key == "G":
+        buffer.move_cursor(buffer.line_count() - 1, 0)
+        return NormalKeyResult(message: "bottom", quit: false, enter_insert: false, enter_command: false)
+    if key == "g":
+        buffer.move_cursor(0, 0)
+        return NormalKeyResult(message: "top", quit: false, enter_insert: false, enter_command: false)
+    if key == "x":
+        val result = editor_dispatch(buffer, editor_cmd("delete"))
+        return NormalKeyResult(message: result.message, quit: false, enter_insert: false, enter_command: false)
+    if key == "u":
+        val result = editor_dispatch(buffer, editor_cmd("undo"))
+        return NormalKeyResult(message: result.message, quit: false, enter_insert: false, enter_command: false)
+    if key == "\x12":
+        val result = editor_dispatch(buffer, editor_cmd("redo"))
+        return NormalKeyResult(message: result.message, quit: false, enter_insert: false, enter_command: false)
+    NormalKeyResult(message: "", quit: false, enter_insert: false, enter_command: false)
+
+fn ctrl_handle_insert_key(buffer: EditorBuffer, key: text) -> InsertKeyResult:
+    if key == "\x1b":
+        return InsertKeyResult(message: "", exit_insert: true)
+    if key == "\x7f" or key == "\b":
+        buffer.delete_before_cursor()
+        return InsertKeyResult(message: "-- INSERT --", exit_insert: false)
+    if key == "\r" or key == "\n":
+        buffer.insert_at_cursor("\n")
+        return InsertKeyResult(message: "-- INSERT --", exit_insert: false)
+    if key.len() == 1:
+        val code = key.char_code_at(0)
+        if code >= 32:
+            buffer.insert_at_cursor(key)
+        return InsertKeyResult(message: "-- INSERT --", exit_insert: false)
+    InsertKeyResult(message: "-- INSERT --", exit_insert: false)
+
+fn ctrl_handle_command_key(key: text, commandline: text) -> CommandKeyResult:
+    if key == "\x1b":
+        return CommandKeyResult(commandline: "", done: false, cancelled: true)
+    if key == "\r" or key == "\n":
+        return CommandKeyResult(commandline: commandline, done: true, cancelled: false)
+    if key == "\x7f" or key == "\b":
+        if commandline.len() > 0:
+            return CommandKeyResult(commandline: commandline.slice(0, commandline.len() - 1), done: false, cancelled: false)
+        return CommandKeyResult(commandline: "", done: false, cancelled: true)
+    if key.len() == 1:
+        val code = key.char_code_at(0)
+        if code >= 32:
+            return CommandKeyResult(commandline: commandline + key, done: false, cancelled: false)
+    CommandKeyResult(commandline: commandline, done: false, cancelled: false)

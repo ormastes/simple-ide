@@ -1,0 +1,114 @@
+"""
+Code Actions Provider for the Simple VSCode Extension.
+
+Maps LSP textDocument/codeAction responses to editor-consumable
+quick-fix and refactoring commands. Each CodeAction carries a
+workspace edit (text edits per file) or a command reference.
+"""
+
+struct TextEdit:
+    start_line: i64
+    start_col: i64
+    end_line: i64
+    end_col: i64
+    new_text: text
+
+struct FileEdit:
+    uri: text
+    edits: [TextEdit]
+
+struct WorkspaceEdit:
+    file_edits: [FileEdit]
+
+struct CodeAction:
+    title: text
+    kind: text
+    is_preferred: bool
+    edit: WorkspaceEdit
+    command_id: text
+    command_args: [text]
+
+struct CodeActionsProvider:
+    actions: [CodeAction]
+
+fn code_actions_provider_create() -> CodeActionsProvider:
+    CodeActionsProvider(actions: [])
+
+fn code_action_kind_quickfix() -> text:
+    "quickfix"
+
+fn code_action_kind_refactor() -> text:
+    "refactor"
+
+fn code_action_kind_source() -> text:
+    "source"
+
+fn code_action_kind_organize_imports() -> text:
+    "source.organizeImports"
+
+fn code_action_from_lsp(title: text, kind: text, is_preferred: bool) -> CodeAction:
+    """Create a code action with an empty workspace edit."""
+    CodeAction(
+        title: title,
+        kind: kind,
+        is_preferred: is_preferred,
+        edit: WorkspaceEdit(file_edits: []),
+        command_id: "",
+        command_args: []
+    )
+
+fn code_action_with_edit(action: CodeAction, uri: text, edits: [TextEdit]) -> CodeAction:
+    """Attach text edits for a single file to a code action."""
+    var file_edits = action.edit.file_edits
+    file_edits.push(FileEdit(uri: uri, edits: edits))
+    CodeAction(
+        title: action.title,
+        kind: action.kind,
+        is_preferred: action.is_preferred,
+        edit: WorkspaceEdit(file_edits: file_edits),
+        command_id: action.command_id,
+        command_args: action.command_args
+    )
+
+fn code_action_with_command(action: CodeAction, cmd_id: text, cmd_args: [text]) -> CodeAction:
+    """Attach a command reference to a code action."""
+    CodeAction(
+        title: action.title,
+        kind: action.kind,
+        is_preferred: action.is_preferred,
+        edit: action.edit,
+        command_id: cmd_id,
+        command_args: cmd_args
+    )
+
+fn code_actions_provider_add(provider: CodeActionsProvider, action: CodeAction):
+    """Register a code action in the provider."""
+    provider.actions.push(action)
+
+fn code_actions_provider_clear(provider: CodeActionsProvider):
+    """Clear all registered code actions."""
+    provider.actions = []
+
+fn code_actions_provider_by_kind(provider: CodeActionsProvider, kind: text) -> [CodeAction]:
+    """Filter actions by kind prefix (e.g. "quickfix" matches "quickfix.xxx")."""
+    var result: [CodeAction] = []
+    var i = 0
+    while i < provider.actions.len():
+        val a = provider.actions[i]
+        if a.kind == kind:
+            result.push(a)
+        i = i + 1
+    result
+
+fn code_actions_provider_preferred(provider: CodeActionsProvider) -> [CodeAction]:
+    """Return only preferred (auto-applicable) actions."""
+    var result: [CodeAction] = []
+    var i = 0
+    while i < provider.actions.len():
+        if provider.actions[i].is_preferred:
+            result.push(provider.actions[i])
+        i = i + 1
+    result
+
+fn code_actions_provider_count(provider: CodeActionsProvider) -> i64:
+    provider.actions.len()

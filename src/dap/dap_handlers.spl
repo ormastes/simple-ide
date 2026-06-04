@@ -1,0 +1,382 @@
+# DAP Handlers - Breakpoint, Variable, and Data Inspection Handlers
+# Handler methods for the DapServer (setBreakpoints, variables, data breakpoints, evaluate, setVariable)
+# All handlers use the unified DebugAdapter trait — no conditional backend dispatch.
+
+import sys
+import dap.protocol as protocol
+import dap.transport as transport
+import dap.breakpoints as breakpoints
+import app.debug.coordinator.{VarInfo, FrameInfo}
+import app.dap.adapter.mod.{DebugAdapter, AdapterCapabilities}
+
+impl DapServer:
+    fn handle_set_breakpoints(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        match arguments:
+            case nil:
+                return Err("Missing arguments for setBreakpoints")
+            case Some(args):
+                # Extract source
+                val source_data = args.get("source")?
+                val source_path = source_data.get("path")?
+
+                # Extract breakpoints
+                val breakpoints_data = args.get("breakpoints")?
+                var source_breakpoints = []
+
+                for bp_data in breakpoints_data:
+                    val source_bp = protocol.SourceBreakpoint.from_json(bp_data)?
+                    source_breakpoints.push(source_bp)
+
+                # Set breakpoints using adapter
+                var protocol_breakpoints = []
+                for source_bp in source_breakpoints:
+                    # Add breakpoint via unified adapter
+                    val bp_result = self.adapter.set_breakpoint_rich(
+                        source_path,
+                        source_bp.line,
+                        source_bp.condition,
+                        source_bp.hit_condition,
+                        source_bp.log_message
+                    )
+
+                    # Create protocol breakpoint response
+                    match bp_result:
+                        Ok(bp_id):
+                            val protocol_bp = {
+                                "id": bp_id,
+                                "verified": true,
+                                "line": source_bp.line,
+                                "source": {
+                                    "path": source_path
+                                }
+                            }
+                            protocol_breakpoints.push(protocol_bp)
+                        Err(e):
+                            val protocol_bp = {
+                                "id": 0,
+                                "verified": false,
+                                "line": source_bp.line,
+                                "message": e,
+                                "source": {
+                                    "path": source_path
+                                }
+                            }
+                            protocol_breakpoints.push(protocol_bp)
+
+                val body = {
+                    "breakpoints": protocol_breakpoints
+                }
+
+                transport.log_debug("Set {protocol_breakpoints.len()} breakpoints in {source_path}")
+
+                # Send response
+                transport.write_response(request_seq, true, command, Some(body))?
+
+                Ok(nil)
+    fn handle_variables(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        match arguments:
+            nil:
+                return Err("Missing arguments for variables")
+            Some(args):
+                val variables_reference = args.get("variablesReference")?
+
+                var variables: [Dict] = []
+
+                # Variables reference 1 = local scope, 2 = global/arguments scope, 3 = registers
+                if variables_reference == 1:
+                    # Get local variables via adapter
+                    val locals_result = self.adapter.read_locals()
+                    match locals_result:
+                        Ok(vars):
+                            for v in vars:
+                                val protocol_var = protocol.Variable.new(v.name, v.value).with_type(v.type_name)
+                                variables.push(protocol_var.to_json())
+                        Err(_):
+                            pass
+
+                    # Placeholder if no variables
+                    if variables.len() == 0:
+                        val placeholder = protocol.Variable.new(
+                            "(no local variables)",
+                            ""
+                        ).with_type("")
+                        variables.push(placeholder.to_json())
+
+                elif variables_reference == 2:
+                    # Get globals/arguments via adapter
+                    # NOTE: ref=2 means "arguments" for remote, "globals" for local
+                    # This semantic mismatch is preserved intentionally (see plan)
+                    val vars_result = self.adapter.read_globals()
+                    match vars_result:
+                        Ok(vars):
+                            for v in vars:
+                                val protocol_var = protocol.Variable.new(v.name, v.value).with_type(v.type_name)
+                                variables.push(protocol_var.to_json())
+                        Err(_):
+                            pass
+
+                    # Placeholder if no variables
+                    if variables.len() == 0:
+                        val placeholder = protocol.Variable.new(
+                            "(no global variables)",
+                            ""
+                        ).with_type("")
+                        variables.push(placeholder.to_json())
+
+                elif variables_reference == 3:
+                    # Register scope (adapter reports if supported)
+                    val regs_result = self.adapter.read_all_registers()
+                    match regs_result:
+                        Ok(regs):
+                            for name in regs.keys():
+                                val value = "0x{regs[name]}"
+                                val protocol_var = protocol.Variable.new(name, value).with_type("u32")
+                                variables.push(protocol_var.to_json())
+                        Err(_):
+                            val placeholder = protocol.Variable.new(
+                                "(registers unavailable)",
+                                ""
+                            ).with_type("")
+                            variables.push(placeholder.to_json())
+
+                else:
+                    # Nested variable inspection via adapter
+                    val children_result = self.adapter.list_children("{variables_reference}")
+                    match children_result:
+                        Ok(child_list):
+                            for child in child_list:
+                                var pvar = protocol.Variable.new(child.name, child.value).with_type(child.type_name)
+                                if child.num_children > 0:
+                                    pvar = pvar.with_children(child.name.hash())
+                                variables.push(pvar.to_json())
+                        Err(_):
+                            pass
+
+                val body = {
+                    "variables": variables
+                }
+
+                transport.write_response(request_seq, true, command, Some(body))?
+
+                Ok(nil)
+    fn handle_evaluate(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        match arguments:
+            nil:
+                return Err("Missing arguments for evaluate")
+            Some(args):
+                val expression = args.get("expression")?
+
+                # Select frame if frameId is provided
+                match args.get_optional("frameId"):
+                    Some(frame_id):
+                        self.adapter.select_frame(frame_id)
+                    nil:
+                        pass
+
+                var result_value = ""
+                var result_type = "string"
+
+                val eval_result = self.adapter.evaluate(expression)
+                match eval_result:
+                    Ok(value):
+                        result_value = value
+                    Err(e):
+                        result_value = "<error: {e}>"
+
+                val body = {
+                    "result": result_value,
+                    "type": result_type,
+                    "variablesReference": 0
+                }
+
+                transport.write_response(request_seq, true, command, Some(body))?
+                Ok(nil)
+    fn handle_data_breakpoint_info(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        var name = ""
+        match arguments:
+            Some(args):
+                match args.get_optional("name"):
+                    Some(n):
+                        name = n
+                    nil:
+                        pass
+            nil:
+                pass
+
+        var data_id = name
+        if data_id == "":
+            data_id = "watch_expr"
+
+        val body = {
+            "dataId": data_id,
+            "description": "Break when value changes: {data_id}",
+            "accessTypes": ["read", "write", "readWrite"],
+            "canPersist": true
+        }
+        transport.write_response(request_seq, true, command, Some(body))?
+        Ok(nil)
+    fn handle_set_data_breakpoints(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        match arguments:
+            nil:
+                return Err("Missing arguments for setDataBreakpoints")
+            Some(args):
+                val requested = args.get("breakpoints")?
+                self.data_breakpoints = []
+                var response_breakpoints = []
+                var applied = 0
+                val caps = self.adapter.capabilities()
+                val limit = caps.max_watchpoints.max(1)
+
+                for bp_data in requested:
+                    var data_id = ""
+                    var access_type = "write"
+                    var condition = ""
+                    var hit_condition = ""
+
+                    match bp_data.get_optional("dataId"):
+                        Some(v):
+                            data_id = v
+                        nil:
+                            pass
+                    if data_id == "":
+                        match bp_data.get_optional("expression"):
+                            Some(v):
+                                data_id = v
+                            nil:
+                                pass
+                    if data_id == "":
+                        data_id = "watch_{self.next_data_breakpoint_id}"
+
+                    match bp_data.get_optional("accessType"):
+                        Some(v):
+                            access_type = v
+                        nil:
+                            pass
+                    match bp_data.get_optional("condition"):
+                        Some(v):
+                            condition = v
+                        nil:
+                            pass
+                    match bp_data.get_optional("hitCondition"):
+                        Some(v):
+                            hit_condition = v
+                        nil:
+                            pass
+
+                    if applied >= limit:
+                        val out_bp = {
+                            "verified": false,
+                            "message": "data breakpoint capacity reached (limit={limit})"
+                        }
+                        response_breakpoints.push(out_bp)
+                    else:
+                        var remote_ok = true
+                        var remote_error = ""
+                        if caps.supports_watchpoints:
+                            val set_result = self.adapter.set_watchpoint(data_id, access_type)
+                            match set_result:
+                                Ok(_):
+                                    remote_ok = true
+                                Err(e):
+                                    remote_ok = false
+                                    remote_error = e
+
+                        if not remote_ok:
+                            val out_bp = {
+                                "verified": false,
+                                "message": "failed to set target watchpoint: {remote_error}"
+                            }
+                            response_breakpoints.push(out_bp)
+                        else:
+                            val dbp_id = self.next_data_breakpoint_id
+                            self.next_data_breakpoint_id = self.next_data_breakpoint_id + 1
+                            val stored = {
+                                "id": dbp_id,
+                                "dataId": data_id,
+                                "accessType": access_type,
+                                "condition": condition,
+                                "hitCondition": hit_condition,
+                                "hitCount": 0
+                            }
+                            self.data_breakpoints.push(stored)
+                            applied = applied + 1
+
+                            val out_bp = {
+                                "id": dbp_id,
+                                "verified": true
+                            }
+                            response_breakpoints.push(out_bp)
+
+                val body = {
+                    "breakpoints": response_breakpoints
+                }
+                transport.write_response(request_seq, true, command, Some(body))?
+                Ok(nil)
+    fn handle_set_variable(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        match arguments:
+            nil:
+                return Err("Missing arguments for setVariable")
+            Some(args):
+                val variables_reference = args.get("variablesReference")?
+                val name = args.get("name")?
+                val value = args.get("value")?
+
+                var old_value = ""
+                if variables_reference == 2:
+                    match self.debug_context.global_variables.get(name):
+                        Some(v):
+                            old_value = v.value
+                        nil:
+                            pass
+                    self.debug_context.global_variables[name] = VariableInfo.new(name, value, "string")
+                else:
+                    match self.debug_context.local_variables.get(name):
+                        Some(v):
+                            old_value = v.value
+                        nil:
+                            pass
+                    self.debug_context.local_variables[name] = VariableInfo.new(name, value, "string")
+
+                val body = {
+                    "value": value,
+                    "type": "string",
+                    "variablesReference": 0
+                }
+                transport.write_response(request_seq, true, command, Some(body))?
+
+                # If the value changed and a data breakpoint targets this variable,
+                # emit a stopped event with data breakpoint reason.
+                if old_value != value:
+                    var should_stop = false
+                    for dbp in self.data_breakpoints:
+                        val data_id = dbp["dataId"]
+                        val access = dbp["accessType"]
+                        if data_id == name:
+                            if access == "write" or access == "readWrite" or access == "readwrite":
+                                should_stop = true
+                    if should_stop:
+                        self.send_stopped_event(protocol.StopReason.DataBreakpoint)?
+
+                Ok(nil)
+
+    fn handle_reverse_step(request_seq: Int, command: String) -> Result<Nil, String>:
+        val result = self.adapter.reverse_step()
+        match result:
+            Ok(_):
+                transport.write_response(request_seq, true, command, None)?
+                self.send_stopped_event(protocol.StopReason.Step)?
+                Ok(nil)
+            Err(e):
+                transport.write_error_response(request_seq, command, "Reverse step failed: {e}")?
+                Ok(nil)
+
+    fn handle_reverse_continue(request_seq: Int, command: String) -> Result<Nil, String>:
+        val result = self.adapter.reverse_continue()
+        match result:
+            Ok(_):
+                transport.write_response(request_seq, true, command, None)?
+                self.send_stopped_event(protocol.StopReason.Breakpoint)?
+                Ok(nil)
+            Err(e):
+                transport.write_error_response(request_seq, command, "Reverse continue failed: {e}")?
+                Ok(nil)

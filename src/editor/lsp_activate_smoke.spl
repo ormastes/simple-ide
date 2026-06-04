@@ -1,0 +1,55 @@
+use std.editor.common.types.*
+use std.editor.common.config.*
+use std.editor.buffer.piece_table.*
+use std.editor.buffer.undo.*
+use std.editor.buffer.buffer.*
+use std.editor.core.document.*
+use std.editor.core.session.{EditSession}
+use std.editor.extensions.host.*
+use std.editor.extensions.manifest.*
+use std.editor.extensions.api.*
+use std.editor.extensions.builtin.md_language.*
+use std.editor.extensions.builtin.md_commands.*
+use std.editor.extensions.builtin.md_vim_motions.*
+use std.editor.extensions.builtin.spl_language.*
+use std.editor.view.file_tree.*
+use std.editor.view.layout.*
+use std.editor.view.split_tree.*
+use std.editor.view.tab.*
+use std.editor.view.dock_zone.*
+use std.editor.view.diagnostics_panel.*
+use std.editor.view.preview_pane.*
+use std.editor.view.outline_panel.*
+use std.editor.view.lsp_result_panel.*
+use std.editor.view.wiki_panel.*
+use std.editor.view.settings_view.*
+use std.editor.render.block_model.*
+use std.editor.services.command_palette.*
+use std.editor.services.diagnostics.*
+use std.editor.services.debug_session.*
+use std.editor.services.lsp_transport.*
+use std.editor.services.lsp_client.*
+use std.editor.services.md_lsp_config.*
+use std.editor.services.simple_lsp_config.*
+use std.editor.services.md_diagnostics.*
+use std.editor.services.md_doc_stats.*
+use std.editor.services.md_search.*
+use app.editor.commands.*
+use app.editor.md_dispatch.*
+use app.editor.debug_process_runtime.*
+use app.editor.editor_controller.*
+
+extern fn rt_file_write_text(path: text, content: text) -> bool
+
+fn main() -> i64:
+    val path = "/tmp/simple_editor_lsp_activate_smoke.spl"
+    rt_file_write_text(path, "fn main():\n    return\n")
+    var session = EditSession.new()
+    session.open_file(path)
+    var ctrl = EditorController.new(session)
+    ctrl._activate_active_language()
+    if not ctrl.simple_lsp_state.running:
+        print "STATUS: FAIL lsp_activate_smoke not_running"
+        return 1
+    print "STATUS: PASS lsp_activate_smoke"
+    0

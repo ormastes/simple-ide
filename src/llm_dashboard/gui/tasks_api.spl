@@ -1,0 +1,70 @@
+# Tasks API Handler
+#
+# Handles POST /api/tasks/create and POST /api/tasks/cancel.
+# Uses the file-based scheduler directly (no store needed).
+
+use app.llm_dashboard.scheduler.scheduler.{
+    scheduler_create_loop, scheduler_create_schedule, scheduler_cancel
+}
+
+fn handle_tasks_api(method: text, path: text, body: text) -> (i32, text, text):
+    """Route tasks API requests. Returns (status_code, content_type, body)."""
+    if method != "POST":
+        return (405, "application/json", "{\"error\":\"Method Not Allowed\"}")
+
+    if path == "/api/tasks/create":
+        return _handle_create(body)
+    if path == "/api/tasks/cancel":
+        return _handle_cancel(body)
+
+    return (404, "application/json", "{\"error\":\"Not Found\"}")
+
+fn _handle_create(body: text) -> (i32, text, text):
+    val kind = _json_str(body, "kind")
+    val prompt = _json_str(body, "prompt")
+    val cron_expr = _json_str(body, "cron_expr")
+    val interval_str = _json_str(body, "interval_seconds")
+    val interval: i64 = interval_str.to_i64() ?? 0
+
+    if prompt == "":
+        return (400, "application/json", "{\"error\":\"prompt required\"}")
+
+    if kind == "schedule":
+        if cron_expr == "":
+            return (400, "application/json", "{\"error\":\"cron_expr required for schedule\"}")
+        val task = scheduler_create_schedule(prompt, cron_expr)
+        return (200, "application/json", "{\"ok\":true,\"id\":\"{task.id}\"}")
+
+    # Default: loop
+    val loop_interval = if interval > 0: interval else: 300
+    val task = scheduler_create_loop(prompt, loop_interval)
+    return (200, "application/json", "{\"ok\":true,\"id\":\"{task.id}\"}")
+
+fn _handle_cancel(body: text) -> (i32, text, text):
+    val task_id = _json_str(body, "task_id")
+    if task_id == "":
+        return (400, "application/json", "{\"error\":\"task_id required\"}")
+    scheduler_cancel(task_id)
+    return (200, "application/json", "{\"ok\":true}")
+
+fn _json_str(json: text, key: text) -> text:
+    """Extract a string value from a simple flat JSON object."""
+    val needle = "\"{key}\":"
+    val idx = json.index_of(needle)
+    if idx < 0:
+        return ""
+    val after = json.slice(idx + needle.len()).trim()
+    if not after.starts_with("\""):
+        # Numeric value — return raw digits
+        var i = 0
+        while i < after.len():
+            val ch = after.slice(i, i + 1)
+            if ch == "," or ch == "}" or ch == " " or ch == "\n":
+                break
+            i = i + 1
+        return after.slice(0, i)
+    val content = after.slice(1)
+    val end = content.index_of("\"")
+    if end < 0:
+        return content
+    return content.slice(0, end)

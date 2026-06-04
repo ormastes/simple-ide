@@ -1,0 +1,398 @@
+# Doctest Runner
+#
+# Extracts doc comments with code blocks from Simple source files
+# and Markdown files, then runs them as test cases.
+
+use std.io.{file_read, file_exists, file_atomic_write, file_remove}
+use std.io.{process_run_timeout, process_run}
+use std.io.{dir_walk}
+use std.io.{time_now_unix_micros}
+use std.test_runner.test_runner_types.TestFileResult
+use std.test_runner.test_runner_execute.find_simple_binary
+use std.test_runner.sdoctest.types.{SdoctestFileResult, SdoctestRunResult, SdoctestBlock, BlockResult, BlockStatus}
+use std.io.{env_get}
+
+fn _dt_get_temp_dir() -> text:
+    val tmpdir = env_get("TMPDIR")
+    if tmpdir != "" and tmpdir != nil:
+        return tmpdir
+    val tmp = env_get("TMP")
+    if tmp != "" and tmp != nil:
+        return tmp
+    val temp = env_get("TEMP")
+    if temp != "" and temp != nil:
+        return temp
+    val os_env = env_get("OS")
+    if os_env != "" and os_env != nil:
+        if os_env.lower().contains("windows"):
+            return "C:/Windows/Temp"
+    "/tmp"
+
+# =========================================================================
+# Doctest Extraction
+# =========================================================================
+
+struct Doctest:
+    source_file: text
+    line_number: i64
+    code: text
+    expected_output: text
+    should_fail: bool
+
+fn extract_doctests(file_path: text) -> [Doctest]:
+    if not file_exists(file_path):
+        return []
+
+    val content = file_read(file_path)
+    val lines = content.split("\n")
+    var doctests: [Doctest] = []
+    var i = 0
+    var in_doc_block = false
+    var in_code_block = false
+    var code_lines: [text] = []
+    var start_line = 0
+    var should_fail = false
+
+    while i < lines.len():
+        val line = lines[i]
+        val trimmed = line.trim()
+
+        # Detect doc comments
+        if trimmed.starts_with("///") or trimmed.starts_with("##"):
+            val doc_content = if trimmed.starts_with("///"):
+                trimmed[3:].trim()
+            else:
+                trimmed[2:].trim()
+
+            if doc_content.starts_with("```simple") or doc_content.starts_with("```spl"):
+                in_code_block = true
+                code_lines = []
+                start_line = i + 1
+                should_fail = doc_content.contains("should_fail")
+            elif doc_content == "```" and in_code_block:
+                in_code_block = false
+                if code_lines.len() > 0:
+                    doctests.push(Doctest(
+                        source_file: file_path,
+                        line_number: start_line,
+                        code: code_lines.join("\n"),
+                        expected_output: "",
+                        should_fail: should_fail
+                    ))
+            elif in_code_block:
+                code_lines.push(doc_content)
+
+        else:
+            if in_code_block:
+                in_code_block = false
+                code_lines = []
+
+        i = i + 1
+
+    doctests
+
+# =========================================================================
+# H11: Markdown Doctest Extraction
+# =========================================================================
+
+fn extract_md_doctests(file_path: text) -> [Doctest]:
+    if not file_exists(file_path):
+        return []
+
+    val content = file_read(file_path)
+    val lines = content.split("\n")
+    var doctests: [Doctest] = []
+    var i = 0
+    var in_code_block = false
+    var code_lines: [text] = []
+    var start_line = 0
+    var should_fail = false
+
+    while i < lines.len():
+        val trimmed = lines[i].trim()
+
+        if not in_code_block:
+            if trimmed.starts_with("```simple") or trimmed.starts_with("```spl"):
+                in_code_block = true
+                code_lines = []
+                start_line = i + 1
+                should_fail = trimmed.contains("should_fail")
+        else:
+            if trimmed == "```":
+                in_code_block = false
+                if code_lines.len() > 0:
+                    doctests.push(Doctest(
+                        source_file: file_path,
+                        line_number: start_line,
+                        code: code_lines.join("\n"),
+                        expected_output: "",
+                        should_fail: should_fail
+                    ))
+            else:
+                code_lines.push(lines[i])
+
+        i = i + 1
+
+    doctests
+
+fn discover_md_doctests(dir: text) -> [Doctest]:
+    var all_doctests: [Doctest] = []
+    val files = dir_walk(dir)
+    for file_path in files:
+        if file_path.ends_with(".md"):
+            val doctests = extract_md_doctests(file_path)
+            all_doctests.merge(doctests)
+    all_doctests
+
+# =========================================================================
+# Run Doctests
+# =========================================================================
+
+fn run_doctests(file_path: text, timeout_ms: i64) -> TestFileResult:
+    val doctests = extract_doctests(file_path)
+
+    if doctests.len() == 0:
+        return TestFileResult(
+            path: file_path,
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            pending: 0,
+            duration_ms: 0,
+            setup_ms: 0,
+            error: "",
+            timed_out: false,
+            cached: false
+        )
+
+    val binary = find_simple_binary()
+    var passed = 0
+    var failed = 0
+    var total_duration = 0
+
+    for dt in doctests:
+        # Write temp file
+        val temp_path = "{_dt_get_temp_dir()}/simple_doctest_{dt.line_number}.spl"
+        file_atomic_write(temp_path, dt.code)
+
+        val result = process_run_timeout(binary, [temp_path], timeout_ms)
+        val exit_code = result.2
+
+        if dt.should_fail:
+            if exit_code != 0:
+                passed = passed + 1
+            else:
+                failed = failed + 1
+        else:
+            if exit_code == 0:
+                passed = passed + 1
+            else:
+                failed = failed + 1
+
+        file_remove(temp_path)
+
+    TestFileResult(
+        path: file_path,
+        passed: passed,
+        failed: failed,
+        skipped: 0,
+        pending: 0,
+        duration_ms: total_duration,
+        setup_ms: 0,
+        error: "",
+        timed_out: false,
+            cached: false
+    )
+
+fn run_md_doctests(file_path: text, timeout_ms: i64) -> TestFileResult:
+    val doctests = extract_md_doctests(file_path)
+
+    if doctests.len() == 0:
+        return TestFileResult(
+            path: file_path,
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            pending: 0,
+            duration_ms: 0,
+            setup_ms: 0,
+            error: "",
+            timed_out: false,
+            cached: false
+        )
+
+    val binary = find_simple_binary()
+    var passed = 0
+    var failed = 0
+
+    for dt in doctests:
+        val temp_path = "{_dt_get_temp_dir()}/simple_md_doctest_{dt.line_number}.spl"
+        file_atomic_write(temp_path, dt.code)
+
+        val result = process_run_timeout(binary, [temp_path], timeout_ms)
+        val exit_code = result.2
+
+        if dt.should_fail:
+            if exit_code != 0:
+                passed = passed + 1
+            else:
+                failed = failed + 1
+        else:
+            if exit_code == 0:
+                passed = passed + 1
+            else:
+                failed = failed + 1
+
+        file_remove(temp_path)
+
+    TestFileResult(
+        path: file_path,
+        passed: passed,
+        failed: failed,
+        skipped: 0,
+        pending: 0,
+        duration_ms: 0,
+        setup_ms: 0,
+        error: "",
+        timed_out: false,
+            cached: false
+    )
+
+# =========================================================================
+# SPL Same-File Doctest Support
+# =========================================================================
+
+fn build_spl_doctest_code(source_content: text, dt: Doctest) -> text:
+    source_content + "\n\n# --- doctest from line {dt.line_number} ---\n" + dt.code
+
+fn run_spl_doctests_same_file(file_path: text, timeout_ms: i64) -> SdoctestFileResult:
+    if not file_exists(file_path):
+        return SdoctestFileResult(
+            source_file: file_path,
+            blocks: [],
+            total: 0, passed: 0, failed: 0, skipped: 0, errors: 0, accepted: 0, duration_ms: 0
+        )
+
+    val source_content = file_read(file_path) ?? ""
+    if source_content == "":
+        return SdoctestFileResult(
+            source_file: file_path,
+            blocks: [],
+            total: 0, passed: 0, failed: 0, skipped: 0, errors: 0, accepted: 0, duration_ms: 0
+        )
+
+    val doctests = extract_doctests(file_path)
+    if doctests.len() == 0:
+        return SdoctestFileResult(
+            source_file: file_path,
+            blocks: [],
+            total: 0, passed: 0, failed: 0, skipped: 0, errors: 0, accepted: 0, duration_ms: 0
+        )
+
+    val binary = find_simple_binary()
+    var block_results: [BlockResult] = []
+    var passed = 0
+    var failed = 0
+    var errors = 0
+    var total_duration = 0
+
+    for dt in doctests:
+        # Build composite file: source + doctest code
+        val composite_code = build_spl_doctest_code(source_content, dt)
+        val temp_path = "{_dt_get_temp_dir()}/spl_doctest_{dt.line_number}.spl"
+        file_atomic_write(temp_path, composite_code)
+
+        val start = time_now_unix_micros()
+        # Use process_run (not process_run_timeout — known arg-passing bug)
+        val result = process_run(binary, [temp_path])
+        val stdout = result.0
+        val stderr = result.1
+        val exit_code = result.2
+        val end = time_now_unix_micros()
+        val duration_ms = (end - start) / 1000
+
+        val block = SdoctestBlock(
+            source_file: file_path,
+            line_number: dt.line_number,
+            code: dt.code,
+            language: "spl",
+            modifiers: []
+        )
+
+        if exit_code == -1:
+            errors = errors + 1
+            block_results.push(BlockResult(
+                block: block, status: BlockStatus.Error,
+                duration_ms: duration_ms, stdout: stdout, stderr: stderr,
+                error: "TIMEOUT"
+            ))
+        elif dt.should_fail:
+            if exit_code != 0:
+                passed = passed + 1
+                block_results.push(BlockResult(
+                    block: block, status: BlockStatus.Passed,
+                    duration_ms: duration_ms, stdout: stdout, stderr: stderr, error: ""
+                ))
+            else:
+                failed = failed + 1
+                block_results.push(BlockResult(
+                    block: block, status: BlockStatus.Failed,
+                    duration_ms: duration_ms, stdout: stdout, stderr: stderr,
+                    error: "Expected failure but block succeeded"
+                ))
+        else:
+            if exit_code == 0:
+                passed = passed + 1
+                block_results.push(BlockResult(
+                    block: block, status: BlockStatus.Passed,
+                    duration_ms: duration_ms, stdout: stdout, stderr: stderr, error: ""
+                ))
+            else:
+                failed = failed + 1
+                val error_msg = if stderr != "": stderr.split("\n")[0] else: "Exit code non-zero"
+                block_results.push(BlockResult(
+                    block: block, status: BlockStatus.Failed,
+                    duration_ms: duration_ms, stdout: stdout, stderr: stderr,
+                    error: error_msg
+                ))
+
+        total_duration = total_duration + duration_ms
+        file_remove(temp_path)
+
+    SdoctestFileResult(
+        source_file: file_path,
+        blocks: block_results,
+        total: doctests.len(),
+        passed: passed,
+        failed: failed,
+        skipped: 0,
+        errors: errors,
+        accepted: 0,
+        duration_ms: total_duration
+    )
+
+fn discover_spl_doctest_files(dirs: [text]) -> [text]:
+    var result: [text] = []
+    for dir in dirs:
+        val files = dir_walk(dir)
+        for file_path in files:
+            if not file_path.ends_with(".spl"):
+                continue
+            # Skip spec and test files
+            if file_path.ends_with("_spec.spl") or file_path.ends_with("_test.spl"):
+                continue
+            # Fast pre-check: only process files containing ///
+            val content = file_read(file_path) ?? ""
+            if content == "":
+                continue
+            if not content.contains("///"):
+                continue
+            # Check for @doctest_skip marker
+            if content.contains("# @doctest_skip"):
+                continue
+            # Verify file has actual code blocks in doc comments
+            val doctests = extract_doctests(file_path)
+            if doctests.len() > 0:
+                result.push(file_path)
+    result
+

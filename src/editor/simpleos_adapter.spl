@@ -1,0 +1,25 @@
+# Editor SimpleOS Adapter
+#
+# Adapts the editor for SimpleOS with reduced resource defaults.
+# Mirrors the SVIM simpleos_adapter pattern.
+
+fn simpleos_editor_config() -> PlatformConfig:
+    platform_default_config(EditorPlatform.SimpleOS)
+
+fn simpleos_editor_init(session: EditSession):
+    session.status_message = "SimpleOS Editor"
+
+fn simpleos_max_open_files() -> i64:
+    32
+
+fn simpleos_max_undo_depth() -> i64:
+    32
+
+fn simpleos_auto_save_interval() -> i64:
+    60000
+
+fn simpleos_file_watcher_enabled() -> bool:
+    false
+
+fn simpleos_settings_schema() -> [SettingDescriptor]:
+    settings_filter_by_platform(full_settings_schema(), "simpleos")

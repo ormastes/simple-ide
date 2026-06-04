@@ -1,0 +1,29 @@
+# LLM Agent Dashboard — TUI Entry Point
+#
+# Isolated TUI entrypoint so the web GUI path does not eagerly compile
+# the common-ui stack.
+
+use app.llm_dashboard.data.store.{AgentDashboardStore}
+use app.llm_dashboard.tui.app.{run_tui_dashboard}
+use std.cli.cli_util (get_cli_args)
+use app.dashboard.framework_policy.{strip_framework_flags}
+
+fn main() -> i64:
+    val args = strip_framework_flags(get_cli_args())
+    var watch_dir = ""
+
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+        if arg == "--dir" and i + 1 < args.len():
+            watch_dir = args[i + 1]
+            i = i + 1
+        i = i + 1
+
+    val store = if watch_dir != "":
+        AgentDashboardStore.with_dir(watch_dir)
+    else:
+        AgentDashboardStore.new()
+
+    run_tui_dashboard(store)
+    return 0

@@ -1,0 +1,641 @@
+use std.nogc_sync_mut.io.file_ops.{file_exists, file_read, file_modified_time}
+use std.json.parser.{json_parse}
+use std.json.types.{json_get_type, json_to_string, json_to_number, json_to_boolean}
+use std.json.object_ops.{json_object_get}
+use std.json.array_ops.{json_array_get, json_array_length}
+use std.json.path_ops.{json_path_get}
+use app.dashboard.assistant_collectors.*
+use app.dashboard.assistant_collectors_text_json.*
+
+fn parse_assistant_session(path: text, now_secs: i64) -> AssistantSession:
+    if assistant_is_store_session_path(path):
+        return parse_assistant_store_session(path, now_secs)
+    val session_id = assistant_session_id(path)
+    var session = AssistantSession.new(session_id, path)
+    session.last_modified_time = file_modified_time(path)
+    if session.last_modified_time > 0 and now_secs - session.last_modified_time <= ASSISTANT_LIVE_WINDOW_SECS:
+        session.source_state = "live"
+        session.session_state = "active"
+
+    if not file_exists(path):
+        session.source_state = "degraded"
+        session.session_state = "degraded"
+        session.warnings.push("missing file")
+        return session
+
+    val content = file_read(path)
+    if content.trim() == "":
+        session.source_state = "degraded"
+        session.session_state = "degraded"
+        session.warnings.push("empty transcript")
+        return session
+
+    val lines = content.split("\n")
+    var saw_useful_event = false
+    var saw_error = false
+    var saw_end = false
+    var saw_start = false
+
+    for raw in lines:
+        val line = raw.trim()
+        if line == "":
+            continue
+        val record = json_parse(line)
+        if record == nil:
+            session.warnings.push("unparsed line")
+            continue
+        if assistant_is_history_path(path):
+            if not assistant_record_has_transcript_fields(record):
+                continue
+        elif not assistant_record_is_transcript(record):
+            continue
+
+        val kind = json_text_at(record, "type")
+        val timestamp = assistant_clock_from_iso(json_text_at(record, "timestamp"))
+        if timestamp != "":
+            session.last_event_time = timestamp
+
+        session.turn_count = session.turn_count + 1
+
+        if session.session_id == "":
+            val candidate = json_text_at(record, "sessionId")
+            if candidate != "":
+                session.session_id = candidate
+        if session.parent_tool_use_id == "":
+            val parent_id = first_non_empty([
+                json_text_at(record, "parentToolUseID"),
+                json_text_at(record, "parent_tool_use_id")
+            ])
+            if parent_id != "":
+                session.parent_tool_use_id = parent_id
+
+        match kind:
+            "assistant":
+                saw_useful_event = true
+                session.assistant_turns = session.assistant_turns + 1
+                record_assistant_record(session, record)
+                val message = json_object_get(record, "message")
+                if session.model == "":
+                    session.model = json_text_at(message, "model")
+                if session.provider == "":
+                    session.provider = assistant_provider_from_model(session.model)
+                val detail = assistant_message_summary(message)
+                if detail != "":
+                    session.last_event_kind = "assistant"
+                    session.last_event_detail = detail
+                    if session.title == "":
+                        session.title = detail
+                    if session.objective == "":
+                        session.objective = detail
+            "user":
+                saw_useful_event = true
+                session.user_turns = session.user_turns + 1
+                val detail = assistant_user_summary(record)
+                if detail != "":
+                    if session.objective == "":
+                        session.objective = detail
+                    if session.title == "" or session.title == assistant_session_title(path):
+                        session.title = detail
+                    session.last_event_kind = "user"
+                    session.last_event_detail = detail
+            "system":
+                saw_useful_event = true
+                val detail = assistant_system_summary(record)
+                if detail != "":
+                    session.last_event_kind = "system"
+                    session.last_event_detail = detail
+                    if session.wake_reason == "":
+                        session.wake_reason = detail
+            "progress":
+                saw_useful_event = true
+                val hook = first_non_empty([
+                    json_text_at(record, "data.hookEvent"),
+                    json_text_at(record, "data.hook_event_name"),
+                    json_text_at(record, "data.hookName")
+                ])
+                val detail = assistant_progress_summary(record)
+                if hook != "":
+                    session.last_event_kind = hook
+                    session.last_event_detail = detail
+                    if session.wake_reason == "":
+                        session.wake_reason = hook
+                    if hook == "SessionStart":
+                        saw_start = true
+                    elif hook == "SessionEnd" or hook == "Stop" or hook == "TaskCompleted":
+                        saw_end = true
+                    elif hook == "PostToolUseFailure":
+                        saw_error = true
+                if detail != "":
+                    if session.title == "":
+                        session.title = detail
+            "file-history-snapshot":
+                saw_useful_event = true
+                session.last_event_kind = "snapshot"
+                session.last_event_detail = "file history snapshot"
+                if session.wake_reason == "":
+                    session.wake_reason = "replay snapshot"
+            "error":
+                saw_useful_event = true
+                saw_error = true
+                session.error_count = session.error_count + 1
+                session.last_event_kind = "error"
+                session.last_event_detail = assistant_error_summary(record)
+            _:
+                pass
+
+        val turn_tokens = assistant_token_usage(record)
+        session.token_input = session.token_input + turn_tokens.0
+        session.token_output = session.token_output + turn_tokens.1
+        session.token_cache_read = session.token_cache_read + turn_tokens.2
+        session.token_cache_create = session.token_cache_create + turn_tokens.3
+    if session.title == "":
+        session.title = assistant_session_title(path)
+    if session.objective == "":
+        session.objective = session.title
+    if session.wake_reason == "":
+        if saw_start:
+            session.wake_reason = "session start"
+        else:
+            session.wake_reason = "replay"
+    if session.model != "" and session.provider == "":
+        session.provider = assistant_provider_from_model(session.model)
+
+    if saw_error and not saw_end:
+        session.session_state = "failed"
+        if session.source_state == "live":
+            session.source_state = "live"
+        else:
+            session.source_state = "replay"
+    elif saw_end:
+        session.session_state = "completed"
+    elif session.source_state == "live":
+        session.session_state = "active"
+    elif saw_useful_event:
+        session.session_state = "stale"
+    else:
+        session.session_state = "degraded"
+        session.source_state = "degraded"
+        session.warnings.push("no usable events")
+
+    session
+
+fn parse_assistant_store_session(path: text, now_secs: i64) -> AssistantSession:
+    val session_id = assistant_store_session_id(path)
+    var session = AssistantSession.new(session_id, assistant_store_timeline_path(session_id))
+    session.project_name = "assistant"
+    session.last_modified_time = file_modified_time(path)
+    if session.last_modified_time > 0 and now_secs - session.last_modified_time <= ASSISTANT_LIVE_WINDOW_SECS:
+        session.source_state = "live"
+        session.session_state = "active"
+
+    if not file_exists(path):
+        session.source_state = "degraded"
+        session.session_state = "degraded"
+        session.warnings.push("missing assistant store session")
+        return session
+
+    val content = file_read(path)
+    if content.trim() == "":
+        session.source_state = "degraded"
+        session.session_state = "degraded"
+        session.warnings.push("empty assistant store session")
+        return session
+
+    val record = json_parse(content)
+    if record == nil:
+        session.source_state = "degraded"
+        session.session_state = "degraded"
+        session.warnings.push("unparsed assistant store session")
+        return session
+
+    session.session_id = first_non_empty([json_text_at(record, "id"), session.session_id])
+    session.title = first_non_empty([json_text_at(record, "name"), json_text_at(record, "summary"), session.title])
+    session.objective = first_non_empty([json_text_at(record, "prompt"), json_text_at(record, "summary"), session.title])
+    session.wake_reason = first_non_empty([json_text_at(record, "last_signal"), json_text_at(record, "state"), "assistant store"])
+    session.parent_session_id = json_text_at(record, "parent_session_id")
+    session.last_event_time = assistant_clock_label_from_millis(json_number_at(record, "updated_at"))
+
+    val raw_state = json_text_at(record, "state")
+    val timeline_path = assistant_store_timeline_path(session.session_id)
+    if file_exists(timeline_path):
+        val timeline_content = file_read(timeline_path)
+        var saw_timeline_event = false
+        var saw_error = false
+        var saw_end = false
+        for raw in timeline_content.split("\n"):
+            val line = raw.trim()
+            if line == "":
+                continue
+            val event = json_parse(line)
+            if event == nil:
+                session.warnings.push("unparsed assistant store timeline line")
+                continue
+            saw_timeline_event = true
+            session.turn_count = session.turn_count + 1
+            val kind = assistant_timeline_kind(event)
+            val detail = assistant_store_event_summary(event, kind)
+            val event_time = assistant_clock_label_from_millis(json_number_at(event, "timestamp"))
+            if event_time != "":
+                session.last_event_time = event_time
+            if kind != "":
+                session.last_event_kind = kind
+            if detail != "":
+                session.last_event_detail = detail
+                if session.title == "":
+                    session.title = detail
+                if session.objective == "":
+                    session.objective = detail
+            if kind == "error":
+                saw_error = true
+                session.error_count = session.error_count + 1
+            elif kind == "stop" or kind == "sessionend" or kind == "taskcompleted" or kind == "completed":
+                saw_end = true
+        if not saw_timeline_event and session.wake_reason == "":
+            session.wake_reason = "assistant store"
+        if saw_error and not saw_end:
+            session.session_state = "failed"
+        elif saw_end:
+            session.session_state = "completed"
+        elif raw_state == "paused":
+            session.session_state = "paused"
+        elif raw_state == "running" or raw_state == "active":
+            if session.source_state == "live":
+                session.session_state = "active"
+            else:
+                session.session_state = "stale"
+        elif raw_state != "":
+            session.session_state = raw_state
+        elif session.source_state == "live":
+            session.session_state = "active"
+        else:
+            session.session_state = "stale"
+    else:
+        if raw_state == "paused":
+            session.session_state = "paused"
+        elif raw_state == "completed":
+            session.session_state = "completed"
+        elif raw_state == "failed":
+            session.session_state = "failed"
+        elif raw_state == "running" or raw_state == "active":
+            if session.source_state == "live":
+                session.session_state = "active"
+            else:
+                session.session_state = "stale"
+        elif raw_state != "":
+            session.session_state = raw_state
+        elif session.source_state == "live":
+            session.session_state = "active"
+        else:
+            session.session_state = "degraded"
+
+    if session.model != "" and session.provider == "":
+        session.provider = assistant_provider_from_model(session.model)
+    if session.title == "":
+        session.title = first_non_empty([json_text_at(record, "name"), json_text_at(record, "summary"), "assistant session"])
+    if session.objective == "":
+        session.objective = session.title
+    if session.last_event_kind == "":
+        session.last_event_kind = raw_state
+    if session.last_event_detail == "":
+        session.last_event_detail = first_non_empty([json_text_at(record, "summary"), raw_state, session.title])
+    session
+
+fn link_assistant_sessions(sessions: [AssistantSession]) -> [AssistantSession]:
+    var linked: [AssistantSession] = []
+    for session in sessions:
+        var copy = session
+        copy.children = []
+        linked.push(copy)
+
+    var child_idx = 0
+    while child_idx < linked.len():
+        var parent_id = linked[child_idx].parent_session_id
+        if parent_id == "":
+            val child_parent = linked[child_idx].parent_tool_use_id
+            if child_parent != "":
+                parent_id = assistant_find_parent_session_id(linked, child_parent)
+        if parent_id != "":
+            var child_session = linked[child_idx]
+            child_session.parent_session_id = parent_id
+            linked[child_idx] = child_session
+            val parent_idx = assistant_session_index(linked, parent_id)
+            if parent_idx >= 0 and not text_list_contains(linked[parent_idx].children, child_session.session_id):
+                var parent_session = linked[parent_idx]
+                parent_session.children.push(child_session.session_id)
+                linked[parent_idx] = parent_session
+        child_idx = child_idx + 1
+    linked
+
+fn sort_sessions_by_activity(sessions: [AssistantSession]) -> [AssistantSession]:
+    var sorted: [AssistantSession] = []
+    for session in sessions:
+        sorted = insert_session_sorted(sorted, session)
+    sorted
+
+fn insert_session_sorted(sorted: [AssistantSession], session: AssistantSession) -> [AssistantSession]:
+    if sorted.len() == 0:
+        sorted.push(session)
+        return sorted
+    var inserted = false
+    var out: [AssistantSession] = []
+    var i = 0
+    while i < sorted.len():
+        if not inserted and session_sort_key(session) > session_sort_key(sorted[i]):
+            out.push(session)
+            inserted = true
+        out.push(sorted[i])
+        i = i + 1
+    if not inserted:
+        out.push(session)
+    out
+
+fn session_sort_key(session: AssistantSession) -> i64:
+    var score = session.last_modified_time
+    if session.source_state == "live":
+        score = score + 1000000000
+    elif session.session_state == "active":
+        score = score + 100000000
+    score
+
+fn count_sessions_with_state(sessions: [AssistantSession], state: text) -> i64:
+    var count: i64 = 0
+    for session in sessions:
+        if session.source_state == state:
+            count = count + 1
+    count
+
+fn assistant_pick_primary_session(sessions: [AssistantSession]) -> text:
+    if sessions.len() == 0:
+        return ""
+    for session in sessions:
+        if session.source_state == "live":
+            return session.session_id
+    for session in sessions:
+        if session.session_state == "active":
+            return session.session_id
+    sessions[0].session_id
+
+fn assistant_surface_state(snapshot: AssistantDashboardSnapshot) -> text:
+    if snapshot.live_sessions > 0:
+        return "live"
+    if snapshot.replay_sessions > 0:
+        return "replay"
+    "degraded"
+
+fn assistant_find_parent_session_id(sessions: [AssistantSession], parent_tool_use_id: text) -> text:
+    for session in sessions:
+        if text_list_contains(session.tool_use_ids, parent_tool_use_id):
+            return session.session_id
+    ""
+
+fn assistant_session_by_id(sessions: [AssistantSession], session_id: text) -> AssistantSession:
+    for session in sessions:
+        if session.session_id == session_id:
+            return session
+    nil
+
+fn assistant_session_index(sessions: [AssistantSession], session_id: text) -> i64:
+    var i = 0
+    while i < sessions.len():
+        if sessions[i].session_id == session_id:
+            return i
+        i = i + 1
+    -1
+
+fn text_list_contains(items: [text], value: text) -> bool:
+    for item in items:
+        if item == value:
+            return true
+    return false
+
+fn build_session_timeline(snapshot: AssistantDashboardSnapshot, session_id: text, max_events: i64) -> [AssistantTimelineEvent]:
+    val session = assistant_session_by_id(snapshot.sessions, session_id)
+    if session == nil:
+        return []
+    val path = session.transcript_path
+    if path == "" or not file_exists(path):
+        return []
+    var events: [AssistantTimelineEvent] = []
+    val content = file_read(path)
+    for raw in content.split("\n"):
+        val line = raw.trim()
+        if line == "":
+            continue
+        val record = json_parse(line)
+        if record == nil:
+            continue
+        if assistant_is_history_path(path):
+            if not assistant_record_has_transcript_fields(record):
+                continue
+        elif not assistant_record_is_transcript(record):
+            continue
+        val timestamp = if assistant_is_store_timeline_path(path):
+            assistant_clock_label_from_millis(json_number_at(record, "timestamp"))
+        else:
+            assistant_clock_from_iso(json_text_at(record, "timestamp"))
+        val kind = assistant_timeline_kind(record)
+        val severity = assistant_timeline_severity(kind)
+        val title = dashboard_assistant_timeline_title(record, kind)
+        val detail = dashboard_assistant_timeline_detail(record, kind)
+        if title != "" or detail != "":
+            events.push(AssistantTimelineEvent.new(session.session_id, timestamp, kind, severity, title, detail, "transcript"))
+    if events.len() <= max_events:
+        return events
+    return events.slice(events.len() - max_events)
+
+fn assistant_timeline_kind(record: any) -> text:
+    val type_name = json_text_at(record, "type")
+    if type_name == "":
+        val store_kind = json_text_at(record, "kind")
+        if store_kind != "":
+            return store_kind.lower()
+        return ""
+    if type_name == "assistant":
+        val message = json_object_get(record, "message")
+        val content = json_object_get(message, "content")
+        if not json_is_array(content):
+            return "assistant"
+        var i = 0
+        val content_len = json_array_length_safe(content)
+        while i < content_len:
+            val item = json_array_get(content, i)
+            val item_type = json_text_at(item, "type")
+            if item_type == "tool_use":
+                return "tool_use"
+            i = i + 1
+        return "assistant"
+    if type_name == "user":
+        return "user"
+    if type_name == "system":
+        return "system"
+    if type_name == "progress":
+        return first_non_empty([
+            json_text_at(record, "data.hookEvent"),
+            json_text_at(record, "data.hook_event_name"),
+            json_text_at(record, "data.hookName")
+        ]).lower()
+    if type_name == "file-history-snapshot":
+        return "snapshot"
+    if type_name == "error":
+        return "error"
+    type_name
+
+fn assistant_timeline_severity(kind: text) -> text:
+    match kind:
+        "start" | "resume" | "signal" => "info"
+        "pause" => "muted"
+        "error" | "posttoolusefailure" | "permissiondenied" => "danger"
+        "sessionend" | "stop" | "taskcompleted" => "success"
+        "subagentstart" | "tool_use" => "info"
+        "precompact" | "snapshot" => "muted"
+        _ => "normal"
+
+fn dashboard_assistant_timeline_title(record: any, kind: text) -> text:
+    match kind:
+        "assistant" => assistant_message_summary(json_object_get(record, "message"))
+        "user" => assistant_user_summary(record)
+        "system" => assistant_system_summary(record)
+        "tool_use" => assistant_tool_use_summary(record)
+        "start" | "pause" | "resume" | "signal" => assistant_store_event_summary(record, kind)
+        "snapshot" => "snapshot"
+        _ => first_non_empty([
+            assistant_store_event_summary(record, kind),
+            json_text_at(record, "data.hookEvent"),
+            json_text_at(record, "data.hook_event_name"),
+            json_text_at(record, "data.hookName"),
+            json_text_at(record, "type")
+        ])
+
+fn dashboard_assistant_timeline_detail(record: any, kind: text) -> text:
+    match kind:
+        "assistant" => assistant_message_detail(json_object_get(record, "message"))
+        "user" => assistant_user_summary(record)
+        "tool_use" => assistant_tool_use_summary(record)
+        "start" | "pause" | "resume" | "signal" => assistant_store_event_summary(record, kind)
+        "progress" => assistant_progress_summary(record)
+        "snapshot" => "replay checkpoint"
+        _ => first_non_empty([
+            assistant_store_event_summary(record, kind),
+            assistant_progress_summary(record),
+            assistant_error_summary(record)
+        ])
+
+fn assistant_token_usage(record: any) -> (i64, i64, i64, i64):
+    val message = json_object_get(record, "message")
+    val usage = json_object_get(message, "usage")
+    (
+        json_number_at(usage, "input_tokens"),
+        json_number_at(usage, "output_tokens"),
+        json_number_at(usage, "cache_read_input_tokens"),
+        json_number_at(usage, "cache_creation_input_tokens")
+    )
+
+fn record_assistant_record(session: AssistantSession, record: any):
+    val message = json_object_get(record, "message")
+    val content = json_object_get(message, "content")
+    if not json_is_array(content):
+        return
+    var i = 0
+    val content_len = json_array_length_safe(content)
+    while i < content_len:
+        val item = json_array_get(content, i)
+        val item_type = json_text_at(item, "type")
+        if item_type == "tool_use":
+            val tool_use_id = first_non_empty([
+                json_text_at(item, "id"),
+                json_text_at(item, "tool_use_id"),
+                json_text_at(record, "toolUseID")
+            ])
+            if tool_use_id != "" and not text_list_contains(session.tool_use_ids, tool_use_id):
+                session.tool_use_ids.push(tool_use_id)
+            val tool_name = json_text_at(item, "name")
+            if tool_name == "Agent" and session.last_event_kind == "":
+                session.last_event_kind = "child_spawn"
+        i = i + 1
+
+fn assistant_message_summary(message: any) -> text:
+    val first = first_message_text(message)
+    if first != "":
+        return short_text(first, 72)
+    ""
+
+fn assistant_message_detail(message: any) -> text:
+    val first = first_message_text(message)
+    if first != "":
+        return short_text(first, 120)
+    ""
+
+fn assistant_user_summary(record: any) -> text:
+    val message = json_object_get(record, "message")
+    val raw = json_text_at(message, "content")
+    if raw != "":
+        val command = assistant_extract_between(raw, "<command-message>", "</command-message>")
+        if command != "":
+            return short_text(command, 80)
+        val cleaned = assistant_strip_tags(raw)
+        if cleaned != "":
+            return short_text(cleaned, 80)
+    short_text(json_text_at(record, "content"), 80)
+
+fn assistant_system_summary(record: any) -> text:
+    val subtype = json_text_at(record, "subtype")
+    val content = json_text_at(record, "content")
+    if subtype != "" and content != "":
+        return short_text("{subtype}: {content}", 80)
+    if content != "":
+        return short_text(content, 80)
+    subtype
+
+fn assistant_progress_summary(record: any) -> text:
+    val hook = first_non_empty([
+        json_text_at(record, "data.hookEvent"),
+        json_text_at(record, "data.hook_event_name"),
+        json_text_at(record, "data.hookName")
+    ])
+    val command = json_text_at(record, "data.command")
+    val tool = first_non_empty([json_text_at(record, "toolUseID"), json_text_at(record, "tool_use_id")])
+    if hook == "":
+        return short_text(command, 80)
+    if command != "":
+        return short_text("{hook} {command}", 100)
+    if tool != "":
+        return short_text("{hook} {tool}", 100)
+    hook
+
+fn assistant_error_summary(record: any) -> text:
+    val message = json_text_at(record, "message")
+    if message != "":
+        return short_text(message, 100)
+    val error = json_text_at(record, "error")
+    if error != "":
+        return short_text(error, 100)
+    ""
+
+fn assistant_tool_use_summary(record: any) -> text:
+    val message = json_object_get(record, "message")
+    val content = json_object_get(message, "content")
+    if not json_is_array(content):
+        return ""
+    var i = 0
+    val content_len = json_array_length_safe(content)
+    while i < content_len:
+        val item = json_array_get(content, i)
+        if json_text_at(item, "type") == "tool_use":
+            val name = json_text_at(item, "name")
+            val tool_input = json_object_get(item, "input")
+            val desc = first_non_empty([
+                json_text_at(tool_input, "description"),
+                json_text_at(tool_input, "prompt"),
+                json_text_at(tool_input, "command"),
+                json_text_at(tool_input, "path"),
+                json_text_at(tool_input, "query"),
+                json_text_at(tool_input, "url")
+            ])
+            if desc != "":
+                return short_text("{name}: {desc}", 100)
+            return name
+        i = i + 1
+    ""
+
+fn assistant_store_event_summary(record: any, kind: text) -> text:
+    first_non_empty([json_text_at(record, "message"), json_text_at(record, "signal"), kind])

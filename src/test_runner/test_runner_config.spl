@@ -1,0 +1,176 @@
+# Test Runner Configuration and CLI Helpers
+#
+# CLI argument handling, environment variable propagation,
+# mode conversion, run management, and memory reporting.
+
+use std.io.{env_set, env_get}
+use std.io.{file_read}
+use std.sffi.cli.{cli_get_args}
+
+use std.test_runner.test_runner_types.{TestExecutionMode, TestOptions}
+
+# =========================================================================
+# CLI Args Helper (inlined to avoid extra module load)
+# =========================================================================
+
+fn get_cli_args() -> [text]:
+    val all_args = cli_get_args()
+    var args: [text] = []
+    var start_idx = 1
+    if all_args.len() > 1 and all_args[1].ends_with("main.spl"):
+        start_idx = 2
+    var i = start_idx
+    while i < all_args.len():
+        args = args.push(all_args[i])
+        i = i + 1
+    args
+
+# =========================================================================
+# Environment Variable Propagation
+# =========================================================================
+
+fn propagate_env_vars(options: TestOptions):
+    # Set SIMPLE_TEST_MODE for child processes
+    val mode_str = mode_to_str(options.mode)
+    env_set("SIMPLE_TEST_MODE", mode_str)
+
+    if options.only_slow:
+        env_set("SIMPLE_TEST_FILTER", "slow")
+    elif options.only_skipped:
+        env_set("SIMPLE_TEST_FILTER", "skipped")
+
+    if options.show_tags:
+        env_set("SIMPLE_TEST_SHOW_TAGS", "1")
+
+    # Enable coverage tracking for child processes
+    if options.coverage:
+        env_set("SIMPLE_COVERAGE", "1")
+
+    # Propagate advanced testing mode env vars
+    if options.fuzz_mode:
+        env_set("SIMPLE_FUZZ_MODE", "true")
+        env_set("SIMPLE_FUZZ_TIME", "{options.fuzz_time_secs}")
+        env_set("SIMPLE_FUZZ_CORPUS", options.fuzz_corpus_dir)
+        if options.fuzz_differential:
+            env_set("SIMPLE_FUZZ_DIFFERENTIAL", "true")
+        if not options.fuzz_shrink:
+            env_set("SIMPLE_FUZZ_SHRINK", "false")
+    if options.chaos_mode:
+        env_set("SIMPLE_CHAOS_MODE", "true")
+        env_set("SIMPLE_CHAOS_TRIALS", "{options.chaos_trials}")
+        env_set("SIMPLE_CHAOS_FAULT_RATE", "{options.chaos_fault_rate}")
+    if options.deploy_mode:
+        env_set("SIMPLE_DEPLOY_MODE", "true")
+        if options.deploy_platform != "":
+            env_set("SIMPLE_DEPLOY_PLATFORM", options.deploy_platform)
+        if options.deploy_upgrade:
+            env_set("SIMPLE_DEPLOY_UPGRADE", "true")
+    if options.security_mode:
+        env_set("SIMPLE_SECURITY_MODE", "true")
+        if options.security_scan:
+            env_set("SIMPLE_SECURITY_SCAN", "true")
+        if options.security_supply_chain:
+            env_set("SIMPLE_SECURITY_SUPPLY_CHAIN", "true")
+
+    # Propagate JIT settings (default: JIT enabled with threshold=10)
+    env_set("SIMPLE_JIT_ENABLED", "1")
+
+# =========================================================================
+# Mode Conversion
+# =========================================================================
+
+fn mode_to_str(mode: TestExecutionMode) -> text:
+    match mode:
+        case TestExecutionMode.Interpreter:
+            "interpreter"
+        case TestExecutionMode.Smf:
+            "smf"
+        case TestExecutionMode.Native:
+            "native"
+        case TestExecutionMode.Compile:
+            "compile"
+        case TestExecutionMode.Composite(spec):
+            spec
+
+# =========================================================================
+# Flag Parsing Helpers
+# =========================================================================
+
+fn get_flag_value(args: [text], flag: text) -> text?:
+    var i = 0
+    while i < args.len():
+        if args[i] == flag and i + 1 < args.len():
+            return Some(args[i + 1])
+        if args[i].starts_with(flag + "="):
+            return Some(args[i][flag.len() + 1:])
+        i = i + 1
+    nil
+
+fn has_run_management_flag(args: [text]) -> bool:
+    for arg in args:
+        if arg == "--list-runs" or arg == "--cleanup-runs" or arg == "--prune-runs" or arg.starts_with("--prune-runs="):
+            return true
+    false
+
+# MEMORY DEBUG: entire body commented out (uses GROUP 4)
+fn handle_run_management(args: [text]) -> i64:
+    print "DISABLED: handle_run_management (memory debug)"
+    return 1
+    # val db_result = load_test_db_compat()
+    # if not db_result.is_ok():
+    #     print "Error: Could not load test database: {db_result.unwrap_err()}"
+    #     return 1
+    #
+    # val db = db_result.unwrap()
+    #
+    # for arg in args:
+    #     if arg == "--list-runs":
+    #         val status_filter = get_flag_value(args, "--runs-status") ?? "all"
+    #         val runs = db.list_runs(status_filter)
+    #         print "Test Runs ({runs.len()}):"
+    #         print ""
+    #         print "| Run ID | Status | Tests | Passed | Failed | Start Time |"
+    #         print "|--------|--------|-------|--------|--------|------------|"
+    #         for r in runs:
+    #             print "| {r.run_id} | {r.status} | {r.test_count} | {r.passed} | {r.failed} | {r.start_time} |"
+    #         return 0
+    #
+    #     if arg == "--cleanup-runs":
+    #         db.cleanup_stale_runs(2)
+    #         val save_result = db.save()
+    #         if not save_result.is_ok():
+    #             print "Error saving: {save_result.unwrap_err()}"
+    #             return 1
+    #         print "Stale runs cleaned up."
+    #         return 0
+    #
+    #     if arg.starts_with("--prune-runs="):
+    #         val count_str = arg[13:]
+    #         val keep = count_str.to_int_or(50)
+    #         db.prune_runs(keep)
+    #         val save_result = db.save()
+    #         if not save_result.is_ok():
+    #             print "Error saving: {save_result.unwrap_err()}"
+    #             return 1
+    #         print "Runs pruned (keeping {keep})."
+    #         return 0
+    #
+    # 0
+
+# =========================================================================
+# MEMORY DEBUG: report free memory
+# =========================================================================
+
+fn report_free_mem(label: text):
+    val avail_line = file_read("/proc/meminfo") ?? ""
+    val lines = avail_line.split("\n")
+    for line in lines:
+        if line.starts_with("MemAvailable"):
+            print "[MEM] {label}: {line}"
+            return
+    print "[MEM] {label}: (could not read /proc/meminfo)"
+
+# =========================================================================
+# Exports
+# =========================================================================
+

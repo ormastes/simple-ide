@@ -1,0 +1,85 @@
+# Stats Panel — TUI
+#
+# Displays Simple compiler project stats in the dashboard:
+# build status, test results, TODOs, features, doc coverage.
+# Uses sparklines and progress bars for visual density.
+
+use app.ui.render.ansi.{RESET, BOLD, DIM, FG_BLUE, FG_GREEN, FG_YELLOW, FG_RED, FG_CYAN, FG_WHITE}
+use app.llm_dashboard.data.project_stats.{
+    ProjectStats, test_pass_rate, feature_progress_pct
+}
+use app.llm_dashboard.tui.sparkline.{
+    progress_bar, progress_bar_compact, status_dot, status_dot_label
+}
+
+fn render_stats_panel(stats: ProjectStats, max_lines: i64) -> [text]:
+    """Render project stats as TUI lines."""
+    var lines: [text] = []
+
+    # Header
+    lines.push(BOLD + FG_CYAN + "Project Status" + RESET)
+    lines.push("")
+
+    # Build status
+    val build_status = status_dot_label(stats.last_build_ok,
+        if stats.last_build_ok: "Build OK" else: "Build FAILED")
+    lines.push(build_status)
+    if stats.last_build_time.len() > 0:
+        lines.push(DIM + "  " + stats.last_build_time + RESET)
+    lines.push("")
+
+    # Test results
+    val pass_rate = test_pass_rate(stats)
+    lines.push(BOLD + "Tests" + RESET)
+    val test_bar = progress_bar(stats.test_passed, stats.test_count, 20)
+    lines.push("  " + test_bar)
+    lines.push("  " + FG_GREEN + stats.test_passed.to_text() + RESET + "/" + stats.test_count.to_text() + " passed")
+    if stats.test_failed > 0:
+        lines.push("  " + FG_RED + stats.test_failed.to_text() + " failed" + RESET)
+    lines.push("")
+
+    # Features
+    val feat_pct = feature_progress_pct(stats)
+    lines.push(BOLD + "Features" + RESET)
+    val feat_bar = progress_bar(stats.feature_done, stats.feature_count, 20)
+    lines.push("  " + feat_bar)
+    lines.push("  " + stats.feature_done.to_text() + "/" + stats.feature_count.to_text() + " done")
+    lines.push("")
+
+    # TODOs
+    lines.push(BOLD + "TODOs" + RESET)
+    if stats.todo_count > 0 or stats.fixme_count > 0:
+        lines.push("  " + FG_YELLOW + "TODO: " + stats.todo_count.to_text() + RESET)
+        if stats.fixme_count > 0:
+            lines.push("  " + FG_RED + "FIXME: " + stats.fixme_count.to_text() + RESET)
+    else:
+        lines.push("  " + DIM + "(none)" + RESET)
+
+    # Truncate
+    if lines.len() > max_lines:
+        var truncated: [text] = []
+        var i = 0
+        while i < max_lines - 1:
+            truncated.push(lines[i])
+            i = i + 1
+        truncated.push(DIM + "..." + RESET)
+        return truncated
+
+    lines
+
+fn render_stats_compact(stats: ProjectStats) -> text:
+    """One-line compact stats for status bar."""
+    var parts: [text] = []
+    parts.push(status_dot(stats.last_build_ok))
+    parts.push(" Tests:")
+    parts.push(FG_GREEN + stats.test_passed.to_text() + RESET)
+    parts.push("/")
+    parts.push(stats.test_count.to_text())
+    if stats.test_failed > 0:
+        parts.push(FG_RED + "(" + stats.test_failed.to_text() + "F)" + RESET)
+    parts.push(" TODO:")
+    parts.push(FG_YELLOW + stats.todo_count.to_text() + RESET)
+    parts.push(" Feat:")
+    val pct = feature_progress_pct(stats)
+    parts.push(progress_bar_compact(pct, 8))
+    parts.join("")

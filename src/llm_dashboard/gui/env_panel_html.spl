@@ -1,0 +1,298 @@
+# Environment Panel — HTML View
+#
+# Renders Claude Code artifacts (CLAUDE.md, skills, agents, MCPs,
+# hooks, memory, templates) as HTML cards for the dashboard GUI.
+
+use std.nogc_async_mut.llm_diagnostics.env_scanner.{
+    EnvSummary, ClaudeMdFile, SkillDef, AgentDef,
+    McpServerDef, HookDef, MemoryFile, TemplateDef
+}
+use std.format_utils.{format_size}
+
+fn generate_env_panel_html(env: EnvSummary) -> text:
+    """Generate full HTML content for the Environment tab."""
+    var parts: [text] = []
+    parts.push("<div class=\"env-panel\">")
+
+    # Summary bar
+    parts.push("<div class=\"env-summary-bar\">")
+    parts.push("<span class=\"env-stat\">CLAUDE.md: <b>")
+    parts.push(env.claude_md_files.len().to_text())
+    parts.push("</b></span>")
+    parts.push("<span class=\"env-stat\">Skills: <b>")
+    parts.push(env.skills.len().to_text())
+    parts.push("</b></span>")
+    parts.push("<span class=\"env-stat\">Agents: <b>")
+    parts.push(env.agents.len().to_text())
+    parts.push("</b></span>")
+    parts.push("<span class=\"env-stat\">MCP Servers: <b>")
+    parts.push(env.mcp_servers.len().to_text())
+    parts.push("</b></span>")
+    parts.push("<span class=\"env-stat\">Hooks: <b>")
+    parts.push(env.hooks.len().to_text())
+    parts.push("</b></span>")
+    parts.push("<span class=\"env-stat\">Memory: <b>")
+    parts.push(env.memory_files.len().to_text())
+    parts.push("</b></span>")
+    parts.push("<span class=\"env-stat env-tokens\">~")
+    parts.push(env.total_estimated_startup_tokens.to_text())
+    parts.push(" startup tokens</span>")
+    parts.push("</div>")
+
+    # CLAUDE.md section
+    parts.push(render_section_header("CLAUDE.md Files", env.claude_md_files.len()))
+    parts.push("<div class=\"env-grid\">")
+    for md in env.claude_md_files:
+        parts.push(render_claude_md_card(md))
+    parts.push("</div>")
+
+    # Skills section
+    parts.push(render_section_header("Skills", env.skills.len()))
+    parts.push("<div class=\"env-grid\">")
+    for skill in env.skills:
+        parts.push(render_skill_card(skill))
+    parts.push("</div>")
+
+    # Agents section
+    parts.push(render_section_header("Agents", env.agents.len()))
+    parts.push("<div class=\"env-grid\">")
+    for agent in env.agents:
+        parts.push(render_agent_card(agent))
+    parts.push("</div>")
+
+    # MCP Servers section
+    parts.push(render_section_header("MCP Servers", env.mcp_servers.len()))
+    parts.push("<div class=\"env-grid\">")
+    for server in env.mcp_servers:
+        parts.push(render_mcp_card(server))
+    parts.push("</div>")
+
+    # Hooks section
+    parts.push(render_section_header("Hooks", env.hooks.len()))
+    parts.push("<div class=\"env-grid\">")
+    for hook in env.hooks:
+        parts.push(render_hook_card(hook))
+    parts.push("</div>")
+
+    # Memory section
+    parts.push(render_section_header("Memory Files", env.memory_files.len()))
+    parts.push("<div class=\"env-grid\">")
+    for mem in env.memory_files:
+        parts.push(render_memory_card(mem))
+    parts.push("</div>")
+
+    # Templates section
+    parts.push(render_section_header("Templates", env.templates.len()))
+    parts.push("<div class=\"env-grid\">")
+    for tmpl in env.templates:
+        parts.push(render_template_card(tmpl))
+    parts.push("</div>")
+
+    parts.push("</div>")
+    parts.join("")
+
+# --- Section Header ---
+
+fn render_section_header(title: text, count: i64) -> text:
+    var parts: [text] = []
+    parts.push("<div class=\"env-section-header\">")
+    parts.push("<h3>")
+    parts.push(title)
+    parts.push(" <span class=\"env-count\">(")
+    parts.push(count.to_text())
+    parts.push(")</span></h3></div>")
+    parts.join("")
+
+# --- Card Renderers ---
+
+fn render_claude_md_card(md: ClaudeMdFile) -> text:
+    var parts: [text] = []
+    parts.push("<div class=\"env-card env-card-md\">")
+    parts.push("<div class=\"env-card-icon\">📄</div>")
+    parts.push("<div class=\"env-card-body\">")
+    parts.push("<div class=\"env-card-title\">")
+    parts.push(short_path(md.path))
+    parts.push("</div>")
+    parts.push("<div class=\"env-card-meta\">")
+    parts.push(md.scope)
+    parts.push(" · ")
+    parts.push(format_size(md.size))
+    parts.push(" · ~")
+    parts.push(md.estimated_tokens.to_text())
+    parts.push(" tokens</div>")
+    parts.push("</div></div>")
+    parts.join("")
+
+fn render_skill_card(skill: SkillDef) -> text:
+    var parts: [text] = []
+    parts.push("<div class=\"env-card env-card-skill\">")
+    parts.push("<div class=\"env-card-icon\">⚡</div>")
+    parts.push("<div class=\"env-card-body\">")
+    parts.push("<div class=\"env-card-title\">/")
+    parts.push(skill.name)
+    parts.push("</div>")
+    parts.push("<div class=\"env-card-meta\">")
+    parts.push(format_size(skill.size))
+    parts.push(" · ~")
+    parts.push(skill.estimated_tokens.to_text())
+    parts.push(" tokens</div>")
+    if skill.description.len() > 0:
+        parts.push("<div class=\"env-card-desc\">")
+        parts.push(skill.description)
+        parts.push("</div>")
+    parts.push("</div></div>")
+    parts.join("")
+
+fn render_agent_card(agent: AgentDef) -> text:
+    var parts: [text] = []
+    parts.push("<div class=\"env-card env-card-agent\">")
+    parts.push("<div class=\"env-card-icon\">🤖</div>")
+    parts.push("<div class=\"env-card-body\">")
+    parts.push("<div class=\"env-card-title\">")
+    parts.push(agent.name)
+    parts.push("</div>")
+    parts.push("<div class=\"env-card-meta\">")
+    parts.push(format_size(agent.size))
+    parts.push(" · ~")
+    parts.push(agent.estimated_tokens.to_text())
+    parts.push(" tokens</div>")
+    if agent.description.len() > 0:
+        parts.push("<div class=\"env-card-desc\">")
+        parts.push(agent.description)
+        parts.push("</div>")
+    parts.push("</div></div>")
+    parts.join("")
+
+fn render_mcp_card(server: McpServerDef) -> text:
+    var parts: [text] = []
+    parts.push("<div class=\"env-card env-card-mcp\">")
+    parts.push("<div class=\"env-card-icon\">🔌</div>")
+    parts.push("<div class=\"env-card-body\">")
+    parts.push("<div class=\"env-card-title\">")
+    parts.push(server.name)
+    parts.push("</div>")
+    parts.push("<div class=\"env-card-meta\">")
+    parts.push(server.command)
+    parts.push("</div>")
+    parts.push("</div></div>")
+    parts.join("")
+
+fn render_hook_card(hook: HookDef) -> text:
+    var parts: [text] = []
+    parts.push("<div class=\"env-card env-card-hook\">")
+    parts.push("<div class=\"env-card-icon\">🪝</div>")
+    parts.push("<div class=\"env-card-body\">")
+    parts.push("<div class=\"env-card-title\">")
+    parts.push(hook.event_type)
+    parts.push("</div>")
+    parts.push("<div class=\"env-card-meta\">")
+    parts.push(hook.hook_type)
+    if hook.matcher.len() > 0:
+        parts.push(" · ")
+        parts.push(hook.matcher)
+    parts.push("</div>")
+    parts.push("</div></div>")
+    parts.join("")
+
+fn render_memory_card(mem: MemoryFile) -> text:
+    var parts: [text] = []
+    parts.push("<div class=\"env-card env-card-memory\">")
+    parts.push("<div class=\"env-card-icon\">🧠</div>")
+    parts.push("<div class=\"env-card-body\">")
+    parts.push("<div class=\"env-card-title\">")
+    parts.push(mem.name)
+    parts.push("</div>")
+    parts.push("<div class=\"env-card-meta\">")
+    parts.push(mem.memory_type)
+    parts.push(" · ")
+    parts.push(format_size(mem.size))
+    parts.push("</div>")
+    parts.push("</div></div>")
+    parts.join("")
+
+fn render_template_card(tmpl: TemplateDef) -> text:
+    var parts: [text] = []
+    parts.push("<div class=\"env-card env-card-template\">")
+    parts.push("<div class=\"env-card-icon\">📋</div>")
+    parts.push("<div class=\"env-card-body\">")
+    parts.push("<div class=\"env-card-title\">")
+    parts.push(tmpl.name)
+    parts.push("</div>")
+    parts.push("<div class=\"env-card-meta\">")
+    parts.push(format_size(tmpl.size))
+    parts.push("</div>")
+    parts.push("</div></div>")
+    parts.join("")
+
+# --- CSS ---
+
+fn generate_env_panel_css() -> text:
+    """CSS for the environment panel cards and grid."""
+    """
+/* Environment Panel */
+.env-panel { padding: 8px; }
+.env-summary-bar {
+    display: flex; flex-wrap: wrap; gap: 12px;
+    padding: 10px 14px; margin-bottom: 12px;
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+}
+.env-stat { font-size: 13px; color: #8b949e; }
+.env-stat b { color: #58a6ff; }
+.env-tokens { color: #f0883e; font-weight: 600; }
+.env-tokens b { color: #f0883e; }
+.env-section-header {
+    margin: 16px 0 6px; padding: 0 4px;
+}
+.env-section-header h3 {
+    font-size: 14px; color: #c9d1d9; font-weight: 600;
+}
+.env-count { color: #8b949e; font-weight: 400; }
+.env-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 8px; margin-bottom: 4px;
+}
+.env-card {
+    display: flex; gap: 10px; padding: 10px 12px;
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    transition: border-color 0.15s;
+}
+.env-card:hover { border-color: #58a6ff; }
+.env-card-icon { font-size: 20px; flex-shrink: 0; }
+.env-card-body { min-width: 0; }
+.env-card-title {
+    font-size: 13px; font-weight: 600; color: #e6edf3;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.env-card-meta {
+    font-size: 11px; color: #8b949e; margin-top: 2px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.env-card-desc {
+    font-size: 11px; color: #7d8590; margin-top: 4px;
+    overflow: hidden; text-overflow: ellipsis;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+}
+.env-card-md { border-left: 3px solid #58a6ff; }
+.env-card-skill { border-left: 3px solid #f0883e; }
+.env-card-agent { border-left: 3px solid #3fb950; }
+.env-card-mcp { border-left: 3px solid #a371f7; }
+.env-card-hook { border-left: 3px solid #d29922; }
+.env-card-memory { border-left: 3px solid #f778ba; }
+.env-card-template { border-left: 3px solid #8b949e; }
+"""
+
+# --- Helpers ---
+
+fn short_path(path: text) -> text:
+    """Shorten path to last 3 components."""
+    val parts = path.split("/")
+    if parts.len() <= 3:
+        return path
+    var result: [text] = []
+    result.push("...")
+    var i = parts.len() - 3
+    while i < parts.len():
+        result.push(parts[i])
+        i = i + 1
+    result.join("/")
+

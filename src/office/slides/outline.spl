@@ -1,0 +1,87 @@
+# Slide outline and CSS-like style helpers.
+#
+# Keeps presentation outline/design metadata near the slide app while reusing
+# the existing Presentation and Slide model.
+
+use app.office.slides.slide.{Presentation, Slide, SlideElementKind}
+
+struct SlideOutlineStyle:
+    selector: text
+    color: text
+    font_weight: text
+    text_transform: text
+    accent: text
+
+struct SlideOutlineItem:
+    slide_index: i32
+    slide_id: text
+    title: text
+    depth: i32
+    style: SlideOutlineStyle
+
+fn default_slide_outline_style() -> SlideOutlineStyle:
+    SlideOutlineStyle(
+        selector: ".slide-outline-item",
+        color: "#1F2937",
+        font_weight: "normal",
+        text_transform: "none",
+        accent: "#4A90D9"
+    )
+
+fn slide_outline_style(selector: text, color: text, font_weight: text, text_transform: text, accent: text) -> SlideOutlineStyle:
+    SlideOutlineStyle(
+        selector: selector,
+        color: color,
+        font_weight: font_weight,
+        text_transform: text_transform,
+        accent: accent
+    )
+
+fn slide_outline_item_text(item: SlideOutlineItem) -> text:
+    var title = item.title
+    if item.style.text_transform == "uppercase":
+        title = title.upper()
+    if item.style.text_transform == "lowercase":
+        title = title.lower()
+    "{item.slide_index + 1}. {title}"
+
+fn slide_outline_style_css(style: SlideOutlineStyle) -> text:
+    var out = style.selector + " color: " + style.color
+    out = out + "; font-weight: " + style.font_weight
+    out = out + "; text-transform: " + style.text_transform
+    out = out + "; border-left-color: " + style.accent + ";"
+    out
+
+fn slide_title_text(slide: Slide) -> text:
+    for el in slide.elements:
+        match el.kind:
+            SlideElementKind.TextBox(content: content):
+                if content != "":
+                    return content
+            _:
+                pass_do_nothing("non-text slide elements do not contribute outline titles")
+    "(untitled slide)"
+
+fn presentation_outline(pres: Presentation, style: SlideOutlineStyle) -> [SlideOutlineItem]:
+    var items: [SlideOutlineItem] = []
+    var idx: i32 = 0
+    for slide in pres.slides:
+        var title = slide_title_text(slide)
+        if idx == 0 and title == "(untitled slide)" and pres.title != "":
+            title = pres.title
+        val item = SlideOutlineItem(
+            slide_index: idx,
+            slide_id: slide.id,
+            title: title,
+            depth: 0,
+            style: style
+        )
+        items.push(item)
+        idx = idx + 1
+    items
+
+fn presentation_outline_text(pres: Presentation, style: SlideOutlineStyle) -> [text]:
+    var lines: [text] = []
+    for item in presentation_outline(pres, style):
+        lines.push(slide_outline_item_text(item))
+    lines

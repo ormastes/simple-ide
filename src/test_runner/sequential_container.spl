@@ -1,0 +1,176 @@
+# Sequential Container Execution
+#
+# Runs each test file in its own isolated container for maximum isolation.
+# One container per test file, with cleanup after each test.
+#
+# NOTE: Container tracking for self-protection - Current implementation uses
+# `docker run --rm` which auto-removes containers. Container tracking would
+# require using named containers without --rm and tracking IDs for cleanup.
+# This is a future enhancement for Week 1 completion.
+
+use std.io.{shell, shell_bool}
+use std.io.{time_now_unix_micros}
+use std.io.{env_get}
+use std.test_runner.test_runner_types.{TestFileResult, TestOptions}
+use std.test_runner.test_runner_container.{container_detect_runtime, container_run_test}
+use std.test_runner.test_runner_execute.make_result_from_output
+
+# =========================================================================
+# Sequential Container Configuration
+# =========================================================================
+
+class SequentialContainerConfig:
+    base_image: text
+    runtime: text            # "docker" or "podman"
+    memory_mb: i64
+    cpu_cores: f64
+    network: text            # "none" recommended
+    cleanup_on_error: bool   # Delete container on failure
+    workspace: text          # Workspace directory
+
+impl SequentialContainerConfig:
+    static fn create_default() -> SequentialContainerConfig:
+        """Create default sequential container config"""
+        SequentialContainerConfig(
+            base_image: "simple-test-isolation:latest",
+            runtime: "auto",
+            memory_mb: 512,
+            cpu_cores: 1.0,
+            network: "none",
+            cleanup_on_error: true,
+            workspace: "."
+        )
+
+    fn with_runtime(rt: text) -> SequentialContainerConfig:
+        """Set container runtime"""
+        SequentialContainerConfig(
+            base_image: self.base_image,
+            runtime: rt,
+            memory_mb: self.memory_mb,
+            cpu_cores: self.cpu_cores,
+            network: self.network,
+            cleanup_on_error: self.cleanup_on_error,
+            workspace: self.workspace
+        )
+
+# =========================================================================
+# Sequential Container Execution
+# =========================================================================
+
+fn sequential_container_run_test(
+    test_file: text,
+    config: SequentialContainerConfig
+) -> TestFileResult:
+    """
+    Run a single test file in an isolated container.
+
+    Args:
+        test_file: Path to test file
+        config: Container configuration
+
+    Returns: TestFileResult with test outcome
+    """
+    # Detect runtime if "auto"
+    var runtime = config.runtime
+    if runtime == "auto":
+        runtime = container_detect_runtime()
+        if runtime == "none":
+            return TestFileResult(
+                path: test_file,
+                passed: 0,
+                failed: 1,
+                skipped: 0,
+                pending: 0,
+                duration_ms: 0,
+                setup_ms: 0,
+                error: "No container runtime available (docker or podman)",
+                timed_out: false,
+                cached: false
+            )
+
+    # Generate unique container name
+    val timestamp = time_now_unix_micros() / 1000
+    val random_suffix = timestamp % 100000
+    val container_name = "simple-test-{timestamp}-{random_suffix}"
+
+    # Run test in container (read-write workspace for build artifacts)
+    val result_tuple = container_run_test(
+        test_file,
+        runtime,
+        config.base_image,
+        config.memory_mb,
+        config.cpu_cores,
+        config.network,
+        false,
+        config.workspace
+    )
+
+    val stdout = result_tuple.0
+    val stderr = result_tuple.1
+    val exit_code = result_tuple.2
+    val duration_ms = result_tuple.3
+
+    # Parse test output using existing helper
+    val result = make_result_from_output(test_file, stdout, stderr, exit_code, duration_ms, 600)
+    return result
+
+fn sequential_container_run_all_tests(
+    test_files: [text],
+    config: SequentialContainerConfig
+) -> [TestFileResult]:
+    """
+    Run all test files sequentially in isolated containers.
+
+    Args:
+        test_files: List of test file paths
+        config: Container configuration
+
+    Returns: List of TestFileResult
+    """
+    var results: [TestFileResult] = []
+
+    print "Running {test_files.len()} test(s) in sequential containers..."
+    print "Container image: {config.base_image}"
+    print "Memory limit: {config.memory_mb}MB, CPU: {config.cpu_cores} cores"
+    print ""
+
+    var test_num = 0
+    for test_file in test_files:
+        test_num = test_num + 1
+        print "[{test_num}/{test_files.len()}] Running {test_file} in isolated container..."
+
+        val result = sequential_container_run_test(test_file, config)
+        results.push(result)
+
+        # Print immediate feedback
+        if result.error == "" and result.failed == 0:
+            print "  PASSED ({result.duration_ms}ms)"
+        elif result.error != "":
+            print "  FAILED: {result.error}"
+        else:
+            print "  FAILED ({result.failed} test(s) failed)"
+
+    print ""
+    return results
+
+# =========================================================================
+# Container Cleanup Helper
+# =========================================================================
+
+fn sequential_container_cleanup(container_name: text, runtime: text) -> bool:
+    """
+    Clean up a container by name.
+
+    Args:
+        container_name: Name of container to remove
+        runtime: Container runtime (docker or podman)
+
+    Returns: true on success, false on failure
+    """
+    val cleanup_cmd = "{runtime} rm -f {container_name}"
+    return shell_bool(cleanup_cmd)
+
+# =========================================================================
+# Exports
+# =========================================================================
+

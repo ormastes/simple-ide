@@ -1,0 +1,121 @@
+# Test Database V3 SDN Serializer
+#
+# Serializes test database structures back to V3 SDN format.
+
+use std.test_runner.string_interner.{StringInterner, escape_sdn_string}
+use std.test_runner.test_db_types.{ChangeEvent, CounterRecord, FileRecord, RunRecord, SuiteRecord, TestRecord, TimingRun, TimingSummary}
+
+# =========================================================================
+# Stable DB Serialization (test_db.sdn)
+# =========================================================================
+
+fn serialize_stable_db(
+    interner: StringInterner,
+    files: List<FileRecord>,
+    suites: List<SuiteRecord>,
+    tests: List<TestRecord>
+) -> text:
+    var parts: List<text> = []
+
+    # Version header
+    parts.push("# version: 3.0")
+    parts.push("")
+
+    # Strings table
+    parts.push(interner.serialize())
+    parts.push("")
+
+    # Files table
+    parts.push("files |file_id, path_str|")
+    for f in files:
+        parts.push("    {f.file_id}, {f.path_str}")
+    parts.push("")
+
+    # Suites table
+    parts.push("suites |suite_id, file_id, name_str|")
+    for s in suites:
+        parts.push("    {s.suite_id}, {s.file_id}, {s.name_str}")
+    parts.push("")
+
+    # Tests table
+    parts.push("tests |test_id, suite_id, name_str, category_str, status_str, tags_str, description_str, valid, qualified_by, qualified_at, qualified_reason|")
+    var test_id = 0
+    for t in tests:
+        val valid_str = if t.valid: "true" else: "false"
+        val tags = format_optional_field(t.tags_str)
+        val desc = format_optional_field(t.description_str)
+        val qby = format_optional_field(t.qualified_by)
+        val qat = format_optional_field(t.qualified_at)
+        val qr = format_optional_field(t.qualified_reason)
+        parts.push("    {test_id}, {t.suite_id}, {t.name_str}, {t.category_str}, {t.status_str}, {tags}, {desc}, {valid_str}, {qby}, {qat}, {qr}")
+        test_id = test_id + 1
+    parts.push("")
+
+    parts.join("\n")
+
+# =========================================================================
+# Volatile DB Serialization (test_db_runs.sdn)
+# =========================================================================
+
+fn serialize_volatile_db(
+    counters: List<CounterRecord>,
+    timing: List<TimingSummary>,
+    timing_runs: List<TimingRun>,
+    changes: List<ChangeEvent>,
+    test_runs: List<RunRecord>
+) -> text:
+    var parts: List<text> = []
+
+    # Version header
+    parts.push("# version: 3.0")
+    parts.push("")
+
+    # Counters table
+    parts.push("counters |test_id, total_runs, passed, failed, flaky_count, last_change, last_10_runs, failure_rate_pct|")
+    for c in counters:
+        val l10 = format_optional_field(c.last_10_runs)
+        parts.push("    {c.test_id}, {c.total_runs}, {c.passed}, {c.failed}, {c.flaky_count}, {c.last_change}, {l10}, {c.failure_rate_pct}")
+    parts.push("")
+
+    # Timing table
+    parts.push("timing |test_id, last_ms, p50, p90, p95, baseline_median, p99, min_time, max_time, iqr, mean, std_dev, cv_pct, baseline_mean, baseline_std_dev, baseline_cv_pct, baseline_last_updated, baseline_run_count, baseline_update_reason|")
+    for t in timing:
+        val blu = format_optional_field(t.baseline_last_updated)
+        val bur = format_optional_field(t.baseline_update_reason)
+        parts.push("    {t.test_id}, {t.last_ms}, {t.p50}, {t.p90}, {t.p95}, {t.baseline_median}, {t.p99}, {t.min_time}, {t.max_time}, {t.iqr}, {t.mean}, {t.std_dev}, {t.cv_pct}, {t.baseline_mean}, {t.baseline_std_dev}, {t.baseline_cv_pct}, {blu}, {t.baseline_run_count}, {bur}")
+    parts.push("")
+
+    # Timing runs table
+    parts.push("timing_runs |test_id, timestamp, duration_ms, outlier|")
+    for tr in timing_runs:
+        val outlier_str = if tr.outlier: "true" else: "false"
+        parts.push("    {tr.test_id}, \"{tr.timestamp}\", {tr.duration_ms}, {outlier_str}")
+    parts.push("")
+
+    # Changes table
+    parts.push("changes |test_id, change_type, run_id|")
+    for ch in changes:
+        parts.push("    {ch.test_id}, {ch.change_type}, {ch.run_id}")
+    parts.push("")
+
+    # Test runs table
+    parts.push("test_runs |run_id, start_time, end_time, pid, hostname, status, test_count, passed, failed, crashed, timed_out|")
+    for r in test_runs:
+        val end = if r.end_time != "": "\"{r.end_time}\"" else: ""
+        parts.push("    {r.run_id}, \"{r.start_time}\", {end}, {r.pid}, {r.hostname}, {r.status}, {r.test_count}, {r.passed}, {r.failed}, {r.crashed}, {r.timed_out}")
+    parts.push("")
+
+    parts.join("\n")
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn format_optional_field(value: text) -> text:
+    if value == "":
+        return ""
+    if value.contains(",") or value.contains("\"") or value.contains("\n"):
+        val escaped = escape_sdn_string(value)
+        return "\"{escaped}\""
+    value
+

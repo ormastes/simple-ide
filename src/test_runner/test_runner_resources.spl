@@ -1,0 +1,252 @@
+# Test Runner Resource Reporting
+#
+# Resource monitoring integration for test runner.
+# Provides violation alerts and summary statistics.
+
+use std.process_monitor.{ProcessMetrics, sample_process, exceeds_limits}
+use std.resource_tracker.{ResourceUsageRecord, calculate_resource_stats, detect_violations}
+use std.resource_tracker.{resource_db_record, resource_db_query_worst_cpu, resource_db_query_worst_memory}
+use std.io.{time_now_unix_micros}
+
+# ============================================================================
+# Resource Limits Configuration
+# ============================================================================
+
+struct ResourceLimits:
+    cpu_percent_limit: f64
+    memory_mb_limit: i64
+    fd_limit: i64
+    enabled: bool
+
+fn default_resource_limits() -> ResourceLimits:
+    """Default resource limits for tests"""
+    ResourceLimits(
+        cpu_percent_limit: 200.0,  # 200% CPU (2 cores)
+        memory_mb_limit: 512,      # 512 MB
+        fd_limit: 1024,            # 1024 file descriptors
+        enabled: true
+    )
+
+fn resource_limits_for_slow_tests() -> ResourceLimits:
+    """Higher limits for slow_it tests"""
+    ResourceLimits(
+        cpu_percent_limit: 400.0,  # 400% CPU (4 cores)
+        memory_mb_limit: 1024,     # 1 GB
+        fd_limit: 2048,            # 2048 file descriptors
+        enabled: true
+    )
+
+fn resource_limits_disabled() -> ResourceLimits:
+    """Disabled resource limits"""
+    ResourceLimits(
+        cpu_percent_limit: 0.0,
+        memory_mb_limit: 0,
+        fd_limit: 0,
+        enabled: false
+    )
+
+# ============================================================================
+# Resource Monitoring for Single Test
+# ============================================================================
+
+fn monitor_test_execution(pid: i64, test_file: text, limits: ResourceLimits) -> ResourceUsageRecord:
+    """
+    Monitor a test execution and return resource usage record.
+
+    Args:
+        pid: Process ID of test execution
+        test_file: Test file path
+        limits: Resource limits configuration
+
+    Returns:
+        ResourceUsageRecord with metrics and violations
+
+    Note: Simplified implementation - takes single sample.
+    Full implementation would sample periodically during test execution.
+    """
+    if not limits.enabled:
+        # Return empty record
+        return ResourceUsageRecord(
+            test_file: test_file,
+            timestamp_ms: 0,
+            duration_ms: 0,
+            max_cpu_percent: 0.0,
+            max_memory_mb: 0,
+            avg_cpu_percent: 0.0,
+            avg_memory_mb: 0,
+            max_open_fds: 0,
+            max_threads: 0,
+            sample_count: 0,
+            violations: ""
+        )
+
+    # Sample process metrics
+    val timestamp = time_now_unix_micros() / 1000
+    val metrics = sample_process(pid, timestamp)
+
+    # Convert single sample to record
+    var record = ResourceUsageRecord(
+        test_file: test_file,
+        timestamp_ms: metrics.timestamp_ms,
+        duration_ms: 0,  # Single sample - no duration
+        max_cpu_percent: metrics.cpu_percent,
+        max_memory_mb: metrics.memory_mb,
+        avg_cpu_percent: metrics.cpu_percent,
+        avg_memory_mb: metrics.memory_mb,
+        max_open_fds: metrics.open_fds,
+        max_threads: metrics.thread_count,
+        sample_count: 1,
+        violations: ""
+    )
+
+    # Detect violations
+    val violations = detect_violations(
+        record,
+        limits.cpu_percent_limit,
+        limits.memory_mb_limit,
+        limits.fd_limit
+    )
+
+    record.violations = violations
+    record
+
+fn record_test_resource_usage(test_file: text, record: ResourceUsageRecord):
+    """
+    Record test resource usage to database.
+
+    Args:
+        test_file: Test file path
+        record: ResourceUsageRecord with metrics
+    """
+    resource_db_record(test_file, record, record.violations)
+
+# ============================================================================
+# Violation Reporting
+# ============================================================================
+
+fn format_violation_alert(test_file: text, record: ResourceUsageRecord) -> text:
+    """
+    Format resource violation alert message.
+
+    Returns:
+        Human-readable alert message or empty string if no violations
+    """
+    if record.violations == "":
+        return ""
+
+    var parts: [text] = ["[RESOURCE VIOLATION] {test_file}"]
+
+    val violations = record.violations.split(",")
+    for violation in violations:
+        if violation == "cpu":
+            parts.push("  CPU: {record.max_cpu_percent}% (limit exceeded)")
+        elif violation == "memory":
+            parts.push("  Memory: {record.max_memory_mb} MB (limit exceeded)")
+        elif violation == "fds":
+            parts.push("  File Descriptors: {record.max_open_fds} (limit exceeded)")
+
+    parts.join("\n") + "\n"
+
+fn has_violations(record: ResourceUsageRecord) -> bool:
+    """Check if record has any violations"""
+    record.violations != ""
+
+# ============================================================================
+# Summary Statistics
+# ============================================================================
+
+fn generate_resource_summary(limit: i64) -> text:
+    """
+    Generate markdown summary of resource usage.
+
+    Args:
+        limit: Number of top consumers to show
+
+    Returns:
+        Markdown formatted summary
+    """
+    var parts: [text] = []
+    parts.push("# Test Resource Usage Summary\n")
+
+    # Top CPU consumers
+    parts.push("## Top CPU Consumers\n")
+    parts.push("| Test File | Max CPU % | Avg CPU % | Violations |")
+    parts.push("|-----------|-----------|-----------|------------|")
+
+    val cpu_records = resource_db_query_worst_cpu(limit)
+    for record in cpu_records:
+        val violations_str = if record.violations == "": "-" else: record.violations
+        parts.push("| {record.test_file} | {record.max_cpu_percent} | {record.avg_cpu_percent} | {violations_str} |")
+
+    parts.push("")
+
+    # Top memory consumers
+    parts.push("## Top Memory Consumers\n")
+    parts.push("| Test File | Max Memory (MB) | Avg Memory (MB) | Violations |")
+    parts.push("|-----------|-----------------|-----------------|------------|")
+
+    val memory_records = resource_db_query_worst_memory(limit)
+    for record in memory_records:
+        val violations_str = if record.violations == "": "-" else: record.violations
+        parts.push("| {record.test_file} | {record.max_memory_mb} | {record.avg_memory_mb} | {violations_str} |")
+
+    parts.push("")
+
+    parts.join("\n") + "\n"
+
+fn count_total_violations() -> i64:
+    """Count total number of violations across all tests"""
+    val all_records = resource_db_query_worst_cpu(10000)  # Load all
+    var count = 0
+
+    for record in all_records:
+        if has_violations(record):
+            count = count + 1
+
+    count
+
+fn format_resource_metrics(record: ResourceUsageRecord) -> text:
+    """
+    Format resource metrics for display.
+
+    Returns:
+        Single-line summary like "CPU: 45.2%, Mem: 128 MB, FDs: 23"
+    """
+    "CPU: {record.max_cpu_percent}%, Mem: {record.max_memory_mb} MB, FDs: {record.max_open_fds}"
+
+# ============================================================================
+# Integration with Test Runner Output
+# ============================================================================
+
+fn append_resource_info_to_output(test_file: text, record: ResourceUsageRecord, output: text) -> text:
+    """
+    Append resource usage info to test output.
+
+    Args:
+        test_file: Test file path
+        record: ResourceUsageRecord
+        output: Original test output
+
+    Returns:
+        Output with appended resource info
+    """
+    if record.sample_count == 0:
+        return output
+
+    var result = output
+
+    # Add separator
+    result = result + "\n--- Resource Usage ---\n"
+
+    # Add metrics
+    result = result + "CPU: {record.max_cpu_percent}% (avg: {record.avg_cpu_percent}%)\n"
+    result = result + "Memory: {record.max_memory_mb} MB (avg: {record.avg_memory_mb} MB)\n"
+    result = result + "File Descriptors: {record.max_open_fds}\n"
+    result = result + "Threads: {record.max_threads}\n"
+
+    # Add violations if any
+    if record.violations != "":
+        result = result + "\n[WARNING] Resource violations: {record.violations}\n"
+
+    result
+

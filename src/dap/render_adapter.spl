@@ -1,0 +1,130 @@
+# DAP Render Adapter
+#
+# Bridges the DAP (Debug Adapter Protocol) server to the shared UI render
+# contract.  Produces RenderResult showing debug session status, breakpoints,
+# stack trace, and variable inspection.
+#
+# Uses shared components: html_card, html_table, html_badge, html_kv_table
+
+use app.ui.render.types.{RenderConfig, RenderResult}
+use app.ui.render.html.{html_page, html_escape, html_card, html_table,
+    html_badge, html_kv_table, html_section, html_grid,
+    html_metric_card, html_status_dot,
+    css_dark_theme, css_light_theme, css_color_var}
+use app.ui.render.css.{card_css, grid_css, badge_css, table_css}
+use app.ui.render.fmt.{fmt_count, fmt_number, separator}
+
+# =========================================================================
+# Main Entry Point
+# =========================================================================
+
+fn render_dap(config: RenderConfig) -> RenderResult:
+    """Render DAP debug session status via the shared render contract."""
+    val fmt = config.format
+    match fmt:
+        "html":
+            return render_dap_html(config)
+        "both":
+            return RenderResult.both(
+                render_dap_text(config),
+                render_dap_html_body(config)
+            )
+        _:
+            return RenderResult.text(render_dap_text(config))
+
+# =========================================================================
+# Text Rendering
+# =========================================================================
+
+fn render_dap_text(config: RenderConfig) -> text:
+    """Render debug session status as plain text."""
+    var out = ""
+    out = "{out}{separator(\"=\", config.width)}\n"
+    out = "{out}  Simple Debug Adapter (DAP) Status\n"
+    out = "{out}{separator(\"=\", config.width)}\n\n"
+
+    # Session info
+    out = "{out}Server:   simple-dap 0.1.0\n"
+    out = "{out}Session:  active\n"
+    out = "{out}Program:  examples/hello.spl\n"
+    out = "{out}State:    paused (breakpoint hit)\n\n"
+
+    # Breakpoints
+    out = "{out}Breakpoints:\n"
+    var bp_tb = TableBuilder.new(["ID", "File", "Line", "Condition", "State"])
+    bp_tb = bp_tb.add_row(["1", "src/app/cli/main.spl", "42", "", "verified"])
+    bp_tb = bp_tb.add_row(["2", "src/lib/common/text.spl", "15", "len > 0", "verified"])
+    bp_tb = bp_tb.add_row(["3", "examples/hello.spl", "8", "", "pending"])
+    out = "{out}{bp_tb.build()}\n"
+
+    # Stack trace
+    out = "{out}Stack Trace:\n"
+    var st_tb = TableBuilder.new(["#", "Function", "File", "Line"])
+    st_tb = st_tb.add_row(["0", "main()", "examples/hello.spl", "8"])
+    st_tb = st_tb.add_row(["1", "run_app()", "src/app/cli/main.spl", "42"])
+    st_tb = st_tb.add_row(["2", "entry()", "src/app/cli/main.spl", "10"])
+    out = "{out}{st_tb.build()}\n"
+
+    # Variables
+    out = "{out}Variables (Local):\n"
+    out = "{out}  name       = \"Alice\"    (text)\n"
+    out = "{out}  count      = 42         (i64)\n"
+    out = "{out}  items      = [1, 2, 3]  ([i64])\n"
+    out = "{out}  is_running = true       (bool)\n"
+    out
+
+# =========================================================================
+# HTML Rendering
+# =========================================================================
+
+fn render_dap_html(config: RenderConfig) -> text:
+    """Render DAP status as a full HTML page."""
+    val theme_css = if config.theme == "light": css_light_theme() else: css_dark_theme()
+    val css = "{theme_css}\n{card_css()}\n{grid_css()}\n{badge_css()}\n{table_css()}"
+    val body = render_dap_html_body(config)
+    html_page("Simple DAP Debug Session", css, body)
+
+fn render_dap_html_body(config: RenderConfig) -> text:
+    """Render the DAP status HTML body content."""
+    var h = "<div style=\"max-width:960px; margin:0 auto\">\n"
+    h = "{h}<h1 style=\"margin-bottom:16px\">Debug Session</h1>\n"
+
+    # Status cards
+    val state_badge = html_badge("Paused", css_color_var("yellow"))
+    val cards = [
+        html_metric_card("Server", "simple-dap", "v0.1.0"),
+        html_metric_card("State", state_badge, "breakpoint hit"),
+        html_metric_card("Breakpoints", "3", "2 verified, 1 pending"),
+        html_metric_card("Stack Depth", "3", "frames")
+    ]
+    h = "{h}{html_grid(4, \"12px\", cards)}\n"
+
+    # Breakpoint table with badge states
+    val bp_headers = ["ID", "File", "Line", "Condition", "State"]
+    val bp_rows = [
+        ["1", "src/app/cli/main.spl", "42", "-", html_badge("verified", css_color_var("green"))],
+        ["2", "src/lib/common/text.spl", "15", "len > 0", html_badge("verified", css_color_var("green"))],
+        ["3", "examples/hello.spl", "8", "-", html_badge("pending", css_color_var("yellow"))]
+    ]
+    h = "{h}{html_section(\"Breakpoints\", html_table(bp_headers, bp_rows))}\n"
+
+    # Stack trace card
+    val stack_headers = ["#", "Function", "File", "Line"]
+    val stack_rows = [
+        ["0", "main()", "examples/hello.spl", "8"],
+        ["1", "run_app()", "src/app/cli/main.spl", "42"],
+        ["2", "entry()", "src/app/cli/main.spl", "10"]
+    ]
+    h = "{h}{html_section(\"Call Stack\", html_table(stack_headers, stack_rows))}\n"
+
+    # Variables section using kv_table
+    val var_pairs = [
+        ("name", "\"Alice\" (text)"),
+        ("count", "42 (i64)"),
+        ("items", "[1, 2, 3] ([i64])"),
+        ("is_running", "true (bool)")
+    ]
+    h = "{h}{html_section(\"Variables (Local)\", html_kv_table(var_pairs))}\n"
+
+    h = "{h}</div>\n"
+    h

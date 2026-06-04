@@ -1,0 +1,67 @@
+# iOS CSS Overrides
+#
+# Returns iOS-specific CSS tokens to inject into the LLM dashboard when
+# running in iOS mode (Tauri WKWebView or mobile Safari).
+#
+# Token values mirror src/lib/common/ui/ios/theme.spl ios_light():
+#   accent  = #007AFF (UIColor.from_hex("#007AFF"))
+#   radius  = 10px    (BorderStyle radius: 10)
+#   font    = -apple-system, BlinkMacSystemFont, "SF Pro Text", ...
+#
+# This module is a leaf: no imports beyond language primitives.
+
+fn ios_css_overrides() -> text:
+    """Return CSS overrides for iOS/WKWebView rendering.
+
+    Injects:
+    - SF Pro font stack with -apple-system
+    - #007AFF accent color on active tabs and headings
+    - border-radius: 10px on cards and tabs
+    - min-height: 44px touch targets
+    - -webkit-overflow-scrolling: touch on scrollable panels
+    - safe-area-inset padding via env()
+    - apple-mobile-web-app viewport hints
+    """
+    return """
+/* iOS mode overrides — token values from src/lib/common/ui/ios/theme.spl ios_light() */
+body, .dashboard-container {
+    font-family: -apple-system, "SF Pro Text", "SF Pro Display", BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    -webkit-text-size-adjust: 100%;
+    padding-top: env(safe-area-inset-top, 20px);
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+:root {
+    --ios-accent: #007AFF;
+    --ios-radius: 10px;
+}
+/* Touch targets — minimum 44x44 pt per Apple HIG */
+.tab-btn, button, [role="button"] {
+    min-height: 44px;
+    min-width: 44px;
+}
+/* Momentum scrolling */
+.main-content, .left-panel, .right-panel, .bottom-panel {
+    -webkit-overflow-scrolling: touch;
+    overflow-y: auto;
+}
+/* Safe area insets for the header/container */
+.dashboard-container {
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+/* iOS accent color */
+.tab-btn.active, .dashboard-header h1 {
+    color: #007AFF;
+}
+.tab-btn.active {
+    background: #007AFF;
+    border-color: #007AFF;
+}
+/* Rounded cards matching iOS border-radius token (10px) */
+.tab-btn, .agent-card, .room-card {
+    border-radius: 10px;
+}
+"""

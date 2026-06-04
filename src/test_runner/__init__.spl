@@ -1,0 +1,388 @@
+# Test Runner Module
+#
+# Modern test execution framework for Simple language.
+# Supports multiple modes (interpreter, SMF, native), coverage tracking,
+# and integration with the unified test/feature database.
+#
+# Public API:
+#   - use app.test_runner_new.test_runner_main.{run_tests}
+#   - use app.test_runner_new.test_db_migrate.{run_migration_cli, validate_databases}
+#   - use app.test_runner_new.test_db_perf.{run_benchmarks}
+#
+# Internal Components:
+#   - Test discovery and execution (test_runner_*)
+#   - Database integration (test_db_*)
+#   - Documentation generation (doc_generator, doctest_runner)
+#   - Coverage tracking (test_runner_coverage)
+#   - Rust test integration (rust_test_runner)
+#   - SDoc test framework (sdoctest)
+
+# All submodules are automatically available through the module system.
+# The test runner is transitioning to use std.database.feature for
+# unified test/feature tracking.
+
+# Re-exported from checkpoint.spl
+export Checkpoint
+export make_empty_checkpoint
+export checkpoint_save
+export checkpoint_load
+export checkpoint_exists
+export checkpoint_delete
+export checkpoint_skip_completed
+
+# Re-exported from doc_generator.spl
+export generate_test_result_md, generate_feature_md
+export generate_pending_feature_md, generate_category_md
+export generate_all_docs
+
+# Re-exported from doctest_runner.spl
+export Doctest, extract_doctests, extract_md_doctests, discover_md_doctests
+export run_doctests, run_md_doctests
+export build_spl_doctest_code, run_spl_doctests_same_file, discover_spl_doctest_files
+
+# Re-exported from execution_strategy.spl
+export ExecutionMode
+export ExecutionStrategy
+export categorize_test_file
+export strategy_auto_select
+export strategy_from_mode
+
+# Re-exported from main.spl
+export TestExecutionMode, TestLevel, OutputFormat
+export TestOptions, TestFileResult, TestRunResult
+export SkipFeatureStatus, SkipFeatureInfo
+export parse_mode_str, parse_test_args
+export discover_test_files, shuffle_files
+export extract_skip_feature_info, file_has_slow_test
+export print_discovery_summary, is_test_file, strip_ansi, read_file_content
+export find_simple_new_binary, find_runtime_lib_dir, find_simple_binary
+export parse_test_output, extract_number_before
+export build_child_args, make_result_from_output
+export run_test_file_interpreter, run_test_file_smf
+export run_test_file_native_old, run_test_file_native
+export preprocess_spipe_file
+export run_test_file_safe_mode
+export list_tests_static
+export print_result_default, print_result_doc
+export print_result, print_summary
+export TestDatabase  # From test_db_compat (wraps lib.database.test_extended)
+export FeatureDatabase, Feature, FeatureStatus  # From lib.database.feature
+export ValidationIssue, validate_database
+export needs_qualification, count_unqualified_ignores
+export TestConfig, find_config_file
+export generate_all_docs
+export extract_doctests, run_doctests
+export run_rust_tests, run_rust_doc_tests
+export SdoctestConfig, SdoctestBlock, SdoctestRunResult
+export load_sdoctest_config, run_sdoctest_mode, print_sdoctest_summary
+export extract_sdoctest_blocks, discover_sdoctest_files
+export write_sdoctest_db, generate_sdoctest_report
+export glob_match_path
+export FileCoverage, CoverageData
+export setup_coverage, collect_coverage
+export print_coverage_summary, generate_coverage_reports
+export check_coverage_threshold, get_coverage_threshold
+export save_coverage_baseline, load_coverage_baseline, print_coverage_delta
+export propagate_env_vars, run_tests, mode_to_str, run_single_test
+export main
+export ExecutionMode, ExecutionStrategy
+export categorize_test_file, strategy_auto_select, strategy_from_mode
+export SequentialContainerConfig
+export sequential_container_run_test, sequential_container_run_all_tests
+
+# Re-exported from process_tracker.spl
+export tracker_register_pid
+export tracker_get_pids
+export tracker_unregister_pid
+export tracker_protect_pid
+export tracker_unprotect_pid
+export tracker_clear
+export tracker_register_container
+export tracker_get_containers
+export tracker_unregister_container
+export tracker_kill_all_children
+export tracker_stop_all_containers
+export is_docker_available
+export get_running_containers
+export tracker_enable_heartbeat
+export tracker_send_heartbeat
+export tracker_check_heartbeat_alive
+
+# Re-exported from qemu_test_runner.spl
+export run_qemu_test_group, run_qemu_tests_all
+
+# Re-exported from resource_governor.spl
+export ResourceGovernor
+export governor_create, governor_can_spawn, governor_wait_until_ready
+
+# Re-exported from runner_lifecycle.spl
+export spawn_tracked_process
+export untrack_process
+export run_tracked_container
+export stop_tracked_container
+export cleanup_all_children
+export cleanup_and_exit
+export lifecycle_enable_heartbeat
+export lifecycle_send_heartbeat
+export lifecycle_check_parent_alive
+export cleanup_orphaned_processes
+export cleanup_orphaned_containers
+
+# Re-exported from rust_test_runner.spl
+export RustTestResult
+export run_rust_tests, run_rust_tests_crate
+export run_rust_doc_tests, run_rust_doc_tests_crate
+export list_ignored_rust_tests
+export parse_cargo_test_output
+export update_rust_test_database
+
+# Re-exported from sequential_container.spl
+export SequentialContainerConfig
+export sequential_container_run_test
+export sequential_container_run_all_tests
+export sequential_container_cleanup
+
+# Re-exported from shutdown.spl
+export EXIT_SUCCESS
+export EXIT_FAILURE
+export EXIT_RESOURCE_SHUTDOWN
+export EXIT_RECOVERY_FAILED
+export shutdown_graceful
+export shutdown_format_summary
+
+# Re-exported from string_interner.spl
+export StringInterner
+export escape_sdn_string, unescape_sdn_string
+
+# Re-exported from system_monitor.spl
+export SystemResources
+export get_system_resources
+export get_system_cpu_percent
+export get_system_memory_percent
+export system_exceeds_threshold
+export get_system_free_memory_gb
+export system_free_memory_low
+export ensure_kill_monitor_running
+export is_linux
+
+# Re-exported from test_classification.spl
+export SESSION_READ_ONLY, SESSION_MUTATING, SESSION_DESTRUCTIVE, SESSION_NOT_QEMU
+export TestClassification
+export classify_test, group_by_session, separate_qemu_tests
+
+# Re-exported from test_config.spl
+export TestConfig, CONFIG_FILENAME, find_config_file
+
+# Re-exported from test_db_compat.spl
+export TestDatabase, load_test_db_compat
+export RunRecord, TestInfo
+export micros_to_rfc3339, parse_rfc3339_to_micros
+
+# Re-exported from test_db_core.spl
+export TestDatabase
+export micros_to_rfc3339, parse_rfc3339_to_micros
+
+# Re-exported from test_db_io.spl
+export DB_PATH, RUNS_PATH, LOCK_TIMEOUT, MAX_FILE_SIZE
+export read_db_file, write_db_file_locked, update_db_file
+
+# Re-exported from test_db_lock.spl
+export FileLock
+
+# Re-exported from test_db_parser.spl
+export ParsedStableDb, ParsedVolatileDb
+export parse_stable_db, parse_volatile_db
+export parse_fields, detect_table
+
+# Re-exported from test_db_serializer.spl
+export serialize_stable_db, serialize_volatile_db
+
+# Re-exported from test_db_types.spl
+export TestStatus, ChangeType
+export FileRecord, SuiteRecord, TestRecord
+export CounterRecord, TimingSummary, TimingRun, ChangeEvent, RunRecord
+export IndividualTestResult, TestFailure, TimingConfig
+export status_to_str, str_to_status, change_type_str, is_flaky_change
+
+# Re-exported from test_db_validation.spl
+export ValidationIssue, ValidationReport
+export validate_database, validate_interner_bounds
+export validate_count_consistency, validate_stale_runs
+export validate_run_record, process_exists
+export needs_qualification, count_unqualified_ignores
+export print_validation_warnings
+
+# Re-exported from test_executor_composite.spl
+export run_test_file_composite
+export extract_base_runtime, extract_platform_layer, extract_arch_from_spec
+export extract_target_from_spec, extract_remote_backend
+export run_test_file_baremetal, run_test_file_remote
+export run_test_file_baremetal_via_interpreter, run_test_file_baremetal_qemu, run_test_file_baremetal_ghdl
+export find_baremetal_elf, qemu_binary_for_arch, qemu_machine_for_arch
+export run_test_file_jit_ch32v307
+
+# Re-exported from test_executor_parsing.spl
+export find_simple_new_binary, find_runtime_lib_dir, find_simple_binary
+export parse_test_output, extract_number_before, extract_number_after_colon
+export extract_error_message
+export build_child_args, make_result_from_output
+export coverage_wrapper_suffix, build_coverage_wrapper
+export extract_coverage_sdn, strip_coverage_blocks
+export COVERAGE_BEGIN, COVERAGE_END
+export list_tests_static, extract_static_test_name
+
+# Re-exported from test_manifest.spl
+export TestManifestEntry, SdoctestManifestEntry, TestManifest
+export MANIFEST_VERSION, MANIFEST_PATH, MANIFEST_TTL_MICROS
+export manifest_new, manifest_is_fresh, manifest_is_fresh_with_ttl
+export manifest_save, manifest_load
+export manifest_find_entry, manifest_find_sdoctest
+export parse_manifest_entry, parse_sdoctest_entry
+
+# Re-exported from test_manifest_scanner.spl
+export manifest_full_scan, manifest_incremental_update
+export scan_test_file, scan_sdoctest_file
+export is_spec_file, is_sdoctest_candidate
+export detect_test_level, extract_tags, extract_platform_tags, count_sdoctest_blocks
+
+# Re-exported from test_result_cache.spl
+export TestCacheEntry, TestResultCache
+export test_result_cache_new, test_result_cache_load
+export stale_entry
+
+# Re-exported from test_dep_graph.spl
+export TestDepGraph
+export test_dep_graph_new
+
+# Re-exported from test_runner_args.spl
+export parse_mode_str
+export parse_test_args
+
+# Re-exported from test_runner_async.spl
+export AsyncTestRun
+export create_temp_files
+export cleanup_temp_files
+export spawn_async_test
+export collect_async_result
+export wait_for_any_process
+export run_tests_parallel
+export run_tests_parallel_with_monitoring
+export get_cpu_count
+
+# Re-exported from test_runner_config.spl
+export get_cli_args, propagate_env_vars, mode_to_str
+export get_flag_value, has_run_management_flag, handle_run_management
+export report_free_mem
+
+# Re-exported from test_runner_container.spl
+export container_detect_runtime
+export container_check_image
+export container_run_test
+export container_build_test_image
+export container_get_version
+export container_cleanup_volumes
+
+# Re-exported from test_runner_coverage.spl
+export FileCoverage, CoverageData
+export setup_coverage, collect_coverage
+export print_coverage_summary, generate_coverage_reports
+export parse_coverage_sdn, sort_files_by_coverage
+export record_coverage_sdn
+export check_coverage_threshold, get_coverage_threshold
+export save_coverage_baseline, load_coverage_baseline, print_coverage_delta
+export reset_coverage_state, decision_key, condition_key
+export merge_counts, parse_i64_safe
+export accumulate_coverage_sdn, build_coverage_data_from_state
+export render_coverage_sdn, find_or_add_file
+
+# Re-exported from test_runner_db.spl
+export write_test_db_run
+export atomic_update_file_test_db
+export acquire_file_lock
+export micros_to_iso
+
+# Re-exported from test_runner_execute.spl
+export find_simple_new_binary, find_runtime_lib_dir, find_simple_binary
+export parse_test_output, extract_number_before, extract_number_after_colon
+export build_child_args, make_result_from_output
+export list_tests_static, extract_static_test_name
+export run_test_file_composite
+export extract_base_runtime, extract_platform_layer, extract_arch_from_spec
+export extract_target_from_spec, extract_remote_backend
+export run_test_file_baremetal, run_test_file_remote
+export run_test_file_baremetal_via_interpreter, run_test_file_baremetal_qemu, run_test_file_baremetal_ghdl
+export find_baremetal_elf, qemu_binary_for_arch, qemu_machine_for_arch
+export run_test_file_interpreter, run_test_file_smf
+export run_test_file_native_old, run_test_file_native
+export preprocess_spipe_file
+export run_test_file_safe_mode
+
+# Re-exported from test_runner_files.spl
+export strip_ansi
+export is_test_file, is_skip_marker_file, matches_level
+export read_file_content
+export file_has_slow_test, file_has_skip_tag, file_has_ignored_test, file_has_tag, count_skip_marker_cases
+export file_get_platform_tags, platform_tag_matches
+export discover_test_files, discover_test_files_fast, discover_test_files_slow
+export save_manifest_from_discovery
+export simple_hash, shuffle_files
+export extract_skip_feature_info, print_skip_features
+export print_discovery_summary
+
+# Re-exported from test_runner_fork.spl
+export run_test_file_fork
+
+# Re-exported from test_runner_helpers.spl
+export parse_individual_results, extract_pending_test_name, extract_test_name
+export categorize_test_file
+export display_closure_warnings, display_call_graph_warnings
+export update_test_database, update_features_from_tests
+
+# Re-exported from test_runner_main.spl
+export run_tests, run_single_test
+export main
+
+# Re-exported from test_runner_modes.spl
+export run_spl_doctest_mode, run_combined_mode
+export run_tests_parallel_mode, run_tests_sequential_containers
+export categorize_test_file
+export display_closure_warnings, display_call_graph_warnings
+export update_test_database, update_features_from_tests
+
+# Re-exported from test_runner_output.spl
+export print_result_default, print_result_doc
+export print_result, print_summary
+
+# Re-exported from test_runner_resources.spl
+export ResourceLimits
+export default_resource_limits, resource_limits_for_slow_tests, resource_limits_disabled
+export monitor_test_execution, record_test_resource_usage
+export format_violation_alert, has_violations
+export generate_resource_summary, count_total_violations
+export format_resource_metrics, append_resource_info_to_output
+
+# Re-exported from test_runner_types.spl
+export TestExecutionMode
+export TestLevel
+export OutputFormat
+export TestOptions
+export TestFileResult
+export TestRunResult
+export SkipFeatureInfo
+export execution_mode_from_string
+export execution_mode_base_runtime
+export execution_mode_is_composite
+export execution_mode_has_layer
+export execution_mode_is_remote
+export execution_mode_is_baremetal
+export execution_mode_is_container
+export execution_mode_target_arch
+export execution_mode_to_string
+
+# Re-exported from test_stats.spl
+export TimingStats, OutlierResult, OutlierMethod
+export compute_statistics, compute_mean, compute_std_dev, sqrt_f64, abs_f64
+export compute_percentiles, percentile_at, sort_f64
+export detect_outliers, detect_outliers_iqr, detect_outliers_mad, detect_outliers_zscore
+export has_regression, has_significant_change
+export detect_flaky_test

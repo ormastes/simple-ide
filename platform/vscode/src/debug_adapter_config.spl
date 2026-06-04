@@ -1,0 +1,118 @@
+"""
+Debug Adapter Configuration for the Simple VSCode Extension.
+
+Declares DAP launch and attach configurations that the TypeScript
+extension host uses to start debug sessions via `bin/simple dap`.
+Mirrors the file-based IPC protocol from `src/app/mcp/dap_bridge.spl`.
+"""
+
+struct DapLaunchConfig:
+    name: text
+    request_type: text
+    program: text
+    args: [text]
+    cwd: text
+    stop_on_entry: bool
+    console_mode: text
+
+struct DapAttachConfig:
+    name: text
+    request_type: text
+    host: text
+    port: i64
+    process_id: i64
+
+struct DapServerConfig:
+    server_path: text
+    args: [text]
+    session_dir: text
+
+struct DebugAdapterConfig:
+    launch_configs: [DapLaunchConfig]
+    attach_configs: [DapAttachConfig]
+    server: DapServerConfig
+
+fn dap_server_path() -> text:
+    "bin/simple"
+
+fn dap_server_args() -> [text]:
+    var args: [text] = []
+    args.push("dap")
+    args.push("--daemon")
+    args
+
+fn dap_session_dir() -> text:
+    ".build/dap_sessions"
+
+fn dap_server_config_create() -> DapServerConfig:
+    DapServerConfig(
+        server_path: dap_server_path(),
+        args: dap_server_args(),
+        session_dir: dap_session_dir()
+    )
+
+fn dap_launch_config_default() -> DapLaunchConfig:
+    """Default launch configuration for running a Simple program."""
+    DapLaunchConfig(
+        name: "Simple: Run Current File",
+        request_type: "launch",
+        program: "",
+        args: [],
+        cwd: "",
+        stop_on_entry: false,
+        console_mode: "integratedTerminal"
+    )
+
+fn dap_launch_config_debug() -> DapLaunchConfig:
+    """Launch config with stop-on-entry for step debugging."""
+    DapLaunchConfig(
+        name: "Simple: Debug Current File",
+        request_type: "launch",
+        program: "",
+        args: [],
+        cwd: "",
+        stop_on_entry: true,
+        console_mode: "integratedTerminal"
+    )
+
+fn dap_launch_config_test() -> DapLaunchConfig:
+    """Launch config for running tests with debugger attached."""
+    DapLaunchConfig(
+        name: "Simple: Debug Tests",
+        request_type: "launch",
+        program: "bin/simple",
+        args: ["test"],
+        cwd: "",
+        stop_on_entry: false,
+        console_mode: "integratedTerminal"
+    )
+
+fn dap_attach_config_default() -> DapAttachConfig:
+    """Default attach configuration for connecting to a running process."""
+    DapAttachConfig(
+        name: "Simple: Attach to Process",
+        request_type: "attach",
+        host: "127.0.0.1",
+        port: 0,
+        process_id: 0
+    )
+
+fn debug_adapter_config_create() -> DebugAdapterConfig:
+    """Create the full debug adapter config with default launch/attach entries."""
+    var launches: [DapLaunchConfig] = []
+    launches.push(dap_launch_config_default())
+    launches.push(dap_launch_config_debug())
+    launches.push(dap_launch_config_test())
+    var attaches: [DapAttachConfig] = []
+    attaches.push(dap_attach_config_default())
+    DebugAdapterConfig(
+        launch_configs: launches,
+        attach_configs: attaches,
+        server: dap_server_config_create()
+    )
+
+fn debug_adapter_config_launch_count(cfg: DebugAdapterConfig) -> i64:
+    cfg.launch_configs.len()
+
+fn debug_adapter_config_attach_count(cfg: DebugAdapterConfig) -> i64:
+    cfg.attach_configs.len()

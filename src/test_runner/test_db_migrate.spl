@@ -1,0 +1,40 @@
+# Test Database Migration — app.test_runner_new.test_db_migrate
+#
+# Provides run_migration_cli() and validate_databases() for use by
+# src/app/cli/test_db_repair.spl.
+
+use app.test_runner_new.test_db_core.{TestDatabase, test_database_load}
+use app.test_runner_new.test_db_validation.{validate_database, ValidationIssue}
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+fn run_migration_cli():
+    """Migrate and repair corrupted test databases.
+
+    Loads both stable (test_db.sdn) and volatile (test_db_runs.sdn) databases,
+    detects structural issues, and rewrites them in the current V3 format.
+    """
+    print "Migrating test databases...\n"
+    val (is_valid, issues) = validate_databases()
+    if is_valid:
+        print "No migration needed — databases are already valid.\n"
+        return
+    print "Found {issues.len()} issue(s). Rewriting databases...\n"
+    val db = test_database_load()
+    db.save()
+    print "Migration complete.\n"
+
+fn validate_databases() -> (bool, [text]):
+    """Validate the test databases and return (is_valid, issue_messages).
+
+    Returns true when both databases pass integrity checks.
+    """
+    val db = test_database_load()
+    val raw_issues = validate_database(db)
+    var messages: [text] = []
+    for issue in raw_issues:
+        messages = messages.push(issue.message)
+    val is_valid = messages.len() == 0
+    (is_valid, messages)

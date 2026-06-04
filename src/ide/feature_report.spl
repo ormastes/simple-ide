@@ -1,0 +1,36 @@
+# IDE feature-check report.
+#
+# Keeps executable sanity checks separate from capability metadata so each probe
+# runs directly against its owning subsystem instead of being precomputed inside
+# the registry.
+
+use app.ide.sheets_compat.{ide_sheet_compat_summary}
+use app.ide.slides_compat.{ide_slide_compat_summary}
+use app.ide.db_admin.{ide_db_admin_summary}
+use app.ide.agent_dashboard.{ide_agent_dashboard_summary}
+use app.ide.markdown_render.{ide_markdown_render_summary}
+use app.ide.launch_sanity.{ide_launch_sanity_summary}
+use app.ide.plugin_manifest.{ide_plugin_manifest_summary}
+use app.ide.gui_sanity.{ide_gui_sanity_summary}
+use app.ide.tui_sanity.{ide_tui_sanity_summary}
+
+fn ide_feature_check_report(mode: text) -> [text]:
+    var lines: [text] = []
+    lines.push("Simple IDE feature check")
+    lines.push("mode: {mode}")
+    lines.push("capabilities: 5")
+    lines.push("markdown: Markdown Preview [document-renderer] -> std.editor.render.md_renderer (md, markdown)")
+    lines.push("  check: " + ide_markdown_render_summary())
+    lines.push("slides: Presentation Slides [office-app] -> app.office.slides (ppt, presentation, slides)")
+    lines.push("  check: " + ide_slide_compat_summary())
+    lines.push("sheets: Spreadsheet [office-app] -> app.office.sheets (excel, xlsx, tabular, csv)")
+    lines.push("  check: " + ide_sheet_compat_summary())
+    lines.push("  gui: " + ide_gui_sanity_summary())
+    lines.push("agent-dashboard: Agent Dashboard [dashboard] -> app.editor.mcp_tools (agent, dashboard, mcp)")
+    lines.push("  check: " + ide_agent_dashboard_summary())
+    lines.push("db-admin: Database Admin [database] -> std.editor.core.session_db (embedded-db, simple-db, portal-db)")
+    lines.push("  check: " + ide_db_admin_summary())
+    lines.push("  tui: " + ide_tui_sanity_summary())
+    lines.push("  launch: " + ide_launch_sanity_summary())
+    lines.push("  plugin-manifest: " + ide_plugin_manifest_summary())
+    return lines

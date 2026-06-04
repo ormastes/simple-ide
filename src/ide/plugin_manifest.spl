@@ -1,0 +1,46 @@
+# IDE plugin manifest adapter.
+#
+# Converts IDE app capabilities into the existing plugin registry manifest
+# shape. This reuses app.plugin.registry parsing/serialization instead of
+# introducing another plugin format for office/IDE app surfaces.
+
+use app.plugin.registry.{PluginEntry, plugin_entry_new, plugin_manifest_to_text, parse_plugin_manifest_text}
+use app.ide.capabilities.{ide_capabilities}
+
+struct IdePluginManifestProbe:
+    entry_count: i64
+    roundtrip_count: i64
+    manifest_text: text
+    names: [text]
+
+fn ide_plugin_entries() -> [PluginEntry]:
+    var entries: [PluginEntry] = []
+    for cap in ide_capabilities():
+        entries.push(plugin_entry_new(
+            name: "ide." + cap.id,
+            library: "builtin:" + cap.owner_module,
+            version: "0.1.0",
+            functions: [
+                "ide_capability_" + cap.id.replace("-", "_"),
+                "ide_feature_check_" + cap.id.replace("-", "_")
+            ]
+        ))
+    entries
+
+fn ide_plugin_manifest_probe() -> IdePluginManifestProbe:
+    val entries = ide_plugin_entries()
+    val text = plugin_manifest_to_text(entries)
+    val parsed = parse_plugin_manifest_text(text)
+    var names: [text] = []
+    for entry in parsed:
+        names.push(entry.name)
+    IdePluginManifestProbe(
+        entry_count: entries.len(),
+        roundtrip_count: parsed.len(),
+        manifest_text: text,
+        names: names
+    )
+
+fn ide_plugin_manifest_summary() -> text:
+    val probe = ide_plugin_manifest_probe()
+    "plugins: entries={probe.entry_count} roundtrip={probe.roundtrip_count} names={probe.names.join(\",\")}"

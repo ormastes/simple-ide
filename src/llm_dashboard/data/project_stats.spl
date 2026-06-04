@@ -1,0 +1,209 @@
+# Project Stats Collector
+#
+# Bridges Simple compiler stats into the LLM dashboard.
+# Collects: file counts, test results, TODO counts, doc coverage,
+# build status, and feature progress from existing dashboard data files.
+
+extern fn rt_rt_file_read_text(path: text) -> text
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_time_now_seconds() -> i64
+
+# =========================================================================
+# Stats Types
+# =========================================================================
+
+struct ProjectStats:
+    total_files: i64
+    total_lines: i64
+    code_lines: i64
+    test_count: i64
+    test_passed: i64
+    test_failed: i64
+    todo_count: i64
+    fixme_count: i64
+    feature_count: i64
+    feature_done: i64
+    doc_coverage_pct: i64
+    last_build_ok: bool
+    last_build_time: text
+    last_updated: i64
+
+fn new_project_stats() -> ProjectStats:
+    ProjectStats(
+        total_files: 0,
+        total_lines: 0,
+        code_lines: 0,
+        test_count: 0,
+        test_passed: 0,
+        test_failed: 0,
+        todo_count: 0,
+        fixme_count: 0,
+        feature_count: 0,
+        feature_done: 0,
+        doc_coverage_pct: 0,
+        last_build_ok: false,
+        last_build_time: "",
+        last_updated: 0
+    )
+
+# =========================================================================
+# Collector — reads from dashboard tracking files
+# =========================================================================
+
+var STATS_CACHE: ProjectStats = new_project_stats()
+var STATS_CACHED = false
+
+fn collect_project_stats(project_dir: text) -> ProjectStats:
+    """Collect project stats from tracking files."""
+    if STATS_CACHED:
+        return STATS_CACHE
+
+    var stats = new_project_stats()
+    stats.last_updated = rt_time_now_seconds()
+
+    # Test results
+    val test_path = project_dir + "/doc/08_tracking/test/test_result.md"
+    if rt_file_exists(test_path):
+        val content = rt_file_read_text(test_path)
+        stats = parse_test_results(stats, content)
+
+    # Build status
+    val build_path = project_dir + "/doc/08_tracking/build/recent_build.md"
+    if rt_file_exists(build_path):
+        val content = rt_file_read_text(build_path)
+        stats = parse_build_status(stats, content)
+
+    # TODO tracking
+    val todo_path = project_dir + "/doc/TODO.md"
+    if rt_file_exists(todo_path):
+        val content = rt_file_read_text(todo_path)
+        stats = parse_todo_counts(stats, content)
+
+    # Feature tracking
+    val feature_path = project_dir + "/doc/06_spec/generated/feature.md"
+    if rt_file_exists(feature_path):
+        val content = rt_file_read_text(feature_path)
+        stats = parse_feature_counts(stats, content)
+
+    # Pending features
+    val pending_path = project_dir + "/doc/06_spec/generated/pending_feature.md"
+    if rt_file_exists(pending_path):
+        val content = rt_file_read_text(pending_path)
+        stats = parse_pending_features(stats, content)
+
+    STATS_CACHE = stats
+    STATS_CACHED = true
+    stats
+
+fn refresh_project_stats(project_dir: text) -> ProjectStats:
+    """Force re-collection."""
+    STATS_CACHED = false
+    collect_project_stats(project_dir)
+
+# =========================================================================
+# Parsers
+# =========================================================================
+
+fn parse_test_results(stats: ProjectStats, content: text) -> ProjectStats:
+    var s = stats
+    val lines = content.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.contains("passed"):
+            s.test_passed = extract_leading_number(trimmed)
+        if trimmed.contains("failed"):
+            s.test_failed = extract_leading_number(trimmed)
+        if trimmed.contains("total"):
+            s.test_count = extract_leading_number(trimmed)
+    if s.test_count == 0 and s.test_passed > 0:
+        s.test_count = s.test_passed + s.test_failed
+    s
+
+fn parse_build_status(stats: ProjectStats, content: text) -> ProjectStats:
+    var s = stats
+    val lines = content.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.contains("SUCCESS") or trimmed.contains("passed") or trimmed.contains("✓"):
+            s.last_build_ok = true
+        if trimmed.contains("FAIL") or trimmed.contains("✗"):
+            s.last_build_ok = false
+        if trimmed.contains("Date:") or trimmed.contains("date:"):
+            val after_colon = trimmed.index_of(":")
+            match after_colon:
+                Some(i):
+                    s.last_build_time = trimmed.slice(i + 1, trimmed.len()).trim()
+                nil:
+                    pass_do_nothing
+    s
+
+fn parse_todo_counts(stats: ProjectStats, content: text) -> ProjectStats:
+    var s = stats
+    val lines = content.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.starts_with("- ") or trimmed.starts_with("| "):
+            if trimmed.contains("TODO"):
+                s.todo_count = s.todo_count + 1
+            if trimmed.contains("FIXME"):
+                s.fixme_count = s.fixme_count + 1
+    s
+
+fn parse_feature_counts(stats: ProjectStats, content: text) -> ProjectStats:
+    var s = stats
+    val lines = content.split("\n")
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.starts_with("- ") or trimmed.starts_with("| "):
+            s.feature_count = s.feature_count + 1
+            if trimmed.contains("✓") or trimmed.contains("done") or trimmed.contains("pass"):
+                s.feature_done = s.feature_done + 1
+    s
+
+fn parse_pending_features(stats: ProjectStats, content: text) -> ProjectStats:
+    var s = stats
+    val lines = content.split("\n")
+    var pending = 0
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.starts_with("- ") or trimmed.starts_with("| "):
+            pending = pending + 1
+    # Pending features are NOT done, add to total
+    s.feature_count = s.feature_count + pending
+    s
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn extract_leading_number(s: text) -> i64:
+    """Extract the first number found in a string."""
+    var digits: [text] = []
+    var found_digit = false
+    for ch in s:
+        if ch >= "0" and ch <= "9":
+            digits.push(ch)
+            found_digit = true
+        elif found_digit:
+            break
+    if digits.len() == 0:
+        return 0
+    digits.join("").to_i64() ?? 0
+
+# =========================================================================
+# Formatting
+# =========================================================================
+
+fn test_pass_rate(stats: ProjectStats) -> i64:
+    """Test pass rate as percentage."""
+    if stats.test_count > 0:
+        (stats.test_passed * 100) / stats.test_count
+    else:
+        0
+
+fn feature_progress_pct(stats: ProjectStats) -> i64:
+    """Feature completion as percentage."""
+    if stats.feature_count > 0:
+        (stats.feature_done * 100) / stats.feature_count
+    else:
+        0

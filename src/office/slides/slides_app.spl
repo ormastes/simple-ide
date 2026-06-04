@@ -1,0 +1,272 @@
+# Simple Slides Application
+#
+# Presentation editor with slide thumbnails, canvas, and speaker notes.
+
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.builder.{column, row, panel, label, text_widget, button, dropdown, scroll, textarea, statusbar, build_tree_with_title, with_flex}
+use common.ui.theme_registry.{ThemeId, theme_id_key}
+use common.ui.ios.builder.{navigation_bar}
+use app.office.slides.slide.{Presentation, Slide, SlideLayout, SlideElement, SlideElementKind, empty_presentation, title_slide, blank_slide, content_slide, add_text_box, slide_count, current_slide}
+use app.office.slides.render.{render_slide_thumbnail, render_slide_canvas}
+use app.office.slides.templates.{apply_template}
+
+# =========================================================================
+# Application Class
+# =========================================================================
+
+class SlidesApp:
+    presentation: Presentation
+    selected_element: text
+    editing_notes: bool
+    modified: bool
+    file_path: text
+
+impl SlidesApp:
+
+    static fn new() -> SlidesApp:
+        """Create a new Slides app with an empty presentation."""
+        return SlidesApp(
+            presentation: empty_presentation("Untitled Presentation"),
+            selected_element: "",
+            editing_notes: false,
+            modified: false,
+            file_path: ""
+        )
+
+    me build_ui() -> UITree:
+        """Build the full Slides editor UI tree."""
+        val pres = me.presentation
+        val total = slide_count(pres)
+        val cur = current_slide(pres)
+        val slide_num = pres.active_slide + 1
+
+        # Navigation bar
+        val present_btn = button("btn_present", "Present", "present")
+        val save_btn = button("btn_save", "Save", "save")
+        val nav = navigation_bar("nav", "Simple Slides", [], [present_btn, save_btn])
+
+        # Toolbar row
+        val add_text_btn = button("btn_add_text", "+Text", "add_text")
+        val add_image_btn = button("btn_add_image", "+Image", "add_image")
+        val add_shape_btn = button("btn_add_shape", "+Shape", "add_shape")
+        val layout_drop = dropdown("layout_dropdown", [
+            "Title Slide", "Title + Content", "Two Column", "Blank", "Section Header"
+        ])
+        val toolbar = row("toolbar", [add_text_btn, add_image_btn, add_shape_btn, layout_drop])
+
+        # Slide thumbnails panel (left sidebar)
+        var thumb_items: [WidgetNode] = []
+        var s_idx: i32 = 0
+        for slide in pres.slides:
+            val thumb_text = render_slide_thumbnail(slide, s_idx)
+            var thumb_label = label("thumb_{s_idx}", thumb_text)
+            if s_idx == pres.active_slide:
+                thumb_label = thumb_label.set_prop("selected", "true")
+            thumb_items.push(thumb_label)
+            s_idx = s_idx + 1
+        val add_slide_btn = button("btn_add_slide", "+ New Slide", "add_slide")
+        thumb_items.push(add_slide_btn)
+        var slide_list = scroll("slide_list", 400, thumb_items)
+        slide_list = with_flex(slide_list, 1)
+
+        # Canvas panel (main area)
+        var canvas_children: [WidgetNode] = []
+        if cur != nil:
+            val widgets = render_slide_canvas(cur)
+            for w in widgets:
+                canvas_children.push(w)
+        else:
+            canvas_children.push(label("canvas_empty", "No slides"))
+        var canvas = panel("canvas", "Slide {slide_num}", canvas_children)
+        canvas = with_flex(canvas, 4)
+
+        # Main row: sidebar + canvas
+        val main_row = row("main_row", [slide_list, canvas])
+
+        # Notes panel
+        val notes_val = if cur != nil: cur.notes else: ""
+        val notes_area = textarea("notes_area", notes_val, "Speaker notes...", 3)
+        val notes_panel = panel("notes_panel", "Notes", [notes_area])
+
+        # Layout name for status
+        val layout_name = if cur != nil: _layout_display_name(cur.layout) else: "None"
+
+        # Status bar
+        val status = statusbar("statusbar",
+            "Slide {slide_num} of {total} | {layout_name}",
+            if me.modified: "Modified" else: "Saved"
+        )
+
+        val root = column("root", [nav, toolbar, main_row, notes_panel, status])
+        return build_tree_with_title(root, "Simple Slides", theme_id_key(ThemeId.IOSLight))
+
+    me handle_event(event: UIEvent):
+        """Handle UI events for the Slides editor."""
+        match event:
+            UIEvent.Action(name):
+                match name:
+                    "add_slide":
+                        me.add_slide(SlideLayout.Blank)
+                    "add_text":
+                        val cur = current_slide(me.presentation)
+                        if cur != nil:
+                            val el_id = "el_{slide_count(me.presentation)}_{cur.elements.len()}"
+                            val updated = add_text_box(cur, el_id, "New Text", 100, 100, 300, 60)
+                            me._replace_current_slide(updated)
+                            me.modified = true
+                    "add_image":
+                        val cur = current_slide(me.presentation)
+                        if cur != nil:
+                            val el = SlideElement(
+                                id: "el_img_{cur.elements.len()}",
+                                kind: SlideElementKind.ImageEl(src: "", alt: "Image Frame"),
+                                x: 100, y: 100,
+                                width: 400, height: 300
+                            )
+                            val updated = _add_element_to_slide(cur, el)
+                            me._replace_current_slide(updated)
+                            me.modified = true
+                    "add_shape":
+                        val cur = current_slide(me.presentation)
+                        if cur != nil:
+                            val el = SlideElement(
+                                id: "el_shape_{cur.elements.len()}",
+                                kind: SlideElementKind.ShapeEl(shape_type: "rectangle", fill_color: "#4A90D9"),
+                                x: 150, y: 150,
+                                width: 200, height: 150
+                            )
+                            val updated = _add_element_to_slide(cur, el)
+                            me._replace_current_slide(updated)
+                            me.modified = true
+                    "delete_slide":
+                        me.delete_slide(me.presentation.active_slide)
+                    "save":
+                        me.modified = false
+                    _:
+                        if name.starts_with("navigate_"):
+                            val idx_str = name.substring(9)
+                            val idx = _parse_int(idx_str)
+                            me.navigate_slide(idx)
+            _:
+                pass_do_nothing("non-action UI events do not affect the slide editor")
+
+    me add_slide(layout: SlideLayout):
+        """Add a new slide with the given layout after the current slide."""
+        val total = slide_count(me.presentation)
+        val new_id = "slide_{total}"
+        val new_slide = apply_template(blank_slide(new_id), layout)
+        var new_slides: [Slide] = []
+        var idx: i32 = 0
+        var inserted = false
+        for s in me.presentation.slides:
+            new_slides.push(s)
+            if idx == me.presentation.active_slide and not inserted:
+                new_slides.push(new_slide)
+                inserted = true
+            idx = idx + 1
+        if not inserted:
+            new_slides.push(new_slide)
+        me.presentation = Presentation(
+            title: me.presentation.title,
+            slides: new_slides,
+            active_slide: me.presentation.active_slide + 1,
+            theme_name: me.presentation.theme_name
+        )
+        me.modified = true
+
+    me delete_slide(index: i32):
+        """Delete the slide at the given index. Keeps at least one slide."""
+        val total = slide_count(me.presentation)
+        if total <= 1:
+            return
+        var new_slides: [Slide] = []
+        var idx: i32 = 0
+        for s in me.presentation.slides:
+            if idx != index:
+                new_slides.push(s)
+            idx = idx + 1
+        val new_active = if index >= new_slides.len(): new_slides.len() - 1 else: index
+        me.presentation = Presentation(
+            title: me.presentation.title,
+            slides: new_slides,
+            active_slide: new_active,
+            theme_name: me.presentation.theme_name
+        )
+        me.modified = true
+
+    me navigate_slide(index: i32):
+        """Navigate to the slide at the given index."""
+        val total = slide_count(me.presentation)
+        if index < 0 or index >= total:
+            return
+        me.presentation = Presentation(
+            title: me.presentation.title,
+            slides: me.presentation.slides,
+            active_slide: index,
+            theme_name: me.presentation.theme_name
+        )
+
+    me _replace_current_slide(updated: Slide):
+        """Replace the current slide with an updated version."""
+        var new_slides: [Slide] = []
+        var idx: i32 = 0
+        for s in me.presentation.slides:
+            if idx == me.presentation.active_slide:
+                new_slides.push(updated)
+            else:
+                new_slides.push(s)
+            idx = idx + 1
+        me.presentation = Presentation(
+            title: me.presentation.title,
+            slides: new_slides,
+            active_slide: me.presentation.active_slide,
+            theme_name: me.presentation.theme_name
+        )
+
+# =========================================================================
+# Module Helpers
+# =========================================================================
+
+fn _add_element_to_slide(slide: Slide, el: SlideElement) -> Slide:
+    """Append an element to a slide and return the updated slide."""
+    var new_elements: [SlideElement] = []
+    for e in slide.elements:
+        new_elements.push(e)
+    new_elements.push(el)
+    return Slide(
+        id: slide.id,
+        layout: slide.layout,
+        elements: new_elements,
+        notes: slide.notes,
+        background: slide.background
+    )
+
+fn _layout_display_name(layout: SlideLayout) -> text:
+    """Human-readable layout name."""
+    match layout:
+        SlideLayout.TitleSlide:
+            return "Title Slide"
+        SlideLayout.TitleContent:
+            return "Title + Content"
+        SlideLayout.TwoColumn:
+            return "Two Column"
+        SlideLayout.Blank:
+            return "Blank"
+        SlideLayout.SectionHeader:
+            return "Section Header"
+
+fn _parse_int(s: text) -> i32:
+    """Parse a non-negative integer from text. Returns 0 on failure."""
+    if s.len() == 0:
+        return 0
+    var result: i32 = 0
+    var i: i32 = 0
+    while i < s.len():
+        val c = s.char_at(i)
+        val code = c.char_code_at(0)
+        if code >= 48 and code <= 57:
+            result = result * 10 + (code - 48)
+        else:
+            return 0
+        i = i + 1
+    return result

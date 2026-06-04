@@ -1,0 +1,71 @@
+# `simple game new <name>` — scaffold a fresh project (AC-7).
+#
+# Creates:
+#   <name>/simple.toml
+#   <name>/src/main.spl  (copy of examples/11_advanced/game2d/hello/main.spl)
+#   <name>/data/game.sdn (default 800x600 60Hz)
+#   <name>/data/assets.sdn (empty assets {})
+#   <name>/asset/.gitkeep
+#   <name>/test/.gitkeep
+#
+# If <name> exists and is non-empty: print error and exit code 2.
+
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_dir_exists(path: text) -> bool
+extern fn rt_dir_create(path: text) -> bool
+extern fn rt_file_write_text(path: text, content: text) -> bool
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_dir_list(path: text) -> [text]
+
+
+fn _ensure_dir(path: text) -> bool:
+    if rt_dir_exists(path):
+        return true
+    rt_dir_create(path)
+
+
+fn _write(path: text, content: text) -> bool:
+    rt_file_write_text(path, content)
+
+
+fn _hello_demo() -> text:
+    if rt_file_exists("examples/11_advanced/game2d/hello/main.spl"):
+        rt_file_read_text("examples/11_advanced/game2d/hello/main.spl")
+    else:
+        "use std.game2d as g\nfn main(): pass_do_nothing\n"
+
+
+fn _default_simple_toml(name: text) -> text:
+    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n[entry]\nmain = \"src/main.spl\"\n"
+
+
+fn _default_game_sdn() -> text:
+    "game:\n  title: \"Hello\"\n  window: { width: 800, height: 600, fullscreen: false, vsync: true }\n  runtime: { fixed_step_hz: 60, deterministic: false }\n  startup_scene: \"main\"\n"
+
+
+fn _default_assets_sdn() -> text:
+    "assets:\n  # add `image PlayerImage = \"asset/player.png\"` etc.\n"
+
+
+fn cmd_new(name: text) -> i64:
+    """Scaffold a new project at <name>/. Exit code 2 if the dir exists
+    and is non-empty.
+    """
+    if rt_dir_exists(name):
+        val entries = rt_dir_list(name)
+        if entries.len() > 0:
+            print "error: directory `{name}` already exists and is non-empty (exit 2)"
+            return 2
+    _ensure_dir(name)
+    _ensure_dir("{name}/src")
+    _ensure_dir("{name}/data")
+    _ensure_dir("{name}/asset")
+    _ensure_dir("{name}/test")
+    _write("{name}/simple.toml", _default_simple_toml(name))
+    _write("{name}/src/main.spl", _hello_demo())
+    _write("{name}/data/game.sdn", _default_game_sdn())
+    _write("{name}/data/assets.sdn", _default_assets_sdn())
+    _write("{name}/asset/.gitkeep", "")
+    _write("{name}/test/.gitkeep", "")
+    print "Created project `{name}/` — `cd {name} && simple game run`"
+    0

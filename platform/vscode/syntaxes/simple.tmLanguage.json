@@ -1,0 +1,234 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Simple",
+  "scopeName": "source.simple",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#math-blocks" },
+    { "include": "#keywords" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#functions" },
+    { "include": "#types" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "math-blocks": {
+      "patterns": [
+        {
+          "name": "meta.block.math.simple",
+          "begin": "\\b(m)\\{",
+          "beginCaptures": {
+            "1": { "name": "keyword.other.math.simple" }
+          },
+          "end": "\\}",
+          "contentName": "markup.math.simple",
+          "patterns": [
+            { "include": "#math-block-content" }
+          ]
+        },
+        {
+          "name": "meta.block.loss.simple",
+          "begin": "\\b(loss)\\{",
+          "beginCaptures": {
+            "1": { "name": "keyword.other.loss.simple" }
+          },
+          "end": "\\}",
+          "contentName": "markup.math.simple",
+          "patterns": [
+            { "include": "#math-block-content" }
+          ]
+        },
+        {
+          "name": "meta.block.nograd.simple",
+          "begin": "\\b(nograd)\\{",
+          "beginCaptures": {
+            "1": { "name": "keyword.other.nograd.simple" }
+          },
+          "end": "\\}",
+          "contentName": "markup.math.simple",
+          "patterns": [
+            { "include": "#math-block-content" }
+          ]
+        }
+      ]
+    },
+    "math-block-content": {
+      "patterns": [
+        {
+          "comment": "Nested braces — consume {…} groups so the block end pattern does not fire prematurely on inner }",
+          "begin": "\\{",
+          "end": "\\}",
+          "beginCaptures": { "0": { "name": "punctuation.section.braces.begin.math.simple" } },
+          "endCaptures":   { "0": { "name": "punctuation.section.braces.end.math.simple" } },
+          "patterns": [
+            { "include": "#math-block-content" }
+          ]
+        },
+        {
+          "name": "support.function.latex.simple",
+          "match": "\\\\(frac|sqrt|sum|prod|int|sin|cos|tan|log|ln|exp|min|max|lim|pi|alpha|beta|gamma|delta|theta|sigma|omega|lambda|mu|phi|psi|nabla|partial|infty|cdot|times|pm|leq|geq|neq|approx|forall|exists|left|right|operatorname)\\b"
+        },
+        {
+          "name": "constant.language.math.simple",
+          "match": "\\b(pi|e|infinity|partial|nabla)\\b"
+        },
+        {
+          "name": "support.function.math.simple",
+          "match": "\\b(sin|cos|tan|tanh|sinh|cosh|log|ln|exp|sqrt|abs|frac|sum|product|integral|min|max|lim|dot|cross|norm|det|trace|diag|softmax|relu|sigmoid)\\b"
+        },
+        {
+          "name": "variable.other.greek.simple",
+          "match": "\\b(alpha|beta|gamma|delta|epsilon|zeta|eta|theta|iota|kappa|lambda|mu|nu|xi|rho|sigma|tau|upsilon|phi|chi|psi|omega|Gamma|Delta|Theta|Lambda|Xi|Pi|Sigma|Phi|Psi|Omega)\\b"
+        },
+        {
+          "name": "keyword.operator.math.simple",
+          "match": "(\\^|@|\\.\\+|\\.\\-|\\.\\*|\\.\\/|\\.\\^|\\.\\.|')"
+        },
+        {
+          "name": "punctuation.separator.comma.math.simple",
+          "match": ","
+        },
+        { "include": "#numbers" }
+      ]
+    },
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.number-sign.simple",
+          "match": "#.*$"
+        },
+        {
+          "name": "comment.block.simple",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.simple",
+          "match": "\\b(if|else|elif|match|case|for|while|loop|break|continue|return)\\b"
+        },
+        {
+          "name": "keyword.other.simple",
+          "match": "\\b(fn|let|class|enum|trait|impl|type|import|export|from|as|pub)\\b"
+        },
+        {
+          "name": "keyword.modifier.simple",
+          "match": "\\b(mut|iso|ref|move|async|await|actor)\\b"
+        },
+        {
+          "name": "keyword.effect.simple",
+          "match": "\\b(effect|io|file|net|unsafe)\\b"
+        },
+        {
+          "name": "constant.language.simple",
+          "match": "\\b(true|false|none|nil|None)\\b"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.simple",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.simple",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.simple",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.simple",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.interpolated.simple",
+          "begin": "f\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "meta.embedded.simple",
+              "begin": "{",
+              "end": "}",
+              "patterns": [
+                { "include": "$self" }
+              ]
+            },
+            {
+              "name": "constant.character.escape.simple",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.simple",
+          "match": "\\b0x[0-9a-fA-F_]+\\b"
+        },
+        {
+          "name": "constant.numeric.binary.simple",
+          "match": "\\b0b[01_]+\\b"
+        },
+        {
+          "name": "constant.numeric.octal.simple",
+          "match": "\\b0o[0-7_]+\\b"
+        },
+        {
+          "name": "constant.numeric.float.simple",
+          "match": "\\b[0-9][0-9_]*\\.[0-9_]+([eE][+-]?[0-9_]+)?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.simple",
+          "match": "\\b[0-9][0-9_]*\\b"
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "name": "entity.name.function.simple",
+          "match": "\\b([a-z_][a-zA-Z0-9_]*)\\s*(?=\\()"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.builtin.simple",
+          "match": "\\b(i8|i16|i32|i64|i128|u8|u16|u32|u64|u128|f32|f64|bool|String|char|void|never)\\b"
+        },
+        {
+          "name": "entity.name.type.simple",
+          "match": "\\b[A-Z][a-zA-Z0-9_]*\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.simple",
+          "match": "(\\+|-|\\*|/|%|==|!=|<|>|<=|>=|and|or|not|&&|\\|\\||!|&|\\||\\^|<<|>>|~|\\?|\\?\\.)"
+        },
+        {
+          "name": "keyword.operator.assignment.simple",
+          "match": "(=|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<=|>>=)"
+        }
+      ]
+    }
+  }
+}

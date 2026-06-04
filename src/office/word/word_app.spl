@@ -1,0 +1,306 @@
+# Simple Word - Document Editor
+#
+# Rich document editor with formatting toolbar, outline sidebar, and iOS-like design.
+
+use common.ui.builder.{column, row, panel, text_widget, label, button, scroll, tree_widget, tree_node, tree_leaf, statusbar, textarea, menubar, with_flex}
+use common.ui.ios.builder.{navigation_bar}
+use common.ui.widget.{UITree, UIEvent, WidgetNode}
+use common.ui.builder.{build_tree_with_title}
+use common.ui.theme_registry.{ThemeId, theme_id_key}
+use common.ui.ios_icons.{ios_icon}
+use common.rich_text.attributed_text.{RichDocument, DocBlock, TextSpan, InlineStyle, empty_document, document_word_count, document_headings, block_to_plain_text, spans_to_plain_text}
+use common.rich_text.editor.{RichTextEditor, TextCursor}
+use common.office.undo.{UndoStack, UndoEntry}
+
+use app.office.word.toolbar.{build_word_toolbar}
+use app.office.word.sidebar.{build_outline_sidebar}
+use app.office.word.render.{render_block, render_document}
+
+# =========================================================================
+# Word Application
+# =========================================================================
+
+class WordApp:
+    editor: RichTextEditor
+    undo_stack: UndoStack
+    sidebar_visible: bool
+    find_query: text
+    file_path: text
+    modified: bool
+
+    static fn new() -> WordApp:
+        """Create a new Word app with an empty untitled document."""
+        val doc = empty_document("Untitled")
+        val editor = RichTextEditor.new(doc)
+        return WordApp(
+            editor: editor,
+            undo_stack: UndoStack.new(100),
+            sidebar_visible: true,
+            find_query: "",
+            file_path: "",
+            modified: false
+        )
+
+    static fn open(path: text, content: text) -> WordApp:
+        """Open a document from a file path and its text content.
+
+        Deserializes the content into a RichDocument by splitting on blank lines
+        into paragraph blocks."""
+        val doc = _deserialize_content(path, content)
+        val editor = RichTextEditor.new(doc)
+        return WordApp(
+            editor: editor,
+            undo_stack: UndoStack.new(100),
+            sidebar_visible: true,
+            find_query: "",
+            file_path: path,
+            modified: false
+        )
+
+    # =====================================================================
+    # UI Building
+    # =====================================================================
+
+    me build_ui() -> UITree:
+        """Build the full iOS-styled document editor UI tree."""
+        val nav = navigation_bar("word_nav", "Simple Word", [], [
+            button("btn_save", ios_icon("doc"), "save")
+        ])
+
+        val toolbar = me.build_toolbar()
+
+        val sidebar = with_flex(me.build_sidebar(), 1)
+        val editor_panel = with_flex(me.build_editor_panel(), 4)
+
+        var main_children: [WidgetNode] = []
+        if me.sidebar_visible:
+            main_children = main_children.push(sidebar)
+        main_children = main_children.push(editor_panel)
+        val main_row = row("word_main", main_children)
+
+        val line = me.current_line()
+        val col = me.editor.cursor.char_offset + 1
+        val wc = me.word_count()
+        val filename = _extract_filename(me.file_path)
+        val status = statusbar("word_status",
+            "Ln {line}, Col {col} | {wc} words | {filename}",
+            if me.modified: "Modified" else: "Saved"
+        )
+
+        val root = column("word_root", [
+            nav,
+            toolbar,
+            main_row,
+            status
+        ])
+
+        return build_tree_with_title(root, "Simple Word", theme_id_key(ThemeId.IOSLight))
+
+    me build_toolbar() -> WidgetNode:
+        """Build the formatting toolbar row."""
+        return build_word_toolbar("word_toolbar")
+
+    me build_sidebar() -> WidgetNode:
+        """Build the document outline sidebar from headings."""
+        return build_outline_sidebar(me.editor.doc)
+
+    me build_editor_content() -> [WidgetNode]:
+        """Return a list of text widgets, one per document block."""
+        return render_document(me.editor.doc.blocks)
+
+    me build_editor_panel() -> WidgetNode:
+        """Build the scrollable editor content area."""
+        val block_widgets = me.build_editor_content()
+        val scrollable = scroll("word_editor_scroll", 800, block_widgets)
+        return panel("word_editor", "Document", [scrollable])
+
+    # =====================================================================
+    # Event Handling
+    # =====================================================================
+
+    me handle_event(event: UIEvent):
+        """Dispatch UI events to the appropriate handler."""
+        match event:
+            case UIEvent.Action(name):
+                me._handle_action(name)
+            _:
+                pass_do_nothing("non-action UI events do not affect the word app")
+
+    me _handle_action(action: text):
+        """Route named actions from toolbar and sidebar buttons."""
+        match action:
+            "format_bold" =>
+                me._push_undo("Bold")
+                me.editor.apply_style_to_block(InlineStyle.Bold)
+                me.modified = true
+            "format_italic" =>
+                me._push_undo("Italic")
+                me.editor.apply_style_to_block(InlineStyle.Italic)
+                me.modified = true
+            "format_underline" =>
+                me._push_undo("Underline")
+                me.editor.apply_style_to_block(InlineStyle.Underline)
+                me.modified = true
+            "format_h1" =>
+                me._push_undo("Heading 1")
+                me.editor.set_heading_level(1)
+                me.modified = true
+            "format_h2" =>
+                me._push_undo("Heading 2")
+                me.editor.set_heading_level(2)
+                me.modified = true
+            "format_h3" =>
+                me._push_undo("Heading 3")
+                me.editor.set_heading_level(3)
+                me.modified = true
+            "format_bullet_list" =>
+                me._push_undo("Bullet List")
+                me.editor.convert_to_bullet_list()
+                me.modified = true
+            "format_quote" =>
+                me._push_undo("Quote")
+                me.editor.convert_to_quote()
+                me.modified = true
+            "toggle_sidebar" =>
+                me.sidebar_visible = not me.sidebar_visible
+            "undo" =>
+                val snapshot = me.undo_stack.undo()
+                if val Some(before_snapshot) = snapshot:
+                    val doc = _deserialize_content(me.file_path, before_snapshot)
+                    me.editor = RichTextEditor.new(doc)
+                    me.modified = true
+            "redo" =>
+                val snapshot = me.undo_stack.redo()
+                if val Some(after_snapshot) = snapshot:
+                    val doc = _deserialize_content(me.file_path, after_snapshot)
+                    me.editor = RichTextEditor.new(doc)
+                    me.modified = true
+            "save" =>
+                me.modified = false
+            case _("unknown word actions are handled as optional block navigation"):
+                if action.starts_with("goto_block_"):
+                    val idx_str = action.slice(11, action.len())
+                    val idx = _parse_int(idx_str)
+                    me.editor.move_to_block(idx)
+
+    me _push_undo(description: text):
+        """Push the current document state onto the undo stack before a mutation."""
+        val before = me.editor.serialize()
+        me.undo_stack.push(UndoEntry(
+            id: "{me.undo_stack.position + 1}",
+            description: description,
+            before_snapshot: before,
+            after_snapshot: ""
+        ))
+
+    # =====================================================================
+    # Queries
+    # =====================================================================
+
+    me save() -> text:
+        """Serialize the current document to text for saving."""
+        return me.editor.serialize()
+
+    me word_count() -> i32:
+        """Return the total word count of the document."""
+        return document_word_count(me.editor.doc)
+
+    me current_line() -> i32:
+        """Return the current cursor line (1-based)."""
+        return me.editor.cursor.block_index + 1
+
+# =========================================================================
+# Internal Helpers
+# =========================================================================
+
+fn _extract_filename(path: text) -> text:
+    """Extract the filename from a path, or return 'Untitled' if empty."""
+    if path == "":
+        return "Untitled"
+    var last_sep = -1
+    var i = 0
+    for ch in path:
+        if ch == "/" or ch == "\\":
+            last_sep = i
+        i = i + 1
+    if last_sep >= 0 and last_sep + 1 < path.len():
+        return path.slice(last_sep + 1, path.len())
+    return path
+
+fn _deserialize_content(path: text, content: text) -> RichDocument:
+    """Deserialize text content into a RichDocument.
+
+    Format: first line 'title: ...' sets the title, remaining non-empty
+    lines become paragraph blocks. Blank lines are skipped."""
+    var title = _extract_filename(path)
+    val lines = content.split("\n")
+    var blocks: [DocBlock] = []
+    var first_line = true
+
+    for line in lines:
+        if first_line:
+            first_line = false
+            if line.starts_with("title: "):
+                title = line.slice(7, line.len())
+                continue
+        val trimmed = line.trim()
+        if trimmed == "":
+            continue
+        if trimmed.starts_with("### "):
+            val heading_text = trimmed.slice(4, trimmed.len())
+            val span = TextSpan(content: heading_text, styles: [])
+            blocks = blocks.push(DocBlock.Heading(level: 3, spans: [span]))
+        elif trimmed.starts_with("## "):
+            val heading_text = trimmed.slice(3, trimmed.len())
+            val span = TextSpan(content: heading_text, styles: [])
+            blocks = blocks.push(DocBlock.Heading(level: 2, spans: [span]))
+        elif trimmed.starts_with("# "):
+            val heading_text = trimmed.slice(2, trimmed.len())
+            val span = TextSpan(content: heading_text, styles: [])
+            blocks = blocks.push(DocBlock.Heading(level: 1, spans: [span]))
+        elif trimmed.starts_with("- "):
+            val item_text = trimmed.slice(2, trimmed.len())
+            val item_span = TextSpan(content: item_text, styles: [])
+            blocks = blocks.push(DocBlock.BulletList(items: [[item_span]]))
+        elif trimmed.starts_with("> "):
+            val quote_text = trimmed.slice(2, trimmed.len())
+            val inner_span = TextSpan(content: quote_text, styles: [])
+            val inner_block = DocBlock.Paragraph(spans: [inner_span])
+            blocks = blocks.push(DocBlock.Quote(blocks: [inner_block]))
+        elif trimmed == "---":
+            blocks = blocks.push(DocBlock.HorizontalRule)
+        else:
+            val span = TextSpan(content: trimmed, styles: [])
+            blocks = blocks.push(DocBlock.Paragraph(spans: [span]))
+
+    if blocks.len() == 0:
+        val empty_span = TextSpan(content: "", styles: [])
+        blocks = blocks.push(DocBlock.Paragraph(spans: [empty_span]))
+
+    return RichDocument(title: title, blocks: blocks, metadata: {})
+
+fn _parse_int(s: text) -> i32:
+    """Parse a simple non-negative integer from a string. Returns 0 on failure."""
+    var result = 0
+    for ch in s:
+        if ch >= "0" and ch <= "9":
+            val digit = _char_digit(ch)
+            result = result * 10 + digit
+        else:
+            return result
+    return result
+
+fn _char_digit(ch: text) -> i32:
+    """Convert a single digit character to its integer value."""
+    match ch:
+        "0" => return 0
+        "1" => return 1
+        "2" => return 2
+        "3" => return 3
+        "4" => return 4
+        "5" => return 5
+        "6" => return 6
+        "7" => return 7
+        "8" => return 8
+        "9" => return 9
+        _ => return 0

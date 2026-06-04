@@ -1,0 +1,472 @@
+# SDoctest Runner
+#
+# Executes extracted code blocks as subprocess tests.
+# Prepends init script content, sets up environment, enforces timeouts.
+
+use std.io.{file_read, file_exists, file_atomic_write, file_remove}
+use std.io.{process_run}
+use std.io.{env_set}
+use std.io.{time_now_unix_micros}
+use std.sffi.cli.{cli_get_args}
+use nogc_sync_mut.platform.{get_host_os, get_host_arch}
+use std.test_runner.test_runner_types.TestOptions
+use std.test_runner.sdoctest.types.{BlockResult, BlockStatus, SdoctestBlock, SdoctestConfig, SdoctestFileResult, SdoctestRunResult}
+use std.test_runner.sdoctest.config.{find_init_script_file, find_env_timeout, find_env_vars, find_env_run_config}
+use std.test_runner.sdoctest.extractor.{extract_sdoctest_blocks, extract_reusable_lines}
+use std.test_runner.sdoctest.discovery.{discover_sdoctest_files, is_tag_ignored}
+
+# =========================================================================
+# Top-Level Orchestrator
+# =========================================================================
+
+fn run_sdoctest_mode(options: TestOptions, config: SdoctestConfig) -> SdoctestRunResult:
+    val cli_path = if options.path != "test/": options.path else: ""
+    val files = discover_sdoctest_files(config, cli_path)
+
+    if options.list:
+        print_sdoctest_list(files, config)
+        return SdoctestRunResult(files: [], total: 0, passed: 0, failed: 0, skipped: 0, errors: 0, accepted: 0, duration_ms: 0)
+
+    if files.len() == 0:
+        print "No sdoctest files found."
+        return SdoctestRunResult(files: [], total: 0, passed: 0, failed: 0, skipped: 0, errors: 0, accepted: 0, duration_ms: 0)
+
+    print "SDoctest: Running code blocks from {files.len()} file(s)..."
+    print ""
+
+    val run_start = time_now_unix_micros()
+    var file_results: [SdoctestFileResult] = []
+    var total = 0
+    var passed = 0
+    var failed = 0
+    var skipped = 0
+    var errors = 0
+    var accepted = 0
+
+    for file_path in files:
+        val file_result = run_sdoctest_file(file_path, config, options)
+        print_file_result(file_result)
+
+        total = total + file_result.total
+        passed = passed + file_result.passed
+        failed = failed + file_result.failed
+        skipped = skipped + file_result.skipped
+        errors = errors + file_result.errors
+        accepted = accepted + file_result.accepted
+        file_results.push(file_result)
+
+        if options.fail_fast and (file_result.failed > 0 or file_result.errors > 0):
+            print ""
+            print "Stopping early (--fail-fast)"
+            break
+
+    val run_end = time_now_unix_micros()
+    val duration_ms = (run_end - run_start) / 1000
+
+    SdoctestRunResult(
+        files: file_results,
+        total: total,
+        passed: passed,
+        failed: failed,
+        skipped: skipped,
+        errors: errors,
+        accepted: accepted,
+        duration_ms: duration_ms
+    )
+
+# =========================================================================
+# Per-File Execution
+# =========================================================================
+
+fn run_sdoctest_file(file_path: text, config: SdoctestConfig, options: TestOptions) -> SdoctestFileResult:
+    val all_blocks = extract_sdoctest_blocks(file_path)
+    # Ignored blocks are completely invisible — excluded from totals and results
+    var blocks: [SdoctestBlock] = []
+    for b in all_blocks:
+        if not b.has_modifier_ignore():
+            blocks.push(b)
+
+    if blocks.len() == 0:
+        return SdoctestFileResult(
+            source_file: file_path,
+            blocks: [],
+            total: 0, passed: 0, failed: 0, skipped: 0, errors: 0, accepted: 0, duration_ms: 0
+        )
+
+    var block_results: [BlockResult] = []
+    var file_passed = 0
+    var file_failed = 0
+    var file_skipped = 0
+    var file_errors = 0
+    var file_accepted = 0
+    var file_duration = 0
+
+    # Resolve the default env from source config or CLI override
+    val default_env_name = if options.sdoctest_env != "": options.sdoctest_env else: "default"
+
+    # Build accumulated preambles for block sharing
+    val preambles = build_file_preambles(blocks)
+
+    var block_idx = 0
+    for block in blocks:
+        val preamble = if block_idx < preambles.len(): preambles[block_idx] else: ""
+        block_idx = block_idx + 1
+        var result = run_sdoctest_block(
+            block,
+            config,
+            default_env_name: default_env_name,
+            options,
+            preamble: preamble
+        )
+
+        # fail-as-success: convert Failed → Passed (but not Error — that's infra)
+        # Triggered by per-block :fail_as_success fence modifier
+        val block_fail_as_success = block.has_modifier_fail_as_success()
+        if block_fail_as_success and result.status == BlockStatus.Failed:
+            result = BlockResult(
+                block: result.block, status: BlockStatus.Passed,
+                duration_ms: result.duration_ms, stdout: result.stdout, stderr: result.stderr,
+                error: "accepted (fail-as-success)"
+            )
+            file_accepted = file_accepted + 1
+
+        match result.status:
+            case BlockStatus.Passed: file_passed = file_passed + 1
+            case BlockStatus.Failed: file_failed = file_failed + 1
+            case BlockStatus.Skipped: file_skipped = file_skipped + 1
+            case BlockStatus.Error: file_errors = file_errors + 1
+        file_duration = file_duration + result.duration_ms
+        block_results.push(result)
+
+        if options.fail_fast and (result.status == BlockStatus.Failed or result.status == BlockStatus.Error):
+            break
+
+    SdoctestFileResult(
+        source_file: file_path,
+        blocks: block_results,
+        total: blocks.len(),
+        passed: file_passed,
+        failed: file_failed,
+        skipped: file_skipped,
+        errors: file_errors,
+        accepted: file_accepted,
+        duration_ms: file_duration
+    )
+
+# =========================================================================
+# Block Accumulation - Preamble Building
+# =========================================================================
+
+fn build_file_preambles(blocks: [SdoctestBlock]) -> [text]:
+    # Build accumulated preambles for each block.
+    # Block N gets reusable definitions (use, struct, class, enum, fn, impl)
+    # extracted from blocks 0..N-1.
+    var preambles: [text] = []
+    var acc_parts: [text] = []
+
+    for block in blocks:
+        # This block's preamble is whatever we've accumulated so far
+        preambles.push(acc_parts.join("\n"))
+
+        # Extract reusable lines from this block and add to accumulator
+        val reusable = extract_reusable_lines(block.code)
+        if reusable != "":
+            acc_parts.push(reusable)
+
+    preambles
+
+
+# =========================================================================
+# Binary Discovery
+# =========================================================================
+
+fn find_sdoctest_binary() -> text:
+    # Prefer the currently running executable — subprocess sdoctests should use
+    # the same binary that invoked the test runner (self-hosted consistency).
+    val args = cli_get_args()
+    if args.len() > 0:
+        val self_exe = args[0]
+        if self_exe != "" and file_exists(self_exe):
+            return self_exe
+
+    # Fallback: try known locations, preferring bin/simple and platform-specific
+    # release paths before the flat legacy path.
+    var candidates: [text] = [
+        "bin/simple",
+        "./bin/simple"
+    ]
+    for candidate in platform_binary_candidates():
+        candidates.push(candidate)
+    candidates.push("release/simple-0.4.0-beta/bin/simple")
+    for candidate in candidates:
+        if file_exists(candidate):
+            return candidate
+    "bin/simple"
+
+fn platform_binary_candidates() -> [text]:
+    val os = get_host_os()
+    val arch = get_host_arch()
+    if os == "windows":
+        if arch == "aarch64":
+            [
+                "bin/release/aarch64-pc-windows-msvc/simple.exe",
+                "bin/release/aarch64-pc-windows-gnu/simple.exe"
+            ]
+        else:
+            [
+                "bin/release/x86_64-pc-windows-msvc/simple.exe",
+                "bin/release/x86_64-pc-windows-gnu/simple.exe"
+            ]
+    elif os == "macos":
+        if arch == "aarch64":
+            [
+                "bin/release/aarch64-apple-darwin-macho/simple",
+                "bin/release/macos-arm64/simple",
+                "bin/release/darwin-aarch64/simple"
+            ]
+        else:
+            [
+                "bin/release/macos-x86_64/simple",
+                "bin/release/darwin-x86_64/simple"
+            ]
+    else:
+        if arch == "aarch64":
+            [
+                "bin/release/linux-aarch64/simple",
+                "bin/release/aarch64-unknown-linux-gnu/simple"
+            ]
+        else:
+            [
+                "bin/release/linux-x86_64/simple",
+                "bin/release/x86_64-unknown-linux-gnu/simple"
+            ]
+
+# =========================================================================
+# Per-Block Execution
+# =========================================================================
+
+fn run_sdoctest_block(block: SdoctestBlock, config: SdoctestConfig, default_env_name: text, options: TestOptions, preamble: text) -> BlockResult:
+    # Check if block should be skipped
+    if block.has_modifier_skip():
+        return BlockResult(
+            block: block, status: BlockStatus.Skipped,
+            duration_ms: 0, stdout: "", stderr: "", error: ""
+        )
+
+    # Check tag ignore
+    val tags = block.get_tags()
+    if is_tag_ignored(tags, config.ignore):
+        return BlockResult(
+            block: block, status: BlockStatus.Skipped,
+            duration_ms: 0, stdout: "", stderr: "", error: "tag ignored"
+        )
+
+    # Note: auto-skip removed — async, spawn, macro etc. are working features.
+    # If a block fails, it reports as Failed, not a crash.
+
+    # Resolve environment
+    val env_name = if block.get_env_name() != "": block.get_env_name() else: default_env_name
+    val timeout = find_env_timeout(config, env_name)
+    val env_vars = find_env_vars(config, env_name)
+    for (k, v) in env_vars:
+        env_set(k, v)
+
+    # Build code with init script and preamble prepended
+    val code = build_temp_code(block, config, preamble)
+
+    # Write temp file
+    val temp_path = "/tmp/sdoctest_block_{block.line_number}.spl"
+    file_atomic_write(temp_path, code)
+
+    # Run subprocess using process_run (process_run_timeout has arg-passing bug)
+    val binary = find_sdoctest_binary()
+    # Block-level @modifier takes priority over env-level run-config
+    val block_run_config = block.get_run_config()
+    val run_config = if block_run_config != "": block_run_config else: find_env_run_config(config, env_name)
+    val run_args = if run_config != "":
+        ["--run-config={run_config}", temp_path]
+    else:
+        [temp_path]
+    val start = time_now_unix_micros()
+    val run_result = process_run(binary, run_args)
+    val stdout = run_result.0
+    val stderr = run_result.1
+    val exit_code = run_result.2
+    val end = time_now_unix_micros()
+    val duration_ms = (end - start) / 1000
+
+    # Cleanup temp file
+    file_remove(temp_path)
+
+    # Determine status
+    val should_fail = block.has_modifier_should_fail()
+
+    if exit_code == -1:
+        return BlockResult(
+            block: block, status: BlockStatus.Error,
+            duration_ms: duration_ms, stdout: stdout, stderr: stderr,
+            error: "TIMEOUT after {timeout}ms"
+        )
+
+    if should_fail:
+        if exit_code != 0:
+            return BlockResult(
+                block: block, status: BlockStatus.Passed,
+                duration_ms: duration_ms, stdout: stdout, stderr: stderr, error: ""
+            )
+        else:
+            return BlockResult(
+                block: block, status: BlockStatus.Failed,
+                duration_ms: duration_ms, stdout: stdout, stderr: stderr,
+                error: "Expected failure but block succeeded"
+            )
+
+    if exit_code == 0:
+        BlockResult(
+            block: block, status: BlockStatus.Passed,
+            duration_ms: duration_ms, stdout: stdout, stderr: stderr, error: ""
+        )
+    else:
+        # Simple blocks ignore exit code - they're demonstration code, not tests
+        # Only sdoctest blocks (interactive examples) require exit code 0
+        if block.language == "simple" or block.language == "spl":
+            BlockResult(
+                block: block, status: BlockStatus.Passed,
+                duration_ms: duration_ms, stdout: stdout, stderr: stderr, error: ""
+            )
+        else:
+            val error_msg = extract_block_error(stderr: stderr, stdout: stdout)
+            BlockResult(
+                block: block, status: BlockStatus.Failed,
+                duration_ms: duration_ms, stdout: stdout, stderr: stderr,
+                error: error_msg
+            )
+
+# =========================================================================
+# Code Building (init script prepending)
+# =========================================================================
+
+fn build_temp_code(block: SdoctestBlock, config: SdoctestConfig, preamble: text) -> text:
+    var parts: [text] = []
+
+    # 1. Init script (if configured)
+    val init_name = block.get_init_name()
+    if init_name != "":
+        val init_file = find_init_script_file(config, init_name)
+        if init_file != "" and file_exists(init_file):
+            val init_content = file_read(init_file)
+            if init_content != "":
+                parts.push(init_content)
+
+    # 2. Accumulated preamble from preceding blocks
+    if preamble != "":
+        parts.push(preamble)
+
+    # 3. The actual block code
+    parts.push(block.code)
+
+    parts.join("\n\n")
+
+# =========================================================================
+# Error Extraction
+# =========================================================================
+
+fn extract_block_error(stderr: text, stdout: text) -> text:
+    val combined = stderr + "\n" + stdout
+    val lines = combined.split("\n")
+
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed.contains( "error:") or trimmed.contains( "Error:") or trimmed.contains( "parse error"):
+            return trimmed
+        if trimmed.contains( "semantic:") or trimmed.contains( "compile failed"):
+            return trimmed
+
+    val stderr_trimmed = stderr.trim()
+    if stderr_trimmed != "":
+        val stderr_lines = stderr.split("\n")
+        val first_line = stderr_lines[0].trim()
+        if first_line != "":
+            return first_line
+
+    "Exit code non-zero"
+
+# =========================================================================
+# Output Formatting
+# =========================================================================
+
+fn print_file_result(result: SdoctestFileResult):
+    if result.total == 0:
+        return
+
+    val status_icon = if result.failed == 0 and result.errors == 0: "PASS" else: "FAIL"
+    var summary = "{result.passed} passed"
+    if result.accepted > 0:
+        summary = summary + ", {result.accepted} accepted"
+    if result.failed > 0:
+        summary = summary + ", {result.failed} failed"
+    summary = summary + ", {result.skipped} skipped, {result.duration_ms}ms"
+    print "  {status_icon}  {result.source_file} ({summary})"
+
+    # Print failure/error details
+    for br in result.blocks:
+        if br.status == BlockStatus.Failed or br.status == BlockStatus.Error:
+            print "        Line {br.block.line_number}: {br.error}"
+
+fn print_sdoctest_list(files: [text], config: SdoctestConfig):
+    print "SDoctest files:"
+    var total_blocks = 0
+
+    for file_path in files:
+        val blocks = extract_sdoctest_blocks(file_path)
+        print "  {file_path} ({blocks.len()} blocks)"
+        for block in blocks:
+            val mod_str = format_modifiers(block)
+            print "    Line {block.line_number}{mod_str}"
+        total_blocks = total_blocks + blocks.len()
+
+    print ""
+    print "Total: {files.len()} files, {total_blocks} code blocks"
+
+fn format_modifiers(block: SdoctestBlock) -> text:
+    var parts: [text] = []
+    if block.has_modifier_skip():
+        parts.push("skip")
+    if block.has_modifier_should_fail():
+        parts.push("should_fail")
+    if block.has_modifier_fail_as_success():
+        parts.push("fail_as_success")
+    if block.get_init_name() != "":
+        parts.push("init={block.get_init_name()}")
+    if block.get_env_name() != "":
+        parts.push("env={block.get_env_name()}")
+    if block.get_run_config() != "":
+        parts.push("@{block.get_run_config()}")
+    val tags = block.get_tags()
+    for t in tags:
+        parts.push("tag={t}")
+
+    if parts.len() > 0:
+        " [{parts.join(", ")}]"
+    else:
+        ""
+
+fn print_sdoctest_summary(result: SdoctestRunResult):
+    print ""
+    print "========================================="
+    val mode_label = if result.accepted > 0: "SDoctest Results (fail-as-success)" else: "SDoctest Results"
+    var summary = "{result.total} total, {result.passed} passed, {result.failed} failed"
+    if result.accepted > 0:
+        summary = summary + ", {result.accepted} accepted"
+    summary = summary + ", {result.skipped} skipped, {result.errors} errors"
+    print "{mode_label}: {summary}"
+    print "Time:    {result.duration_ms}ms"
+    print "========================================="
+    if result.is_ok():
+        print "All sdoctest blocks passed!"
+    else:
+        print "Some sdoctest blocks failed."
+
+# =========================================================================
+# Exports
+# =========================================================================

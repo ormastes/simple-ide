@@ -1,0 +1,230 @@
+# Agent Tree
+#
+# Builds and maintains the agent hierarchy from dashboard events.
+# Tracks parent-child relationships, agent states, and resource usage.
+
+use app.llm_dashboard.data.types.{
+    AgentNode, AgentActivity, LLMProvider, FileActivity, URLActivity,
+    provider_from_text
+}
+use app.llm_dashboard.data.jsonl_parser.{
+    DashboardEvent, event_to_activity
+}
+
+# =========================================================================
+# Agent Tree
+# =========================================================================
+
+class AgentTree:
+    agents: [AgentNode]
+    root_ids: [text]
+
+    static fn new() -> AgentTree:
+        return AgentTree(agents: [], root_ids: [])
+
+# =========================================================================
+# Tree Methods
+# =========================================================================
+
+impl AgentTree:
+
+    fn get_agent(id: text) -> AgentNode?:
+        """Find an agent by ID."""
+        for agent in self.agents:
+            if agent.id == id:
+                return agent
+        return nil
+
+    fn agent_count() -> i32:
+        return self.agents.len()
+
+    fn all_agents() -> [AgentNode]:
+        return self.agents
+
+    fn root_agents() -> [AgentNode]:
+        """Get top-level agents (no parent)."""
+        var roots: [AgentNode] = []
+        for id in self.root_ids:
+            val agent = self.get_agent(id)
+            if agent != nil:
+                roots.push(agent)
+        return roots
+
+    fn children_of(parent_id: text) -> [AgentNode]:
+        """Get direct children of an agent."""
+        var children: [AgentNode] = []
+        val parent = self.get_agent(parent_id)
+        if parent == nil:
+            return children
+        for child_id in parent.children:
+            val child = self.get_agent(child_id)
+            if child != nil:
+                children.push(child)
+        return children
+
+    fn depth_of(agent_id: text) -> i32:
+        """Get tree depth of an agent (0 for root)."""
+        var depth = 0
+        var current_id = agent_id
+        while true:
+            val agent = self.get_agent(current_id)
+            if agent == nil:
+                return depth
+            if agent.parent_id == nil:
+                return depth
+            current_id = agent.parent_id
+            depth = depth + 1
+            if depth > 20:  # safety limit
+                return depth
+        return depth
+
+    # -- Mutation ---------------------------------------------------------
+
+    me ensure_agent(id: text, provider: LLMProvider, model: text):
+        """Ensure an agent exists in the tree, creating if needed."""
+        for agent in self.agents:
+            if agent.id == id:
+                return
+        var node = AgentNode.new(id, provider, model)
+        self.agents.push(node)
+        self.root_ids.push(id)
+
+    me update_from_event(event: DashboardEvent):
+        """Update the tree based on a dashboard event."""
+        match event:
+            DashboardEvent.SessionStart(session_id, model, provider_name, timestamp):
+                val provider = provider_from_text(provider_name)
+                self.ensure_agent(session_id, provider, model)
+                self._update_agent_field(session_id, "model", model)
+                self._update_agent_time(session_id, timestamp)
+
+            DashboardEvent.ToolCall(agent_id, tool_name, args, timestamp):
+                self.ensure_agent(agent_id, LLMProvider.Claude, "")
+                val activity = event_to_activity(event)
+                self._update_agent_activity(agent_id, activity)
+                self._update_agent_time(agent_id, timestamp)
+                self._record_tool(agent_id, tool_name)
+                # Track file activity
+                if tool_name == "Read" and args.len() > 0:
+                    self._record_file_read(agent_id, args[0])
+                elif (tool_name == "Write" or tool_name == "Edit") and args.len() > 0:
+                    self._record_file_write(agent_id, args[0])
+                elif (tool_name == "WebFetch" or tool_name == "WebSearch") and args.len() > 0:
+                    self._record_url(agent_id, args[0])
+
+            DashboardEvent.AgentSpawn(parent_id, child_id, description, prompt, timestamp):
+                self.ensure_agent(parent_id, LLMProvider.Claude, "")
+                self.ensure_agent(child_id, LLMProvider.Claude, "")
+                self._set_parent(child_id, parent_id)
+                self._update_agent_activity(parent_id, AgentActivity.SubAgentSpawn(child_id: child_id))
+                self._update_agent_time(parent_id, timestamp)
+
+            DashboardEvent.AssistantMessage(agent_id, input_tokens, output_tokens, cache_read, cache_create, timestamp):
+                self.ensure_agent(agent_id, LLMProvider.Claude, "")
+                self._update_agent_activity(agent_id, AgentActivity.Thinking)
+                self._add_token_usage(agent_id, input_tokens, output_tokens, cache_read, cache_create)
+                self._update_agent_time(agent_id, timestamp)
+
+            DashboardEvent.SessionEnd(session_id, timestamp):
+                self._update_agent_activity(session_id, AgentActivity.Finished)
+                self._update_agent_time(session_id, timestamp)
+
+            DashboardEvent.Error(agent_id, message, timestamp):
+                self._update_agent_activity(agent_id, AgentActivity.Error(msg: message))
+                self._update_agent_time(agent_id, timestamp)
+
+            _: pass_dn
+
+    # -- Internal mutation helpers ----------------------------------------
+
+    fn _find_agent_idx(id: text) -> i32:
+        """Find agent index by ID. Returns -1 if not found."""
+        var i = 0
+        while i < self.agents.len():
+            if self.agents[i].id == id:
+                return i
+            i = i + 1
+        return -1
+
+    me _update_agent_activity(id: text, activity: AgentActivity):
+        val idx = self._find_agent_idx(id)
+        if idx >= 0:
+            self.agents[idx].activity = activity
+
+    me _update_agent_time(id: text, timestamp: i64):
+        val idx = self._find_agent_idx(id)
+        if idx >= 0:
+            self.agents[idx].last_active = timestamp
+            if self.agents[idx].start_time == 0:
+                self.agents[idx].start_time = timestamp
+
+    me _update_agent_field(id: text, field: text, value: text):
+        val idx = self._find_agent_idx(id)
+        if idx >= 0:
+            if field == "model":
+                self.agents[idx].model = value
+
+    me _set_parent(child_id: text, parent_id: text):
+        val child_idx = self._find_agent_idx(child_id)
+        if child_idx >= 0:
+            self.agents[child_idx].parent_id = parent_id
+        val parent_idx = self._find_agent_idx(parent_id)
+        if parent_idx >= 0:
+            if not _list_contains(self.agents[parent_idx].children, child_id):
+                self.agents[parent_idx].children.push(child_id)
+        # Remove from root_ids if it now has a parent
+        var new_roots: [text] = []
+        for rid in self.root_ids:
+            if rid != child_id:
+                new_roots.push(rid)
+        self.root_ids = new_roots
+
+    me _record_to_list(id: text, field: text, value: text):
+        """Push value into a named list field of an agent, deduplicating."""
+        val idx = self._find_agent_idx(id)
+        if idx < 0:
+            return
+        var list_ref = match field:
+            "tools" => self.agents[idx].tools_used
+            "files_read" => self.agents[idx].files_read
+            "files_written" => self.agents[idx].files_written
+            "urls" => self.agents[idx].urls_fetched
+            _ => return
+        if not _list_contains(list_ref, value):
+            match field:
+                "tools" => self.agents[idx].tools_used.push(value)
+                "files_read" => self.agents[idx].files_read.push(value)
+                "files_written" => self.agents[idx].files_written.push(value)
+                "urls" => self.agents[idx].urls_fetched.push(value)
+                _ => pass_dn
+
+    me _record_tool(id: text, tool_name: text):
+        self._record_to_list(id, "tools", tool_name)
+
+    me _record_file_read(id: text, path: text):
+        self._record_to_list(id, "files_read", path)
+
+    me _record_file_write(id: text, path: text):
+        self._record_to_list(id, "files_written", path)
+
+    me _record_url(id: text, url: text):
+        self._record_to_list(id, "urls", url)
+
+    me _add_token_usage(id: text, input: i64, output: i64, cache_read: i64, cache_create: i64):
+        val idx = self._find_agent_idx(id)
+        if idx >= 0:
+            self.agents[idx].input_tokens = self.agents[idx].input_tokens + input
+            self.agents[idx].output_tokens = self.agents[idx].output_tokens + output
+            self.agents[idx].cache_read_tokens = self.agents[idx].cache_read_tokens + cache_read
+            self.agents[idx].cache_create_tokens = self.agents[idx].cache_create_tokens + cache_create
+
+# =========================================================================
+# Shared Helpers
+# =========================================================================
+
+fn _list_contains(list: [text], value: text) -> bool:
+    """Check if a text list contains a value."""
+    for item in list:
+        if item == value:
+            return true
+    return false

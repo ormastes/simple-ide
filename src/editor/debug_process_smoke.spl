@@ -1,0 +1,39 @@
+# Editor DAP process transport smoke
+#
+# Native-only smoke entry for the process-backed DAP stdio transport.
+
+extern fn rt_process_spawn_piped(cmd: text, args: [text]) -> i64
+extern fn rt_process_write_stdin(pid: i64, data: text) -> bool
+extern fn rt_process_read_stdout(pid: i64) -> text
+extern fn rt_process_is_alive(pid: i64) -> bool
+extern fn rt_process_kill(pid: i64) -> bool
+
+fn main() -> i64:
+    val pid = rt_process_spawn_piped("bin/simple", ["run", "src/app/dap/simple_dap_main.spl"])
+    if pid <= 0:
+        print "STATUS: FAIL editor_dap_process_smoke start"
+        return 1
+    val frame = "Content-Length: 84\r\n\r\n{\"seq\":1,\"type\":\"request\",\"command\":\"initialize\",\"arguments\":{\"adapterID\":\"simple\"}}"
+    if not rt_process_write_stdin(pid, frame):
+        rt_process_kill(pid)
+        print "STATUS: FAIL editor_dap_process_smoke write"
+        return 1
+
+    var attempts = 0
+    var saw_response = false
+    var raw = ""
+    while attempts < 100000 and not saw_response and rt_process_is_alive(pid):
+        val chunk = rt_process_read_stdout(pid)
+        if chunk != "":
+            raw = raw + chunk
+        if raw.contains("\"type\":\"response\"") and raw.contains("\"command\":\"initialize\""):
+            saw_response = true
+        attempts = attempts + 1
+    rt_process_kill(pid)
+
+    if not saw_response:
+        print "STATUS: FAIL editor_dap_process_smoke no_response"
+        return 1
+
+    print "STATUS: PASS editor_dap_process_smoke"
+    0

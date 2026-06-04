@@ -1,0 +1,185 @@
+# Editor Controller Diagnostics Methods
+#
+# Diagnostics panel, quickfix, code action application.
+
+use app.editor.editor_controller_types.*
+use app.editor.editor_controller.*
+use std.editor.buffer.buffer.*
+use std.editor.core.document.*
+use std.editor.services.diagnostics.*
+use std.editor.view.diagnostics_panel.*
+use std.editor.view.lsp_result_panel.*
+use app.editor.editor_lsp_helpers.*
+use app.editor.editor_path_text_helpers.*
+
+fn ctrl_request_quickfix(ctrl: mut EditorController) -> EditorAction:
+    val doc: EditorDocument = ctrl.session.documents[ctrl.session.active_index]
+    if ctrl.session.active_index < 0 or ctrl.session.active_index >= ctrl.session.buffers.len():
+        ctrl.status_msg = "no file open"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    if doc == nil:
+        ctrl.status_msg = "no file open"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    if doc.language_id == "markdown":
+        val content = md_buffer_content(ctrl.session.buffers[ctrl.session.active_index])
+        val row = ctrl.session.buffers[ctrl.session.active_index].cursor_row
+        val line = ctrl.session.buffers[ctrl.session.active_index].line_at(row)
+        val fixed = _editor_markdown_quickfix_line(line)
+        if fixed != line:
+            val edit_json = "{\"line\":" + str(row) + ",\"newText\":\"" + _editor_escape_json(fixed) + "\"}"
+            ctrl.code_actions = [EditorCodeAction(title: "Apply Markdown quick fix", kind: "quickfix", edit_json: edit_json, command: "")]
+            ctrl.status_msg = "1 quick fix"
+            return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+        ctrl.code_actions = []
+        val diags = md_diagnose(content, doc.path())
+        if diags.len() > 0:
+            ctrl.status_msg = "diagnostics available"
+        else:
+            ctrl.status_msg = "no quick fixes"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    ctrl.code_actions = []
+    ctrl.status_msg = "no quick fixes"
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_show_diagnostics_panel(ctrl: mut EditorController) -> EditorAction:
+    ctrl.diagnostics_view_mode = "all"
+    ctrl.diagnostics_view_payload = ""
+    ctrl_refresh_diagnostics_panel_view(ctrl)
+    var layout = ctrl.session.dock_layout
+    layout.show_right("problems")
+    ctrl.session.dock_layout = layout
+    ctrl.status_msg = "problems: " + ctrl.diagnostic_store.total_count().to_text()
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_show_diagnostics_filter(ctrl: mut EditorController, payload: text) -> EditorAction:
+    ctrl.diagnostics_view_mode = "filter"
+    ctrl.diagnostics_view_payload = payload
+    ctrl_refresh_diagnostics_panel_view(ctrl)
+    var layout = ctrl.session.dock_layout
+    layout.show_right("problems")
+    ctrl.session.dock_layout = layout
+    val visible = _editor_problem_visible_count(ctrl.diagnostics_panel)
+    ctrl.status_msg = "problems: " + visible.to_text()
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_show_diagnostics_group(ctrl: mut EditorController, payload: text) -> EditorAction:
+    ctrl.diagnostics_view_mode = "group"
+    ctrl.diagnostics_view_payload = if payload == "source" then "source" else: "severity"
+    ctrl_refresh_diagnostics_panel_view(ctrl)
+    var layout = ctrl.session.dock_layout
+    layout.show_right("problems")
+    ctrl.session.dock_layout = layout
+    val visible = _editor_problem_visible_count(ctrl.diagnostics_panel)
+    ctrl.status_msg = "problems: " + visible.to_text()
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_show_diagnostics_sort(ctrl: mut EditorController, payload: text) -> EditorAction:
+    ctrl.diagnostics_view_mode = "sort"
+    ctrl.diagnostics_view_payload = if payload == "source" or payload == "path" then payload else: "severity"
+    ctrl_refresh_diagnostics_panel_view(ctrl)
+    var layout = ctrl.session.dock_layout
+    layout.show_right("problems")
+    ctrl.session.dock_layout = layout
+    val visible = _editor_problem_visible_count(ctrl.diagnostics_panel)
+    ctrl.status_msg = "problems: " + visible.to_text()
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_refresh_diagnostics_panel_view(ctrl: mut EditorController):
+    if ctrl.diagnostics_view_mode == "filter":
+        val severity = _editor_payload_part(ctrl.diagnostics_view_payload, 0)
+        val source = _editor_payload_part(ctrl.diagnostics_view_payload, 1)
+        ctrl.diagnostics_panel = diagnostics_panel_from_store_filtered(ctrl.diagnostic_store, severity, source)
+        return
+    if ctrl.diagnostics_view_mode == "group":
+        val group_by = if ctrl.diagnostics_view_payload == "source" then "source" else: "severity"
+        ctrl.diagnostics_panel = diagnostics_panel_from_store_grouped(ctrl.diagnostic_store, group_by)
+        return
+    if ctrl.diagnostics_view_mode == "sort":
+        val sort_by = if ctrl.diagnostics_view_payload == "source" or ctrl.diagnostics_view_payload == "path" then ctrl.diagnostics_view_payload else: "severity"
+        ctrl.diagnostics_panel = diagnostics_panel_from_store_sorted(ctrl.diagnostic_store, sort_by)
+        return
+    ctrl.diagnostics_panel = diagnostics_panel_from_store(ctrl.diagnostic_store)
+
+fn ctrl_apply_first_quickfix(ctrl: mut EditorController) -> EditorAction:
+    ctrl_apply_code_action_at(ctrl, 0)
+
+fn ctrl_apply_code_action_at(ctrl: mut EditorController, index: i64) -> EditorAction:
+    if ctrl.code_actions.len() == 0:
+        ctrl.status_msg = "no quick fix selected"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    var action_index = index
+    if action_index < 0:
+        action_index = 0
+    if action_index >= ctrl.code_actions.len():
+        action_index = ctrl.code_actions.len() - 1
+    if ctrl.session.active_index < 0 or ctrl.session.active_index >= ctrl.session.buffers.len():
+        ctrl.status_msg = "no file open"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    var buffer: EditorBuffer = ctrl.session.buffers[ctrl.session.active_index]
+    val action = ctrl.code_actions[action_index]
+    val doc: EditorDocument = ctrl.session.documents[ctrl.session.active_index]
+    val doc_path = if doc == nil then "" else: doc.path()
+    val applied = _editor_apply_code_action_content(buffer, doc_path, action.edit_json)
+    if not applied.applied:
+        if action.command != "":
+            val command_requested = ctrl_execute_lsp_code_action_command(ctrl, action.command)
+            ctrl.code_actions = []
+            if command_requested:
+                val command_name = _editor_lsp_command_name(action.command)
+                ctrl.status_msg = "command requested: " + command_name
+            else:
+                ctrl.status_msg = "code action command unavailable"
+            return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+        ctrl.status_msg = "quick fix has no editable change"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val extra_file_edits = if action.edit_json.contains("\"changes\"") then ctrl_apply_workspace_edit_extra_paths(ctrl, doc_path, action.edit_json) else: 0
+    buffer.push_undo_snapshot()
+    buffer.replace_content(applied.content)
+    buffer.dirty = true
+    buffer.move_cursor(applied.line, applied.col)
+    ctrl.session.update_active_buffer(buffer)
+    ctrl_replace_open_document_buffer(ctrl, doc_path, buffer)
+    ctrl.code_actions = []
+    val doc: EditorDocument = ctrl.session.active_document()
+    if doc != nil and doc.language_id == "markdown":
+        ctrl_update_markdown_preview(ctrl, doc, buffer)
+    if extra_file_edits > 0:
+        ctrl.status_msg = "applied: " + action.title + " (" + extra_file_edits.to_text() + " file edits)"
+    else:
+        ctrl.status_msg = "applied: " + action.title
+    if action.command != "":
+        val command_requested = ctrl_execute_lsp_code_action_command(ctrl, action.command)
+        if command_requested:
+            ctrl.status_msg = ctrl.status_msg + "; command requested: " + _editor_lsp_command_name(action.command)
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_dispatch_diagnostics_panel_key(ctrl: mut EditorController, key: text) -> EditorAction:
+    if key == "j":
+        ctrl.diagnostics_panel = diagnostics_panel_select(ctrl.diagnostics_panel, ctrl.diagnostics_panel.selected + 1)
+        ctrl.status_msg = "problem selected"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    if key == "k":
+        ctrl.diagnostics_panel = diagnostics_panel_select(ctrl.diagnostics_panel, ctrl.diagnostics_panel.selected - 1)
+        ctrl.status_msg = "problem selected"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    if key == "\r" or key == "\n":
+        return ctrl_diagnostics_jump_selected(ctrl)
+    EditorAction(redraw: false, quit: false, status_msg: ctrl.status_msg)
+
+fn ctrl_diagnostics_jump_selected(ctrl: mut EditorController) -> EditorAction:
+    val path = diagnostics_panel_target_path(ctrl.diagnostics_panel)
+    if path == "":
+        ctrl.status_msg = "no problem target"
+        return EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)
+    val line = diagnostics_panel_target_line(ctrl.diagnostics_panel)
+    val col = diagnostics_panel_target_col(ctrl.diagnostics_panel)
+    var session = ctrl.session
+    session.open_file(path)
+    ctrl.session = session
+    ctrl_focus_lsp_target_path(ctrl, path)
+    val buffer: EditorBuffer = ctrl.session.active_buffer()
+    if buffer != nil:
+        buffer.move_cursor(line, col)
+        ctrl.session.update_active_buffer(buffer)
+    ctrl.status_msg = "problem jump: " + path + ":" + (line + 1).to_text()
+    EditorAction(redraw: true, quit: false, status_msg: ctrl.status_msg)

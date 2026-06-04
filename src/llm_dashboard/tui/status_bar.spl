@@ -1,0 +1,80 @@
+# Status Bar
+#
+# Bottom status bar showing LLM connection states, token counts,
+# and aggregate dashboard statistics.
+
+use app.llm_dashboard.data.types.{LLMStatus, LLMProvider, provider_name, format_tokens}
+use app.llm_dashboard.data.store.{AgentDashboardStore}
+use app.llm_dashboard.tui.colors.{provider_color, connection_dot, status_indicator}
+use app.ui.render.ansi.{RESET, BOLD, DIM, GREEN, YELLOW, RED}
+
+# =========================================================================
+# Status Bar Rendering
+# =========================================================================
+
+fn render_status_bar(store: AgentDashboardStore) -> text:
+    """Render the full status bar line."""
+    var parts: [text] = []
+
+    # LLM provider statuses
+    for status in store.llm_statuses:
+        parts.push(format_provider_status(status))
+
+    # Cache efficiency
+    val cache_pct = store.session_cache_efficiency_pct()
+    val cache_color = if cache_pct >= 70: GREEN elif cache_pct >= 30: YELLOW else: RED
+    if store.total_cache_reads > 0 or store.total_cache_creates > 0:
+        parts.push("{cache_color}Cache:{RESET} {cache_pct}%")
+
+    # Aggregate stats
+    val reads = store.total_files_read()
+    val writes = store.total_files_written()
+    val urls = store.total_urls()
+    val tools = store.total_tools_used()
+    val agents = store.tree.agent_count()
+    val mcp_count = store.mcp_stats.len()
+
+    parts.push("{DIM}Files:{RESET} {reads}R {writes}W")
+    parts.push("{DIM}URLs:{RESET} {urls}")
+    parts.push("{DIM}Tools:{RESET} {tools}")
+    parts.push("{DIM}Agents:{RESET} {agents}")
+    if mcp_count > 0:
+        parts.push("{DIM}MCP:{RESET} {mcp_count} servers")
+
+    var line = ""
+    for p in parts:
+        if line != "":
+            line = "{line}  "
+        line = "{line}{p}"
+
+    return " {line}"
+
+fn format_provider_status(status: LLMStatus) -> text:
+    """Format a single provider's status for the status bar."""
+    val color = provider_color(status.provider)
+    val dot = connection_dot(status.connected)
+    val name = provider_name(status.provider)
+    val tokens = format_tokens(status.tokens_used)
+
+    if status.connected:
+        val cache_info = if status.cache_read_tokens > 0: " c{format_tokens(status.cache_read_tokens)}" else: ""
+        return "{color}{name}{RESET}: {dot} {tokens} tok{cache_info}"
+    return "{color}{name}{RESET}: {dot}"
+
+# =========================================================================
+# Availability Banner
+# =========================================================================
+
+fn render_availability_banner(available: bool) -> [text]:
+    """Show a banner if JSONL watching is not available."""
+    if available:
+        return []
+    var lines: [text] = []
+    lines.push("")
+    lines.push(" {BOLD}JSONL Transcript Watching Unavailable{RESET}")
+    lines.push("")
+    lines.push(" Expected directory: ~/.claude/projects/")
+    lines.push(" This dashboard monitors Claude Code JSONL transcripts.")
+    lines.push(" Run Claude Code (claude) to generate transcript files.")
+    lines.push("")
+    return lines

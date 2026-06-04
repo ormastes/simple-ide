@@ -1,0 +1,15 @@
+use app.test_dep_graph_shared.{SharedDepGraph}
+use app.test_dep_graph_shared.{shared_dep_graph_new}
+
+class TestDepGraph:
+    inner: SharedDepGraph
+
+fn test_dep_graph_new() -> TestDepGraph:
+    TestDepGraph(inner: shared_dep_graph_new("", false))
+
+impl TestDepGraph:
+    fn get_deps(test_path: text) -> [text]:
+        self.inner.get_deps(test_path)
+
+    me analyze_test(test_path: text):
+        self.inner.analyze_test(test_path)

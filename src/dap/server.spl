@@ -1,0 +1,519 @@
+# DAP Server Implementation
+# Handles DAP requests and manages debugging state
+# Uses a unified DebugAdapter trait for all debug backends (local, GDB, Trace32, etc.)
+
+import sys
+import dap.protocol as protocol
+import dap.transport as transport
+import dap.breakpoints as breakpoints
+import app.dap.hooks.{StackFrame, Variable, ExecutionState, EvalResult}
+import app.debug.remote.backend.RemoteRiscV32Backend
+import app.debug.remote.types.DebugConfig
+import app.debug.coordinator.{VarInfo, FrameInfo}
+import app.dap.adapter.mod.{DebugAdapter, AdapterCapabilities, AdapterConfig}
+import app.dap.adapter.local.LocalAdapter
+import app.dap.adapter.remote.RemoteAdapter
+
+# DAP Server
+class DapServer:
+    state: DebuggerState
+    breakpoint_manager: breakpoints.BreakpointManager
+    current_thread_id: Int
+    current_frame_id: Int
+    stop_reason: Option<protocol.StopReason>
+    launch_config: LaunchConfig
+    debug_context: DebugContext
+    step_mode: Option<StepMode>   # Current stepping mode
+    adapter: DebugAdapter         # Unified debug adapter (local, remote, etc.)
+    data_breakpoints: [Dict]         # Active data breakpoints/watchpoints
+    next_data_breakpoint_id: Int
+
+    static fn _create_with_adapter(adapter: DebugAdapter) -> DapServer:
+        DapServer(
+            state: DebuggerState.Uninitialized,
+            breakpoint_manager: breakpoints.BreakpointManager.new(),
+            current_thread_id: 1,
+            current_frame_id: 1,
+            stop_reason: nil,
+            launch_config: LaunchConfig.default(),
+            debug_context: DebugContext.new(),
+            step_mode: nil,
+            adapter: adapter,
+            data_breakpoints: [],
+            next_data_breakpoint_id: 1
+        )
+
+    static fn new() -> DapServer:
+        val config = AdapterConfig.local("")
+        val adapter = LocalAdapter.create(config)
+        DapServer._create_with_adapter(adapter)
+
+    # Create a DAP server with any adapter
+    static fn with_adapter(adapter: DebugAdapter) -> DapServer:
+        DapServer._create_with_adapter(adapter)
+
+    # Create a DAP server with a remote backend (convenience)
+    static fn with_remote(backend: RemoteRiscV32Backend) -> DapServer:
+        val config = AdapterConfig.gdb(backend.inner.config.host, backend.inner.config.port, backend.inner.config.program)
+        val adapter = RemoteAdapter.create(backend, config)
+        DapServer._create_with_adapter(adapter)
+
+    # Create a DAP server with a Trace32 backend
+    static fn with_trace32(config: DebugConfig) -> Result<DapServer, String>:
+        val backend = RemoteRiscV32Backend.trace32_only(config)?
+        val adapter_config = AdapterConfig.trace32(config.host, config.port, config.program)
+        val adapter = RemoteAdapter.create(backend, adapter_config)
+        Ok(DapServer._create_with_adapter(adapter))
+
+impl DapServer:
+    fn handle_initialize(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        transport.log_debug("Handling initialize request")
+
+        # Update state
+        self.state = DebuggerState.Initialized
+
+        # Build capabilities
+        val capabilities = protocol.Capabilities.default()
+
+        # Send response
+        transport.write_response(request_seq, true, command, Some(capabilities))?
+
+        # Send initialized event
+        transport.write_event("initialized", {})?
+
+        Ok(nil)
+    fn handle_launch(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        transport.log_debug("Handling launch request")
+
+        # Parse launch configuration
+        match arguments:
+            Some(args):
+                self.launch_config = LaunchConfig.from_json(args)
+                transport.log_debug("Launching program: {self.launch_config.program}")
+                transport.log_debug("Arguments: {self.launch_config.args}")
+                transport.log_debug("Stop on entry: {self.launch_config.stop_on_entry}")
+
+                # Initialize debug context with source path
+                self.debug_context.source_path = self.launch_config.program
+            nil:
+                transport.log_debug("No launch arguments provided")
+
+        # Attach adapter to program
+        self.adapter.attach(self.launch_config.program, self.launch_config.args)?
+
+        # Update state
+        self.state = DebuggerState.Launched
+
+        # Send response
+        transport.write_response(request_seq, true, command, nil)?
+
+        Ok(nil)
+    fn handle_configuration_done(request_seq: Int, command: String) -> Result<Nil, String>:
+        transport.log_debug("Handling configurationDone request")
+
+        # Send response
+        transport.write_response(request_seq, true, command, nil)?
+
+        # Update state to running
+        self.state = DebuggerState.Running
+
+        # Check if we should stop on entry
+        if self.launch_config.stop_on_entry:
+            # Initialize stack with entry frame
+            val entry_frame = StackEntry.new(
+                "main",
+                self.launch_config.program,
+                1,
+                0
+            )
+            self.debug_context.call_stack = [entry_frame]
+            self.debug_context.current_line = 1
+
+            # Send stopped event at entry point
+            self.send_stopped_event(protocol.StopReason.Entry)?
+        else:
+            # Start execution without stopping
+            # NOTE: Interpreter integration needed for actual execution
+            transport.log_debug("Starting execution without stopping on entry")
+
+        Ok(nil)
+    fn handle_threads(request_seq: Int, command: String) -> Result<Nil, String>:
+        # Return single main thread
+        val thread = protocol.Thread.new(self.current_thread_id, "Main Thread")
+
+        val body = {
+            "threads": [thread.to_json()]
+        }
+
+        transport.write_response(request_seq, true, command, Some(body))?
+
+        Ok(nil)
+    fn handle_stack_trace(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        var stack_frames: [Dict] = []
+        var frame_id = self.current_frame_id
+
+        # Get stack frames from adapter
+        val adapter_frames = self.adapter.stack_trace()
+        match adapter_frames:
+            Ok(frames):
+                for f in frames:
+                    val protocol_frame = protocol.StackFrame.new(
+                        frame_id,
+                        f.function_name,
+                        f.line,
+                        f.column
+                    ).with_source(f.file)
+                    stack_frames.push(protocol_frame.to_json())
+                    frame_id = frame_id + 1
+            Err(_):
+                pass
+
+        # Fallback if no frames
+        if stack_frames.len() == 0:
+            val frame = protocol.StackFrame.new(
+                frame_id,
+                "main",
+                1,
+                0
+            ).with_source(self.debug_context.source_path)
+            stack_frames.push(frame.to_json())
+
+        val body = {
+            "stackFrames": stack_frames,
+            "totalFrames": stack_frames.len()
+        }
+
+        transport.write_response(request_seq, true, command, Some(body))?
+
+        Ok(nil)
+    fn handle_scopes(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        # Return local and global scopes
+        val local_scope = protocol.Scope.new("Local", 1)
+        val global_scope = protocol.Scope.new("Global", 2)
+
+        var scopes = [
+            local_scope.to_json(),
+            global_scope.to_json()
+        ]
+
+        # Add Registers scope if adapter supports it
+        if self.adapter.capabilities().supports_registers:
+            val register_scope = protocol.Scope.new("Registers", 3)
+            scopes.push(register_scope.to_json())
+
+        val body = {
+            "scopes": scopes
+        }
+
+        transport.write_response(request_seq, true, command, Some(body))?
+
+        Ok(nil)
+    fn handle_continue(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        transport.log_debug("Handling continue request")
+
+        # Continue execution via adapter
+        self.adapter.resume()?
+        self.step_mode = nil
+
+        # Update state
+        self.state = DebuggerState.Running
+
+        val body = {
+            "allThreadsContinued": true
+        }
+
+        transport.write_response(request_seq, true, command, Some(body))?
+
+        # NOTE: When interpreter integration is complete, this will:
+        # 1. Resume interpreter execution
+        # 2. Check breakpoints at each step
+        # 3. Stop when a breakpoint is hit or program terminates
+        self.execute_until_stop()?
+
+        Ok(nil)
+    fn handle_pause(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        transport.log_debug("Handling pause request")
+
+        # Pause execution via adapter
+        self.adapter.halt()?
+
+        # Send response
+        transport.write_response(request_seq, true, command, nil)?
+
+        # Send stopped event
+        self.send_stopped_event(protocol.StopReason.Pause)?
+
+        Ok(nil)
+    fn handle_next(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        transport.log_debug("Handling next (step over) request")
+
+        # Step over via adapter
+        self.adapter.step_over()?
+        self.step_mode = Some(StepMode.StepOver)
+
+        # Send response
+        transport.write_response(request_seq, true, command, nil)?
+
+        # Refresh state from adapter and send stopped event
+        self.execute_step()?
+
+        Ok(nil)
+    fn handle_step_in(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        transport.log_debug("Handling stepIn request")
+
+        # Step into via adapter
+        self.adapter.single_step()?
+        self.step_mode = Some(StepMode.StepIn)
+
+        transport.write_response(request_seq, true, command, nil)?
+
+        # Refresh state from adapter and send stopped event
+        self.execute_step()?
+
+        Ok(nil)
+    fn handle_step_out(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        transport.log_debug("Handling stepOut request")
+
+        # Step out via adapter
+        self.adapter.step_out()?
+        self.step_mode = Some(StepMode.StepOut)
+
+        transport.write_response(request_seq, true, command, nil)?
+
+        # Refresh state from adapter and send stopped event
+        self.execute_step()?
+
+        Ok(nil)
+    fn lookup_data_breakpoint_value(name: String) -> Option<String>:
+        # Prefer in-memory debug context values if available.
+        match self.debug_context.local_variables.get(name):
+            Some(v):
+                return Some(v.value)
+            nil:
+                pass
+        match self.debug_context.global_variables.get(name):
+            Some(v):
+                return Some(v.value)
+            nil:
+                pass
+
+        # Fallback to adapter scope snapshots.
+        val local_result = self.adapter.read_locals()
+        match local_result:
+            Ok(local_vars):
+                for v in local_vars:
+                    if v.name == name:
+                        return Some(v.value)
+            Err(_):
+                pass
+        val global_result = self.adapter.read_globals()
+        match global_result:
+            Ok(global_vars):
+                for v in global_vars:
+                    if v.name == name:
+                        return Some(v.value)
+            Err(_):
+                pass
+
+        nil
+    fn check_runtime_data_breakpoints() -> Bool:
+        var hit = false
+        var updated: [Dict] = []
+        for dbp in self.data_breakpoints:
+            var nd = dbp
+            val access = nd.get("accessType") ?? "write"
+            val data_id = nd.get("dataId") ?? ""
+            if access == "read":
+                updated.push(nd)
+                continue
+
+            if data_id == "":
+                updated.push(nd)
+                continue
+
+            match self.lookup_data_breakpoint_value(data_id):
+                Some(current_value):
+                    val prev_value = nd.get("lastValue") ?? ""
+                    if prev_value == "":
+                        nd["lastValue"] = current_value
+                    elif prev_value != current_value:
+                        nd["lastValue"] = current_value
+                        val prev_hits = nd.get("hitCount") ?? 0
+                        nd["hitCount"] = prev_hits + 1
+                        hit = true
+                nil:
+                    pass
+            updated.push(nd)
+
+        self.data_breakpoints = updated
+        hit
+    fn execute_until_stop() -> Result<Nil, String>:
+        # Adapter resume was already called by the handler.
+        # Refresh debug context from adapter stack trace.
+        val trace_result = self.adapter.stack_trace()
+        match trace_result:
+            Ok(frames):
+                if frames.len() > 0:
+                    val top = frames[0]
+                    self.debug_context.current_line = top.line
+                    self.debug_context.source_path = top.file
+            Err(_):
+                # Adapter could not provide location; fall back to line advance
+                self.debug_context.current_line = self.debug_context.current_line + 1
+
+        # Runtime data breakpoint check (variable-change watchpoints).
+        if self.check_runtime_data_breakpoints():
+            self.send_stopped_event(protocol.StopReason.DataBreakpoint)?
+            return Ok(nil)
+
+        # Check if we hit a breakpoint
+        match self.breakpoint_manager.should_stop_at_line(
+            self.debug_context.source_path,
+            self.debug_context.current_line
+        ):
+            Some(bp):
+                # Hit a breakpoint
+                self.breakpoint_manager.increment_hit_count(bp.id)
+                self.send_stopped_event(protocol.StopReason.Breakpoint)?
+            nil:
+                # No breakpoint hit — report step stop
+                self.send_stopped_event(protocol.StopReason.Step)?
+
+        Ok(nil)
+    fn execute_step() -> Result<Nil, String>:
+        # Adapter step methods were already called by the handler
+        # (step_over / single_step / step_out). Refresh debug context
+        # from adapter stack trace to get the real post-step location.
+        val trace_result = self.adapter.stack_trace()
+        match trace_result:
+            Ok(frames):
+                if frames.len() > 0:
+                    val top = frames[0]
+                    self.debug_context.current_line = top.line
+                    self.debug_context.source_path = top.file
+
+                    # Rebuild call_stack from adapter frames
+                    var new_stack: [StackEntry] = []
+                    for f in frames:
+                        new_stack.push(StackEntry.new(
+                            f.function_name,
+                            f.file,
+                            f.line,
+                            0
+                        ))
+                    self.debug_context.call_stack = new_stack
+            Err(_):
+                # Adapter could not provide location; fall back to line advance
+                self.debug_context.current_line = self.debug_context.current_line + 1
+
+        # Runtime data breakpoint check (variable-change watchpoints).
+        if self.check_runtime_data_breakpoints():
+            self.send_stopped_event(protocol.StopReason.DataBreakpoint)?
+            return Ok(nil)
+
+        # Send stopped event
+        self.send_stopped_event(protocol.StopReason.Step)?
+
+        Ok(nil)
+    fn handle_disconnect(request_seq: Int, command: String, arguments: Option<Dict>) -> Result<Nil, String>:
+        transport.log_debug("Handling disconnect request")
+
+        # Update state
+        self.state = DebuggerState.Terminated
+
+        # Send response
+        transport.write_response(request_seq, true, command, nil)?
+
+        # Send terminated event
+        transport.write_event("terminated", {})?
+
+        Ok(nil)
+    fn send_stopped_event(reason: protocol.StopReason) -> Result<Nil, String>:
+        self.state = DebuggerState.Stopped
+        self.stop_reason = Some(reason)
+
+        val body = {
+            "reason": reason.to_string(),
+            "threadId": self.current_thread_id,
+            "allThreadsStopped": true
+        }
+
+        transport.write_event("stopped", body)?
+
+        Ok(nil)
+    fn handle_request(request: protocol.DapRequest) -> Result<Nil, String>:
+        match request.command:
+            case "initialize":
+                self.handle_initialize(request.id, request.command, request.arguments)
+            case "launch":
+                self.handle_launch(request.id, request.command, request.arguments)
+            case "configurationDone":
+                self.handle_configuration_done(request.id, request.command)
+            case "setBreakpoints":
+                self.handle_set_breakpoints(request.id, request.command, request.arguments)
+            case "dataBreakpointInfo":
+                self.handle_data_breakpoint_info(request.id, request.command, request.arguments)
+            case "setDataBreakpoints":
+                self.handle_set_data_breakpoints(request.id, request.command, request.arguments)
+            case "threads":
+                self.handle_threads(request.id, request.command)
+            case "stackTrace":
+                self.handle_stack_trace(request.id, request.command, request.arguments)
+            case "scopes":
+                self.handle_scopes(request.id, request.command, request.arguments)
+            case "variables":
+                self.handle_variables(request.id, request.command, request.arguments)
+            case "continue":
+                self.handle_continue(request.id, request.command, request.arguments)
+            case "pause":
+                self.handle_pause(request.id, request.command, request.arguments)
+            case "next":
+                self.handle_next(request.id, request.command, request.arguments)
+            case "stepIn":
+                self.handle_step_in(request.id, request.command, request.arguments)
+            case "stepOut":
+                self.handle_step_out(request.id, request.command, request.arguments)
+            case "evaluate":
+                self.handle_evaluate(request.id, request.command, request.arguments)
+            case "setVariable":
+                self.handle_set_variable(request.id, request.command, request.arguments)
+            case "stepBack":
+                self.handle_reverse_step(request.id, request.command)
+            case "reverseContinue":
+                self.handle_reverse_continue(request.id, request.command)
+            case "disconnect":
+                self.handle_disconnect(request.id, request.command, request.arguments)
+            case _:
+                # Unknown command
+                transport.log_error("Unknown command: {request.command}")
+                transport.write_response(request.id, false, request.command, nil)?
+                Ok(nil)
+    fn run() -> Result<Nil, String>:
+        transport.log_debug("DAP server starting")
+
+        loop:
+            # Check if terminated
+            match self.state:
+                case Terminated:
+                    transport.log_debug("Server terminated")
+                    return Ok(nil)
+                case _:
+                    pass
+
+            # Read next message
+            val message = match transport.read_message():
+                case Ok(msg):
+                    msg
+                case Err(e):
+                    transport.log_debug("Read error: {e}")
+                    return Ok(nil)
+
+            # Parse message type
+            val msg_type = transport.parse_message_type(message)?
+
+            # Only handle requests (DAP doesn't use notifications from client)
+            if msg_type == "request":
+                val request = protocol.DapRequest.from_json(message)?
+                self.handle_request(request)?
+
+        Ok(nil)

@@ -1,0 +1,136 @@
+# Word Document Sidebar
+#
+# Outline navigation showing document headings.
+
+use common.ui.widget.{WidgetNode}
+use common.ui.builder.{panel, tree_widget, tree_node, tree_leaf, scroll}
+use common.rich_text.attributed_text.{RichDocument, DocBlock, spans_to_plain_text}
+
+# =========================================================================
+# Outline Sidebar Builder
+# =========================================================================
+
+fn build_outline_sidebar(doc: RichDocument) -> WidgetNode:
+    """Build a sidebar panel with a tree of document headings.
+
+    Heading hierarchy:
+      - H1 entries become top-level tree nodes
+      - H2 entries become children of the preceding H1
+      - H3 entries become children of the preceding H2
+    Each node label is the heading plain text.
+    Each node action is "goto_block_{index}" for jump navigation."""
+
+    var entries: [_HeadingEntry] = []
+    var block_idx = 0
+    for block in doc.blocks:
+        match block:
+            case DocBlock.Heading(level, spans):
+                val label_text = spans_to_plain_text(spans)
+                entries = entries.push(_HeadingEntry(
+                    level: level,
+                    label: label_text,
+                    block_index: block_idx
+                ))
+            _:
+                pass_do_nothing("non-heading document blocks do not appear in the outline")
+        block_idx = block_idx + 1
+
+    val tree_children = _build_heading_tree(entries)
+    val tree = tree_widget("outline_tree", tree_children)
+    val scrollable = scroll("outline_scroll", 600, [tree])
+    return panel("outline_sidebar", "Outline", [scrollable])
+
+# =========================================================================
+# Internal Types
+# =========================================================================
+
+struct _HeadingEntry:
+    level: i32
+    label: text
+    block_index: i32
+
+# =========================================================================
+# Tree Construction
+# =========================================================================
+
+fn _build_heading_tree(entries: [_HeadingEntry]) -> [WidgetNode]:
+    """Convert a flat list of heading entries into a nested tree of WidgetNodes.
+
+    Strategy: iterate entries, maintaining current H1 and H2 contexts.
+    When a higher-level heading is encountered, flush the accumulated
+    children into the parent node."""
+
+    var top_nodes: [WidgetNode] = []
+
+    var h1_id = ""
+    var h1_label = ""
+    var h1_children: [WidgetNode] = []
+
+    var h2_id = ""
+    var h2_label = ""
+    var h2_children: [WidgetNode] = []
+
+    for entry in entries:
+        if entry.level == 1:
+            # Flush previous H2 into H1 children
+            if h2_id != "":
+                val h2_node = _make_tree_node(h2_id, h2_label, h2_children)
+                h1_children = h1_children.push(h2_node)
+                h2_id = ""
+                h2_label = ""
+                h2_children = []
+
+            # Flush previous H1 into top nodes
+            if h1_id != "":
+                val h1_node = _make_tree_node(h1_id, h1_label, h1_children)
+                top_nodes = top_nodes.push(h1_node)
+
+            # Start new H1
+            h1_id = "heading_{entry.block_index}"
+            h1_label = entry.label
+            h1_children = []
+
+        elif entry.level == 2:
+            # Flush previous H2 into H1 children
+            if h2_id != "":
+                val h2_node = _make_tree_node(h2_id, h2_label, h2_children)
+                h1_children = h1_children.push(h2_node)
+
+            # Start new H2
+            h2_id = "heading_{entry.block_index}"
+            h2_label = entry.label
+            h2_children = []
+
+        else:
+            # H3 or deeper: attach as leaf to current H2 (or H1 if no H2)
+            val leaf_id = "heading_{entry.block_index}"
+            var leaf = tree_leaf(leaf_id, entry.label)
+            leaf = leaf.set_prop("action", "goto_block_{entry.block_index}")
+
+            if h2_id != "":
+                h2_children = h2_children.push(leaf)
+            elif h1_id != "":
+                h1_children = h1_children.push(leaf)
+            else:
+                top_nodes = top_nodes.push(leaf)
+
+    # Flush remaining accumulators
+    if h2_id != "":
+        val h2_node = _make_tree_node(h2_id, h2_label, h2_children)
+        h1_children = h1_children.push(h2_node)
+
+    if h1_id != "":
+        val h1_node = _make_tree_node(h1_id, h1_label, h1_children)
+        top_nodes = top_nodes.push(h1_node)
+
+    return top_nodes
+
+fn _make_tree_node(id: text, label_text: text, children: [WidgetNode]) -> WidgetNode:
+    """Create a tree_node or tree_leaf depending on whether it has children."""
+    if children.len() == 0:
+        var leaf = tree_leaf(id, label_text)
+        leaf = leaf.set_prop("action", "goto_block_{id}")
+        return leaf
+    var node = tree_node(id, label_text, children)
+    node = node.set_prop("action", "goto_block_{id}")
+    return node

@@ -1,0 +1,177 @@
+# LLM Dashboard Login-Only Server
+#
+# Minimal runtime-safe server for validating the web login flow without the
+# full dashboard GUI dependency tree.
+
+use std.nogc_sync_mut.io.tcp.{TcpListener, TcpStream}
+use std.text.{to_int_or}
+use app.llm_dashboard.web_login.{
+    DashboardAuthSession,
+    auth_ensure_bootstrap,
+    auth_authenticate_form,
+    auth_session_from_headers,
+    auth_delete_session,
+    auth_login_page,
+    auth_login_cookie_header,
+    auth_clear_cookie_header,
+    auth_identity_html
+}
+
+fn parse_request_line(request_line: text) -> (text, text):
+    var method = ""
+    var path = ""
+    var idx = 0
+    for part in request_line.split(" "):
+        if idx == 0:
+            method = part
+        elif idx == 1:
+            path = part
+            break
+        idx = idx + 1
+    return (method, path)
+
+class LoginOnlyServer:
+    port: i32
+
+    static fn new(port: i32) -> LoginOnlyServer:
+        return LoginOnlyServer { port: port }
+
+    fn start():
+        print "Starting LLM dashboard login-only server on port {self.port}..."
+        print "Open http://localhost:{self.port}/login in your browser"
+
+        match TcpListener.bind("0.0.0.0:{self.port}"):
+            Err(e):
+                print "Error: Failed to bind to port {self.port}: {e}"
+                return
+            Ok(listener):
+                loop:
+                    match listener.accept():
+                        Ok(stream):
+                            self.handle_connection(stream)
+                        Err(e):
+                            print "Error accepting connection: {e}"
+
+    fn handle_connection(stream: TcpStream):
+        match stream.read_line():
+            Err(_):
+                val _ = stream.close()
+            Ok(request_line):
+                val request = parse_request_line(request_line)
+                val method = request.0
+                val path = request.1
+                if method == "" or path == "":
+                    val _ = stream.write_text(http_error(400, "Bad Request"))
+                    val _ = stream.close()
+                    return
+
+                var headers = ""
+                var content_length = 0
+                loop:
+                    match stream.read_line():
+                        Ok(header_line):
+                            if header_line.trim() == "":
+                                break
+                            headers = "{headers}{header_line}\n"
+                            if header_line.starts_with("Content-Length:"):
+                                val len_str = header_line[15:]
+                                content_length = to_int_or(len_str.trim(), 0)
+                        Err(_):
+                            break
+
+                var body = ""
+                if method == "POST" and content_length > 0:
+                    match stream.read_bytes(content_length):
+                        Ok(data):
+                            body = data
+                        Err(_):
+                            pass_dn
+
+                val response = self.route_request(method, path, body, headers)
+                val _ = stream.write_text(response)
+                val _ = stream.close()
+
+    fn route_request(method: text, path: text, body: text, headers: text) -> text:
+        val clean_path = _clean_path(path)
+        val session = auth_session_from_headers(headers)
+
+        if clean_path == "/login":
+            return self.handle_login(method, body, session)
+
+        if clean_path == "/logout":
+            return self.handle_logout(session)
+
+        if clean_path == "/" and session != nil:
+            return http_response(200, "text/html", _welcome_page(session))
+
+        return http_redirect("/login")
+
+    fn handle_login(method: text, body: text, session: DashboardAuthSession?) -> text:
+        if method == "GET":
+            if session != nil:
+                return http_redirect("/")
+            return http_response(200, "text/html", auth_login_page("", ""))
+
+        if method != "POST":
+            return http_error(405, "Method Not Allowed")
+
+        val auth_result = auth_authenticate_form(body)
+        if val auth_session = auth_result.0:
+            return http_redirect_with_headers("/", [auth_login_cookie_header(auth_session)])
+        return http_response(401, "text/html", auth_login_page(auth_result.1, auth_result.2))
+
+    fn handle_logout(session: DashboardAuthSession?) -> text:
+        if val active = session:
+            auth_delete_session(active.session_id)
+        return http_redirect_with_headers("/login", [auth_clear_cookie_header()])
+
+fn _welcome_page(session: DashboardAuthSession?) -> text:
+    var identity = ""
+    if val active = session:
+        identity = auth_identity_html(active)
+    "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>LLM Dashboard Login Validation</title></head><body><h1>Login validation server</h1><p>The reusable login flow is active.</p><div>{identity}</div><p><a href=\"/logout\">Log out</a></p></body></html>"
+
+fn http_response(status: i32, content_type: text, body: text) -> text:
+    return http_response_with_headers(status, content_type, body, [])
+
+fn http_response_with_headers(status: i32, content_type: text, body: text, extra_headers: [text]) -> text:
+    val status_text = match status:
+        200: "OK"
+        302: "Found"
+        400: "Bad Request"
+        401: "Unauthorized"
+        405: "Method Not Allowed"
+        500: "Internal Server Error"
+        _: "Unknown"
+
+    var response = "HTTP/1.1 {status} {status_text}\r\n"
+    response = "{response}Content-Type: {content_type}\r\n"
+    response = "{response}Content-Length: {body.len()}\r\n"
+    for header in extra_headers:
+        response = "{response}{header}\r\n"
+    response = "{response}Connection: close\r\n"
+    response = "{response}\r\n"
+    response = "{response}{body}"
+    return response
+
+fn http_redirect(location: text) -> text:
+    return http_redirect_with_headers(location, [])
+
+fn http_redirect_with_headers(location: text, extra_headers: [text]) -> text:
+    var headers = ["Location: {location}"]
+    for header in extra_headers:
+        headers.push(header)
+    return http_response_with_headers(302, "text/plain", "", headers)
+
+fn http_error(status: i32, message: text) -> text:
+    return http_response(status, "text/plain", message)
+
+fn _clean_path(path: text) -> text:
+    if path.contains("?"):
+        return path[0:path.index_of("?") ?? path.len()]
+    path
+
+fn main() -> i64:
+    val server = LoginOnlyServer.new(38123)
+    server.start()
+    return 0

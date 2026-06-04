@@ -1,0 +1,203 @@
+# SDoctest Type Definitions
+#
+# All data structures for the sdoctest documentation testing system.
+
+# =========================================================================
+# Modifier Enum - inline fence modifiers
+# =========================================================================
+
+enum SdoctestModifier:
+    Skip
+    Ignore
+    ShouldFail
+    FailAsSuccess
+    IgnoreOutput
+    Init(text)
+    Env(text)
+    Tag(text)
+    RunConfig(text)
+
+# =========================================================================
+# Block Status
+# =========================================================================
+
+enum BlockStatus:
+    Passed
+    Failed
+    Skipped
+    Error
+
+# =========================================================================
+# Source Config - an entry in sources list
+# =========================================================================
+
+struct SdoctestSource:
+    path: text
+    is_dir: bool
+    pattern: text
+    init: text
+    env: text
+
+# =========================================================================
+# Init Script Config
+# =========================================================================
+
+struct SdoctestInitScript:
+    name: text
+    file: text
+
+# =========================================================================
+# Environment Config
+# =========================================================================
+
+struct SdoctestEnv:
+    name: text
+    timeout: i64
+    env_vars: Dict<text, text>
+    run_config: text
+
+# =========================================================================
+# Ignore Config
+# =========================================================================
+
+struct SdoctestIgnore:
+    paths: [text]
+    tags: [text]
+
+# =========================================================================
+# Top-Level Config
+# =========================================================================
+
+struct SdoctestConfig:
+    version: i64
+    default_timeout: i64
+    sources: [SdoctestSource]
+    ignore: SdoctestIgnore
+    init_scripts: [SdoctestInitScript]
+    environments: [SdoctestEnv]
+
+# =========================================================================
+# Extracted Code Block
+# =========================================================================
+
+struct SdoctestBlock:
+    source_file: text
+    line_number: i64
+    code: text
+    language: text
+    modifiers: [SdoctestModifier]
+
+impl SdoctestBlock:
+    fn has_modifier_skip() -> bool:
+        for m in self.modifiers:
+            match m:
+                case SdoctestModifier.Skip: return true
+                case _: pass
+        false
+
+    fn has_modifier_ignore() -> bool:
+        for m in self.modifiers:
+            match m:
+                case SdoctestModifier.Ignore: return true
+                case _: pass
+        false
+
+    fn has_modifier_should_fail() -> bool:
+        for m in self.modifiers:
+            match m:
+                case SdoctestModifier.ShouldFail: return true
+                case _: pass
+        false
+
+    fn has_modifier_fail_as_success() -> bool:
+        for m in self.modifiers:
+            match m:
+                case SdoctestModifier.FailAsSuccess: return true
+                case _: pass
+        false
+
+    fn has_modifier_ignore_output() -> bool:
+        for m in self.modifiers:
+            match m:
+                case SdoctestModifier.IgnoreOutput: return true
+                case _: pass
+        false
+
+    fn get_init_name() -> text:
+        for m in self.modifiers:
+            match m:
+                case SdoctestModifier.Init(name): return name
+                case _: pass
+        ""
+
+    fn get_env_name() -> text:
+        for m in self.modifiers:
+            match m:
+                case SdoctestModifier.Env(name): return name
+                case _: pass
+        ""
+
+    fn get_run_config() -> text:
+        for m in self.modifiers:
+            match m:
+                case SdoctestModifier.RunConfig(rc): return rc
+                case _: pass
+        ""
+
+    fn get_tags() -> [text]:
+        var tags: [text] = []
+        for m in self.modifiers:
+            match m:
+                case SdoctestModifier.Tag(t): tags.push(t)
+                case _: pass
+        tags
+
+# =========================================================================
+# Block Result
+# =========================================================================
+
+struct BlockResult:
+    block: SdoctestBlock
+    status: BlockStatus
+    duration_ms: i64
+    stdout: text
+    stderr: text
+    error: text
+
+# =========================================================================
+# File Result (aggregates blocks from one markdown file)
+# =========================================================================
+
+struct SdoctestFileResult:
+    source_file: text
+    blocks: [BlockResult]
+    total: i64
+    passed: i64
+    failed: i64
+    skipped: i64
+    errors: i64
+    accepted: i64
+    duration_ms: i64
+
+# =========================================================================
+# Run Result (aggregates all files)
+# =========================================================================
+
+struct SdoctestRunResult:
+    files: [SdoctestFileResult]
+    total: i64
+    passed: i64
+    failed: i64
+    skipped: i64
+    errors: i64
+    accepted: i64
+    duration_ms: i64
+
+impl SdoctestRunResult:
+    fn is_ok() -> bool:
+        self.failed == 0 and self.errors == 0
+
+# =========================================================================
+# Exports
+# =========================================================================
+

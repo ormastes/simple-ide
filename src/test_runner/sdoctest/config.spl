@@ -1,0 +1,309 @@
+# SDoctest Configuration
+#
+# Parses sdoctest.sdn config file using simple line-based parsing.
+# Falls back to sensible defaults if config file is missing.
+# Note: Uses manual parsing instead of std.sdn.parser due to runtime limitations.
+# Note: All array pushes are inline (not in helper functions) due to BUG-15
+#       (arrays passed to functions are copied, push inside function doesn't modify caller's array).
+
+use std.io.{file_read, file_exists}
+use std.test_runner.sdoctest.types.{SdoctestConfig, SdoctestEnv, SdoctestIgnore, SdoctestInitScript, SdoctestSource}
+
+# =========================================================================
+# Public API
+# =========================================================================
+
+fn load_sdoctest_config(config_path: text) -> SdoctestConfig:
+    if not file_exists(config_path):
+        return default_sdoctest_config()
+
+    val content = file_read(config_path) ?? ""
+    if content == "":
+        return default_sdoctest_config()
+
+    parse_config_from_text(content)
+
+fn default_sdoctest_config() -> SdoctestConfig:
+    SdoctestConfig(
+        version: 1,
+        default_timeout: 5000,
+        sources: [
+            SdoctestSource(path: "README.md", is_dir: false, pattern: "", init: "", env: ""),
+            SdoctestSource(path: "doc/", is_dir: true, pattern: "*.md", init: "", env: ""),
+            SdoctestSource(path: "examples/", is_dir: true, pattern: "*.md", init: "", env: "")
+        ],
+        ignore: SdoctestIgnore(paths: ["doc/11_archive/**", "doc/09_report/**"], tags: []),
+        init_scripts: [],
+        environments: [
+            SdoctestEnv(name: "default", timeout: 5000, env_vars: {}, run_config: "")
+        ]
+    )
+
+# =========================================================================
+# Simple Line-Based Config Parser
+# =========================================================================
+
+fn parse_config_from_text(content: text) -> SdoctestConfig:
+    val lines = content.split("\n")
+    var version = 1
+    var default_timeout = 5000
+    var sources: [SdoctestSource] = []
+    var ignore_paths: [text] = []
+    var ignore_tags: [text] = []
+    var init_scripts: [SdoctestInitScript] = []
+    var environments: [SdoctestEnv] = []
+
+    # Track which section we're in
+    var section = ""
+    var subsection = ""
+    var current_source_path = ""
+    var current_source_is_dir = false
+    var current_source_pattern = ""
+    var current_source_init = ""
+    var current_source_env = ""
+    var current_init_name = ""
+    var current_init_file = ""
+    var current_env_name = ""
+    var current_env_timeout = 5000
+    var current_env_vars: Dict<text, text> = {}
+    var current_env_run_config = ""
+    var in_env_vars = false
+
+    var i = 0
+    while i < lines.len():
+        val line = lines[i]
+        val trimmed = line.trim()
+
+        # Skip empty lines and comments
+        if trimmed == "" or trimmed.starts_with( "#"):
+            i = i + 1
+            continue
+
+        val indent = line_indent(line)
+
+        # Top-level sections (indent 0)
+        if indent == 0 and trimmed.ends_with( ":"):
+            # Flush previous section data (inline due to BUG-15)
+            if current_source_path != "":
+                val pat = if current_source_is_dir and current_source_pattern == "": "*.md" else: current_source_pattern
+                sources.push(SdoctestSource(path: current_source_path, is_dir: current_source_is_dir, pattern: pat, init: current_source_init, env: current_source_env))
+            current_source_path = ""
+            if current_init_name != "":
+                init_scripts.push(SdoctestInitScript(name: current_init_name, file: current_init_file))
+            current_init_name = ""
+            if current_env_name != "":
+                environments.push(SdoctestEnv(name: current_env_name, timeout: current_env_timeout, env_vars: current_env_vars, run_config: current_env_run_config))
+            current_env_name = ""
+            in_env_vars = false
+
+            val section_str = trimmed[0:trimmed.len() - 1]
+            section = section_str.trim()
+            subsection = ""
+            i = i + 1
+            continue
+
+        # sdoctest section fields
+        if section == "sdoctest":
+            val kv = parse_kv(trimmed)
+            if kv.0 == "version":
+                version = to_int(kv.1)
+            elif kv.0 == "default_timeout":
+                default_timeout = to_int(kv.1)
+
+        # sources section - array of entries
+        elif section == "sources":
+            if trimmed.starts_with( "- "):
+                # Flush previous source (inline due to BUG-15)
+                if current_source_path != "":
+                    val pat = if current_source_is_dir and current_source_pattern == "": "*.md" else: current_source_pattern
+                    sources.push(SdoctestSource(path: current_source_path, is_dir: current_source_is_dir, pattern: pat, init: current_source_init, env: current_source_env))
+                current_source_path = ""
+                current_source_is_dir = false
+                current_source_pattern = ""
+                current_source_init = ""
+                current_source_env = ""
+
+                val entry_substr = trimmed[2:]
+                val entry_str = entry_substr.trim()
+                val kv = parse_kv(entry_str)
+                if kv.0 == "file":
+                    current_source_path = strip_quotes(kv.1)
+                    current_source_is_dir = false
+                elif kv.0 == "dir":
+                    current_source_path = strip_quotes(kv.1)
+                    current_source_is_dir = true
+            else:
+                # Continuation of current source entry
+                val kv = parse_kv(trimmed)
+                if kv.0 == "init":
+                    current_source_init = strip_quotes(kv.1)
+                elif kv.0 == "env":
+                    current_source_env = strip_quotes(kv.1)
+                elif kv.0 == "pattern":
+                    current_source_pattern = strip_quotes(kv.1)
+
+        # ignore section
+        elif section == "ignore":
+            val kv = parse_kv(trimmed)
+            if kv.0 == "paths":
+                ignore_paths = parse_inline_array(kv.1)
+            elif kv.0 == "tags":
+                ignore_tags = parse_inline_array(kv.1)
+
+        # init_scripts section
+        elif section == "init_scripts":
+            if indent == 2 and trimmed.ends_with( ":"):
+                # Flush previous (inline due to BUG-15)
+                if current_init_name != "":
+                    init_scripts.push(SdoctestInitScript(name: current_init_name, file: current_init_file))
+                val init_substr = trimmed[0:trimmed.len() - 1]
+                current_init_name = init_substr.trim()
+                current_init_file = ""
+            else:
+                val kv = parse_kv(trimmed)
+                if kv.0 == "file":
+                    current_init_file = strip_quotes(kv.1)
+
+        # environments section
+        elif section == "environments":
+            if indent == 2 and trimmed.ends_with( ":"):
+                # Flush previous (inline due to BUG-15)
+                if current_env_name != "":
+                    environments.push(SdoctestEnv(name: current_env_name, timeout: current_env_timeout, env_vars: current_env_vars, run_config: current_env_run_config))
+                val env_substr = trimmed[0:trimmed.len() - 1]
+                current_env_name = env_substr.trim()
+                current_env_timeout = default_timeout
+                current_env_vars = {}
+                current_env_run_config = ""
+                in_env_vars = false
+            elif trimmed == "env_vars:":
+                in_env_vars = true
+            elif in_env_vars:
+                val kv = parse_kv(trimmed)
+                if kv.0 != "":
+                    current_env_vars[kv.0] = strip_quotes(kv.1)
+            else:
+                val kv = parse_kv(trimmed)
+                if kv.0 == "timeout":
+                    current_env_timeout = to_int(kv.1)
+                elif kv.0 == "run-config":
+                    current_env_run_config = strip_quotes(kv.1)
+
+        i = i + 1
+
+    # Flush final entries (inline due to BUG-15)
+    if current_source_path != "":
+        val pat = if current_source_is_dir and current_source_pattern == "": "*.md" else: current_source_pattern
+        sources.push(SdoctestSource(path: current_source_path, is_dir: current_source_is_dir, pattern: pat, init: current_source_init, env: current_source_env))
+    if current_init_name != "":
+        init_scripts.push(SdoctestInitScript(name: current_init_name, file: current_init_file))
+    if current_env_name != "":
+        environments.push(SdoctestEnv(name: current_env_name, timeout: current_env_timeout, env_vars: current_env_vars, run_config: current_env_run_config))
+
+    if environments.len() == 0:
+        environments.push(SdoctestEnv(name: "default", timeout: default_timeout, env_vars: {}, run_config: ""))
+
+    SdoctestConfig(
+        version: version,
+        default_timeout: default_timeout,
+        sources: sources,
+        ignore: SdoctestIgnore(paths: ignore_paths, tags: ignore_tags),
+        init_scripts: init_scripts,
+        environments: environments
+    )
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn make_source(path: text, is_dir: bool, pattern: text, init: text, env: text) -> SdoctestSource:
+    val pat = if is_dir and pattern == "": "*.md" else: pattern
+    SdoctestSource(path: path, is_dir: is_dir, pattern: pat, init: init, env: env)
+
+# =========================================================================
+# Parsing Helpers
+# =========================================================================
+
+fn line_indent(line: text) -> i64:
+    var count = 0
+    var i = 0
+    while i < line.len():
+        val ch = line[i:i + 1]
+        if ch == " ":
+            count = count + 1
+        elif ch == "\t":
+            count = count + 4
+        else:
+            break
+        i = i + 1
+    count
+
+fn parse_kv(s: text) -> (text, text):
+    val idx = s.index_of(":") ?? -1
+    if idx < 0:
+        return ("", s)
+    val key_str = s[0:idx]
+    val key = key_str.trim()
+    val value_str = s[idx + 1:]
+    val value = value_str.trim()
+    (key, value)
+
+fn strip_quotes(s: text) -> text:
+    if s.len() >= 2:
+        val starts_dquote = s.starts_with( "\"")
+        val ends_dquote = s.ends_with( "\"")
+        val starts_squote = s.starts_with( "'")
+        val ends_squote = s.ends_with( "'")
+        if (starts_dquote and ends_dquote) or (starts_squote and ends_squote):
+            return s[1 : s.len() - 1]
+    s
+
+fn parse_inline_array(s: text) -> [text]:
+    # Parse ["item1", "item2", "item3"]
+    var items: [text] = []
+    var inner = s.trim()
+    if starts_with(inner, "["):
+        inner = inner[1:]
+    if ends_with(inner, "]"):
+        inner = inner[0:inner.len() - 1]
+
+    val parts = inner.split(",")
+    for part in parts:
+        val trimmed = part.trim()
+        if trimmed != "":
+            items.push(strip_quotes(trimmed))
+
+    items
+
+# =========================================================================
+# Lookup Helpers
+# =========================================================================
+
+fn find_init_script_file(config: SdoctestConfig, name: text) -> text:
+    for script in config.init_scripts:
+        if script.name == name:
+            return script.file
+    ""
+
+fn find_env_timeout(config: SdoctestConfig, name: text) -> i64:
+    for env in config.environments:
+        if env.name == name:
+            return env.timeout
+    config.default_timeout
+
+fn find_env_vars(config: SdoctestConfig, name: text) -> Dict<text, text>:
+    for env in config.environments:
+        if env.name == name:
+            return env.env_vars
+    {}
+
+fn find_env_run_config(config: SdoctestConfig, name: text) -> text:
+    for env in config.environments:
+        if env.name == name:
+            return env.run_config
+    ""
+
+# =========================================================================
+# Exports
+# =========================================================================
+

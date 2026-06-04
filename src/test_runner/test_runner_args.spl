@@ -1,0 +1,497 @@
+# Test Runner Argument Parsing
+#
+# Parses command-line arguments and creates TestOptions.
+
+use std.test_runner.test_runner_types.{OutputFormat, TestExecutionMode, TestLevel, TestOptions}
+use std.io.{shell_output, env_get}
+
+extern fn rt_file_exists(path: text) -> bool
+
+# =========================================================================
+# Mode String Parsing
+# =========================================================================
+
+fn parse_mode_str(m: text) -> TestExecutionMode:
+    if m == "native" or m == "binary":
+        return TestExecutionMode.Native
+    if m == "compile":
+        return TestExecutionMode.Compile
+    if m == "smf" or m == "loader":
+        return TestExecutionMode.Smf
+    if m == "jit":
+        return TestExecutionMode.Composite("jit")
+    # Support composite platform specs like "baremetal(riscv32)",
+    # "interpreter(baremetal(riscv32))", "jit(remote(baremetal(stm32h7)))", etc.
+    if m.contains("baremetal") or m.contains("remote") or m.contains("container") or m.contains("jit("):
+        # Normalize: if no base runtime prefix, add "interpreter("
+        if not m.starts_with("interpreter(") and not m.starts_with("smf(") and not m.starts_with("native(") and not m.starts_with("jit("):
+            return TestExecutionMode.Composite("interpreter(" + m + ")")
+        return TestExecutionMode.Composite(m)
+    TestExecutionMode.Interpreter
+
+# =========================================================================
+# Argument Parsing
+# =========================================================================
+
+fn parse_test_args(args: [text]) -> TestOptions:
+    var path = ""
+    var level = TestLevel.All
+    var tag = ""
+    var fail_fast = false
+    var mode = TestExecutionMode.Interpreter
+    var timeout = 120
+    var list = false
+    var list_ignored = false
+    var only_slow = false
+    var only_skipped = false
+    var show_tags = false
+    var gc_log = false
+    var gc_off = false
+    var seed = 0
+    var seed_set = false
+    var safe_mode = false
+    var force_rebuild = false
+    var keep_artifacts = false
+    var run_all = false
+    var format = OutputFormat.Default
+    var list_skip_features = false
+    var planned_only = false
+    var no_limits = false
+    var sdoctest = false
+    var sdoctest_env = ""
+    var sdoctest_force = false
+    var no_db = false
+    var verbose = false
+    var coverage = false
+    var execution_mode = ""
+    var container_sequential = false
+    var self_protect = true   # Enabled by default — stops when free drops below 25%
+    var resume = false
+    var cpu_threshold = 75.0  # Stop at 75% CPU usage (= less than 25% free)
+    var mem_threshold = 75.0  # Stop at 75% RAM usage (= less than 25% free)
+    # Disable parallel by default when running as a child of the test runner
+    # (SIMPLE_TEST_RUNNER_RUST is set by the runtime when spawning child processes
+    # via cli.rs / cli_sffi.rs). Without this guard every worker process would
+    # itself spin up another worker pool, causing exponential process explosion.
+    var parallel = env_get("SIMPLE_TEST_RUNNER_RUST") != "1"
+    var sequential = false
+    var max_workers = 0
+    var parallel_timeout = 300
+    var closure_warnings = false
+    var ci_mode = false
+    # Advanced testing modes
+    var fuzz_mode = false
+    var fuzz_time_secs = 60
+    var fuzz_corpus_dir = "test/03_system/feature/language/fuzz/corpus"
+    var fuzz_differential = false
+    var fuzz_shrink = true
+    var chaos_mode = false
+    var chaos_trials = 100
+    var chaos_fault_rate = 10
+    var deploy_mode = false
+    var deploy_platform = ""
+    var deploy_upgrade = false
+    var security_mode = false
+    var security_scan = false
+    var security_supply_chain = false
+    var spl_doctest = false
+    var max_mem_gb = 16
+    var mem_check = false
+    var fork_mode = _is_fork_available()
+    var resource_limit_pct = 75
+    var no_cache = false
+    var refresh_manifest = false
+    var manifest_status = false
+    var clean = false
+    var no_cover_check = false
+    # Session sharing options
+    var session_share = false
+    var session_daemon = false
+    var session_kind = ""
+    var max_sessions = 0
+    var session_debug = false
+    var session_reset = ""
+    var assert_ran = false
+
+    var i = 0
+    while i < args.len():
+        val arg = args[i]
+        if arg == "--unit":
+            level = TestLevel.Unit
+        elif arg == "--integration":
+            level = TestLevel.Integration
+        elif arg == "--system":
+            level = TestLevel.System
+        elif arg == "--fail-fast":
+            fail_fast = true
+        elif arg == "--list":
+            list = true
+        elif arg == "--list-ignored":
+            list = true
+            list_ignored = true
+        elif arg == "--only-slow":
+            only_slow = true
+        elif arg == "--only-skipped":
+            only_skipped = true
+        elif arg == "--show-tags":
+            show_tags = true
+        elif arg == "--gc-log":
+            gc_log = true
+        elif arg == "--gc=off" or arg == "--gc=OFF":
+            gc_off = true
+        elif arg == "--safe-mode" or arg == "--safe":
+            safe_mode = true
+        elif arg == "--force-rebuild":
+            force_rebuild = true
+        elif arg == "--keep-artifacts":
+            keep_artifacts = true
+        elif arg == "--all":
+            run_all = true
+        elif arg == "--list-skip-features" or arg == "--skip-features":
+            list_skip_features = true
+            only_skipped = true
+            list = true
+        elif arg == "--planned-only" or arg == "--pending":
+            planned_only = true
+        elif arg == "--no-limits":
+            no_limits = true
+        elif arg == "--max-mem":
+            i = i + 1
+            if i < args.len():
+                max_mem_gb = to_int(args[i])
+        elif arg.starts_with("--max-mem="):
+            max_mem_gb = to_int(arg[10:])
+        elif arg == "--no-db":
+            no_db = true
+        elif arg == "--verbose" or arg == "-v":
+            verbose = true
+        elif arg == "--quick" or arg == "-q":
+            no_db = true
+        elif arg == "--coverage":
+            coverage = true
+        elif arg == "--assert-ran":
+            assert_ran = true
+        elif arg == "--execution-mode":
+            i = i + 1
+            if i < args.len():
+                execution_mode = args[i]
+        elif arg.starts_with("--execution-mode="):
+            execution_mode = arg[17:]
+        elif arg == "--container-sequential" or arg == "--container-seq":
+            container_sequential = true
+            execution_mode = "container-seq"
+        elif arg == "--self-protect":
+            self_protect = true
+        elif arg == "--no-self-protect":
+            self_protect = false
+        elif arg == "--resume":
+            resume = true
+        elif arg == "--cpu-threshold":
+            i = i + 1
+            if i < args.len():
+                cpu_threshold = parse_f64(args[i])
+        elif arg.starts_with("--cpu-threshold="):
+            cpu_threshold = parse_f64(arg[16:])
+        elif arg == "--mem-threshold":
+            i = i + 1
+            if i < args.len():
+                mem_threshold = parse_f64(args[i])
+        elif arg.starts_with("--mem-threshold="):
+            mem_threshold = parse_f64(arg[16:])
+        elif arg == "--parallel":
+            parallel = true
+            sequential = false
+        elif arg == "--sequential" or arg == "-s":
+            sequential = true
+            parallel = false
+        elif arg == "--resource-limit":
+            i = i + 1
+            if i < args.len():
+                resource_limit_pct = to_int(args[i])
+        elif arg.starts_with("--resource-limit="):
+            resource_limit_pct = to_int(arg[17:])
+        elif arg == "--max-workers":
+            i = i + 1
+            if i < args.len():
+                max_workers = to_int(args[i])
+        elif arg.starts_with("--max-workers="):
+            max_workers = to_int(arg[14:])
+        elif arg == "--parallel-timeout":
+            i = i + 1
+            if i < args.len():
+                parallel_timeout = to_int(args[i])
+        elif arg.starts_with("--parallel-timeout="):
+            parallel_timeout = to_int(arg[19:])
+        elif arg == "--closure-warnings":
+            closure_warnings = true
+        elif arg == "--ci":
+            ci_mode = true
+            run_all = true
+            fail_fast = false
+        elif arg == "--fuzz":
+            fuzz_mode = true
+        elif arg == "--fuzz-time":
+            i = i + 1
+            if i < args.len():
+                fuzz_time_secs = to_int(args[i])
+        elif arg.starts_with("--fuzz-time="):
+            fuzz_time_secs = to_int(arg[12:])
+        elif arg == "--fuzz-corpus":
+            i = i + 1
+            if i < args.len():
+                fuzz_corpus_dir = args[i]
+        elif arg.starts_with("--fuzz-corpus="):
+            fuzz_corpus_dir = arg[14:]
+        elif arg == "--fuzz-differential":
+            fuzz_differential = true
+        elif arg == "--no-shrink":
+            fuzz_shrink = false
+        elif arg == "--chaos":
+            chaos_mode = true
+        elif arg == "--chaos-trials":
+            i = i + 1
+            if i < args.len():
+                chaos_trials = to_int(args[i])
+        elif arg.starts_with("--chaos-trials="):
+            chaos_trials = to_int(arg[15:])
+        elif arg == "--chaos-fault-rate":
+            i = i + 1
+            if i < args.len():
+                chaos_fault_rate = to_int(args[i])
+        elif arg.starts_with("--chaos-fault-rate="):
+            chaos_fault_rate = to_int(arg[19:])
+        elif arg == "--deploy":
+            deploy_mode = true
+        elif arg == "--deploy-platform":
+            i = i + 1
+            if i < args.len():
+                deploy_platform = args[i]
+        elif arg.starts_with("--deploy-platform="):
+            deploy_platform = arg[18:]
+        elif arg == "--deploy-upgrade":
+            deploy_upgrade = true
+        elif arg == "--security":
+            security_mode = true
+        elif arg == "--security-scan":
+            security_scan = true
+        elif arg == "--security-supply-chain":
+            security_supply_chain = true
+        elif arg == "--spl-doctest":
+            spl_doctest = true
+        elif arg == "--mem-check":
+            mem_check = true
+        elif arg == "--fork-mode" or arg == "--fork":
+            fork_mode = true
+        elif arg == "--no-fork":
+            fork_mode = false
+        elif arg == "--no-cache":
+            no_cache = true
+        elif arg == "--refresh-manifest":
+            refresh_manifest = true
+        elif arg == "--manifest-status":
+            manifest_status = true
+        elif arg == "--clean":
+            clean = true
+        elif arg == "--no-cover-check":
+            no_cover_check = true
+        elif arg == "--session-share":
+            session_share = true
+        elif arg == "--no-session-share":
+            session_share = false
+        elif arg == "--session-daemon":
+            session_daemon = true
+            session_share = true
+        elif arg == "--session-kind":
+            i = i + 1
+            if i < args.len():
+                session_kind = args[i]
+        elif arg.starts_with("--session-kind="):
+            session_kind = arg[15:]
+        elif arg == "--max-sessions":
+            i = i + 1
+            if i < args.len():
+                max_sessions = to_int(args[i])
+        elif arg.starts_with("--max-sessions="):
+            max_sessions = to_int(arg[15:])
+        elif arg == "--session-debug":
+            session_debug = true
+        elif arg == "--session-reset":
+            i = i + 1
+            if i < args.len():
+                session_reset = args[i]
+        elif arg.starts_with("--session-reset="):
+            session_reset = arg[16:]
+        elif arg == "--sdoctest":
+            sdoctest = true
+        elif arg == "--sdoctest-force":
+            sdoctest_force = true
+        elif arg.starts_with("--sdoctest-env="):
+            sdoctest_env = arg[15:]
+        elif arg == "--sdoctest-env":
+            i = i + 1
+            if i < args.len():
+                sdoctest_env = args[i]
+        elif arg == "--tag":
+            i = i + 1
+            if i < args.len():
+                tag = args[i]
+        elif arg == "--doc":
+            format = OutputFormat.Doc
+        elif arg == "--format":
+            i = i + 1
+            if i < args.len():
+                if args[i] == "doc":
+                    format = OutputFormat.Doc
+        elif arg == "--compile":
+            mode = TestExecutionMode.Compile
+        elif arg == "--mode":
+            i = i + 1
+            if i < args.len():
+                mode = parse_mode_str(args[i])
+        elif arg.starts_with("--mode="):
+            val m = arg.replace("--mode=", "")
+            mode = parse_mode_str(m)
+        elif arg == "--timeout":
+            i = i + 1
+            if i < args.len():
+                timeout = to_int(args[i])
+        elif arg == "--seed":
+            i = i + 1
+            if i < args.len():
+                seed = to_int(args[i])
+                seed_set = true
+        elif not arg.starts_with("-") and path == "":
+            path = arg
+        i = i + 1
+
+    if path == "":
+        path = "test/"
+
+    if no_limits:
+        max_mem_gb = 0
+
+    TestOptions(
+        path: path,
+        level: level,
+        tag: tag,
+        fail_fast: fail_fast,
+        mode: mode,
+        timeout: timeout,
+        list: list,
+        list_ignored: list_ignored,
+        only_slow: only_slow,
+        only_skipped: only_skipped,
+        show_tags: show_tags,
+        gc_log: gc_log,
+        gc_off: gc_off,
+        seed: seed,
+        seed_set: seed_set,
+        safe_mode: safe_mode,
+        force_rebuild: force_rebuild,
+        keep_artifacts: keep_artifacts,
+        run_all: run_all,
+        format: format,
+        list_skip_features: list_skip_features,
+        planned_only: planned_only,
+        no_limits: no_limits,
+        sdoctest: sdoctest,
+        sdoctest_env: sdoctest_env,
+        sdoctest_force: sdoctest_force,
+        no_db: no_db,
+        verbose: verbose,
+        coverage: coverage,
+        execution_mode: execution_mode,
+        container_sequential: container_sequential,
+        self_protect: self_protect,
+        resume: resume,
+        cpu_threshold: cpu_threshold,
+        mem_threshold: mem_threshold,
+        parallel: parallel,
+        sequential: sequential,
+        max_workers: max_workers,
+        parallel_timeout: parallel_timeout,
+        closure_warnings: closure_warnings,
+        ci_mode: ci_mode,
+        fuzz_mode: fuzz_mode,
+        fuzz_time_secs: fuzz_time_secs,
+        fuzz_corpus_dir: fuzz_corpus_dir,
+        fuzz_differential: fuzz_differential,
+        fuzz_shrink: fuzz_shrink,
+        chaos_mode: chaos_mode,
+        chaos_trials: chaos_trials,
+        chaos_fault_rate: chaos_fault_rate,
+        deploy_mode: deploy_mode,
+        deploy_platform: deploy_platform,
+        deploy_upgrade: deploy_upgrade,
+        security_mode: security_mode,
+        security_scan: security_scan,
+        security_supply_chain: security_supply_chain,
+        spl_doctest: spl_doctest,
+        max_mem_gb: max_mem_gb,
+        mem_check: mem_check,
+        fork_mode: fork_mode,
+        resource_limit_pct: resource_limit_pct,
+        no_cache: no_cache,
+        refresh_manifest: refresh_manifest,
+        manifest_status: manifest_status,
+        clean: clean,
+        session_share: session_share,
+        session_daemon: session_daemon,
+        session_kind: session_kind,
+        max_sessions: max_sessions,
+        session_debug: session_debug,
+        session_reset: session_reset,
+        assert_ran: assert_ran,
+        no_cover_check: no_cover_check
+    )
+
+# =========================================================================
+# Helper Functions
+# =========================================================================
+
+fn parse_f64(s: text) -> f64:
+    """Parse float from string (simple implementation)"""
+    var result = 0.0
+    var decimal_part = 0.0
+    var decimal_divisor = 1.0
+    var seen_dot = false
+
+    for i in s.len():
+        val ch = s[i:i + 1]
+
+        if ch == ".":
+            seen_dot = true
+        else:
+            val is_digit = ch >= "0" and ch <= "9"
+            if is_digit:
+                var digit = 0
+                if ch == "0": digit = 0
+                if ch == "1": digit = 1
+                if ch == "2": digit = 2
+                if ch == "3": digit = 3
+                if ch == "4": digit = 4
+                if ch == "5": digit = 5
+                if ch == "6": digit = 6
+                if ch == "7": digit = 7
+                if ch == "8": digit = 8
+                if ch == "9": digit = 9
+
+                if seen_dot:
+                    decimal_divisor = decimal_divisor * 10.0
+                    decimal_part = decimal_part + (digit * 1.0)
+                else:
+                    result = result * 10.0 + (digit * 1.0)
+
+    if seen_dot:
+        result = result + (decimal_part / decimal_divisor)
+
+    result
+
+fn _is_fork_available() -> bool:
+    """Auto-detect fork availability. fork() is Linux-only.
+    Uses /proc/stat existence check instead of spawning uname subprocess."""
+    rt_file_exists("/proc/stat")
+
+# =========================================================================
+# Exports
+# =========================================================================

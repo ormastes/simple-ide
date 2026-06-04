@@ -1,0 +1,32 @@
+use app.test_cache_shared.{TestCacheEntry, TEST_RESULT_CACHE_VERSION, stale_entry}
+use app.test_cache_shared.{shared_cache_check_freshness, shared_cache_build_entry, shared_cache_save, shared_cache_load_entries}
+
+class TestResultCache:
+    entries: {text: TestCacheEntry}
+    cache_path: text
+
+fn test_result_cache_new(cache_path: text) -> TestResultCache:
+    TestResultCache(entries: {}, cache_path: cache_path)
+
+impl TestResultCache:
+    fn check_freshness(test_path: text, dep_paths: [text]) -> TestCacheEntry:
+        shared_cache_check_freshness(self.entries, test_path, dep_paths)
+
+    fn is_fresh(test_path: text, dep_paths: [text]) -> bool:
+        val entry = self.check_freshness(test_path, dep_paths)
+        entry.result_status == 0
+
+    me record_result(test_path: text, dep_paths: [text], passed: i64, failed: i64, skipped: i64, duration_ms: i64):
+        var status = 0
+        if failed > 0:
+            status = 1
+        self.entries[test_path] = shared_cache_build_entry(test_path, dep_paths, status, passed, failed, skipped, duration_ms, "")
+
+    me invalidate_all():
+        self.entries = {}
+
+    me save():
+        shared_cache_save(self.entries, self.cache_path)
+
+fn test_result_cache_load(cache_path: text) -> TestResultCache:
+    TestResultCache(entries: shared_cache_load_entries(cache_path), cache_path: cache_path)

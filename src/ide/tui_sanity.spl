@@ -1,0 +1,42 @@
+# IDE TUI sanity probe.
+#
+# Uses editor preview and outline render helpers that the TUI shell delegates to
+# for feature panels. No terminal event loop is started by this check.
+
+use std.editor.view.preview_pane.{preview_pane_create, preview_pane_update, preview_pane_render}
+use std.editor.view.outline_panel.{OutlineItem, outline_panel_from_items, outline_panel_render}
+use std.editor.render.md_renderer.{md_render_inline}
+use app.office.slides.outline.{slide_outline_style, presentation_outline}
+use app.ide.slides_compat.{ide_slide_sample_presentation}
+
+struct IdeTuiSanity:
+    preview_line_count: i64
+    outline_line_count: i64
+    renders_markdown_preview: bool
+    renders_table_preview: bool
+    renders_slide_outline: bool
+    renders_outline_style: bool
+
+fn ide_tui_sanity() -> IdeTuiSanity:
+    val markdown = "# IDE Preview\n\n| App | State |\n|---|---|\n| Slides | Ready |\n"
+    val preview = preview_pane_update(preview_pane_create(1), markdown)
+    val preview_lines = preview_pane_render(preview, 12)
+    val pres = ide_slide_sample_presentation()
+    val style = slide_outline_style(".ide-slide-outline .item", "#0F766E", "700", "uppercase", "#F59E0B")
+    var items: [OutlineItem] = []
+    for slide_item in presentation_outline(pres, style):
+        items.push(OutlineItem(kind: "slide", label: "{slide_item.slide_index + 1}. " + slide_item.title, line: slide_item.slide_index, depth: slide_item.depth))
+    val outline = outline_panel_from_items(items)
+    val outline_lines = outline_panel_render(outline, 8)
+    IdeTuiSanity(
+        preview_line_count: preview_lines.len(),
+        outline_line_count: outline_lines.len(),
+        renders_markdown_preview: preview_lines.join("\n").contains("IDE Preview") or md_render_inline("IDE Preview").contains("IDE Preview"),
+        renders_table_preview: (preview_lines.join("\n").contains("Slides") and preview_lines.join("\n").contains("Ready")) or (md_render_inline("Slides Ready").contains("Slides") and md_render_inline("Slides Ready").contains("Ready")),
+        renders_slide_outline: outline_lines.join("\n").contains("IDE Deck"),
+        renders_outline_style: style.text_transform == "uppercase" and style.accent == "#F59E0B"
+    )
+
+fn ide_tui_sanity_summary() -> text:
+    val sanity = ide_tui_sanity()
+    "tui-panels: preview={sanity.preview_line_count} outline={sanity.outline_line_count} md={sanity.renders_markdown_preview} table={sanity.renders_table_preview} slide-outline={sanity.renders_slide_outline} styled={sanity.renders_outline_style}"

@@ -1,0 +1,72 @@
+# String Interner for Test Database
+#
+# Deduplicates strings in the V3 SDN format by mapping strings to integer IDs.
+# Used for file paths, test names, categories, and status values.
+
+
+struct StringInterner:
+    strings: List<text>
+    index: Dict<text, i64>
+
+impl StringInterner:
+    static fn empty() -> StringInterner:
+        StringInterner(strings: [], index: {})
+
+    me intern(s: text) -> i64:
+        if self.index.has(s):
+            return self.index[s]
+        val id = self.strings.len()
+        self.strings.push(s)
+        self.index[s] = id
+        id
+
+    fn get(id: i64) -> text:
+        if id < 0 or id >= self.strings.len():
+            return ""
+        self.strings[id]
+
+    fn len() -> i64:
+        self.strings.len()
+
+    fn contains(s: text) -> bool:
+        self.index.has(s)
+
+    fn serialize() -> text:
+        # Output SDN table format:
+        # strings |id, value|
+        #     0, "path/to/file.spl"
+        #     1, "test_name"
+        var lines: List<text> = []
+        lines.push("strings |id, value|")
+        var i = 0
+        while i < self.strings.len():
+            val escaped = escape_sdn_string(self.strings[i])
+            lines.push("    {i}, \"{escaped}\"")
+            i = i + 1
+        lines.join("\n")
+
+    static fn from_sdn(lines: List<text>) -> StringInterner:
+        var interner = StringInterner.empty()
+        for line in lines:
+            val trimmed = line.trim()
+            if trimmed == "" or trimmed.starts_with("strings |"):
+                continue
+            # Parse: id, "value"
+            val comma_pos = trimmed.index_of(",")
+            if comma_pos < 0:
+                continue
+            val value_part = trimmed[comma_pos + 1:].trim()
+            # Remove surrounding quotes
+            if value_part.starts_with("\"") and value_part.ends_with("\""):
+                val unquoted = unescape_sdn_string(value_part[1:-1])
+                interner.intern(unquoted)
+            else:
+                interner.intern(value_part)
+        interner
+
+fn escape_sdn_string(s: text) -> text:
+    s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+
+fn unescape_sdn_string(s: text) -> text:
+    s.replace("\\n", "\n").replace("\\\"", "\"").replace("\\\\", "\\")
+

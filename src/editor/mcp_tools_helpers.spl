@@ -1,0 +1,278 @@
+# Editor MCP Tools — Helpers
+#
+# Wiki index, vault search, attachment handling, path utilities,
+# LSP request helpers, and formatting functions used by mcp_tools.spl.
+
+use std.editor.services.md_search.*
+use std.editor.core.session.{EditSession}
+use std.editor.core.path_text.*
+use std.editor.services.lsp_client.{LspResponse}
+use app.editor.editor_controller.{EditorController}
+
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_file_write_text(path: text, content: text) -> bool
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_file_read_bytes(path: text) -> [u8]?
+extern fn rt_file_write_bytes(path: text, data: [u8]) -> bool
+extern fn rt_dir_create_all(path: text) -> bool
+extern fn rt_dir_walk(path: text) -> [text]
+
+fn editor_mcp_wiki_index(session: EditSession) -> MdWikiIndex:
+    var docs: [MdWikiDocument] = []
+    for doc in session.documents:
+        if doc.language_id == "markdown":
+            docs.push(md_wiki_document(doc.path(), doc.buffer.to_text()))
+    md_wiki_index_documents(docs)
+
+fn editor_mcp_wiki_vault_index(root: text) -> MdWikiIndex:
+    md_wiki_index_documents(editor_mcp_wiki_vault_documents(root))
+
+fn editor_mcp_wiki_vault_documents(root: text) -> [MdWikiDocument]:
+    var docs: [MdWikiDocument] = []
+    val files = rt_dir_walk(root)
+    for file in files:
+        val lower = file.to_lower()
+        if lower.ends_with(".md") or lower.ends_with(".markdown"):
+            docs.push(md_wiki_document(file, rt_file_read_text(file) ?? ""))
+    docs
+
+fn editor_mcp_vault_search_index(root: text) -> MdVaultSearchIndex:
+    val cache_path = editor_mcp_vault_search_cache_path(root)
+    val docs = editor_mcp_wiki_vault_documents(root)
+    val loaded = md_vault_search_index_load(cache_path)
+    if loaded.root == root and not loaded.dirty and md_vault_search_index_matches_documents(loaded, docs):
+        return loaded
+    val index = md_vault_search_index_new(root, docs)
+    md_vault_search_index_save(index, cache_path)
+    index
+
+fn editor_mcp_vault_search_cache_path(root: text) -> text:
+    if root.ends_with("/"):
+        return root + ".simple-vault-search.cache"
+    root + "/.simple-vault-search.cache"
+
+fn editor_mcp_template_list(folder: text) -> text:
+    var out = ""
+    val files = rt_dir_walk(folder)
+    for file in files:
+        val lower = file.to_lower()
+        if lower.ends_with(".md") or lower.ends_with(".markdown"):
+            out = out + file + "\n"
+    out
+
+fn editor_mcp_insert_attachment(target_path: text, attachment_path: text, label: text, storage_dir: text) -> bool:
+    val existing = rt_file_read_text(target_path) ?? ""
+    val stored_path = editor_mcp_attachment_storage_path(target_path, attachment_path, storage_dir)
+    if stored_path == "":
+        return false
+    val embed = editor_mcp_attachment_embed(stored_path, label)
+    val sep = if existing == "" or existing.ends_with("\n") then "" else: "\n"
+    rt_file_write_text(target_path, existing + sep + embed + "\n")
+
+fn editor_mcp_attachment_storage_path(target_path: text, attachment_path: text, storage_dir: text) -> text:
+    if storage_dir == "":
+        return attachment_path
+    val data = rt_file_read_bytes(attachment_path) ?? []
+    if data.len() == 0 and not rt_file_exists(attachment_path):
+        return ""
+    val clean_dir = editor_clean_relative_dir(storage_dir)
+    if clean_dir == "":
+        return ""
+    val note_dir = editor_dirname(target_path)
+    val dest_dir = if note_dir == "" then clean_dir else: note_dir + "/" + clean_dir
+    if not rt_dir_create_all(dest_dir):
+        return ""
+    val name = editor_path_basename(attachment_path)
+    if name == "":
+        return ""
+    val unique_name = editor_mcp_unique_attachment_name(dest_dir, name)
+    val dest_path = dest_dir + "/" + unique_name
+    if not rt_file_write_bytes(dest_path, data):
+        return ""
+    clean_dir + "/" + unique_name
+
+fn editor_mcp_unique_attachment_name(dest_dir: text, name: text) -> text:
+    val dot = editor_last_dot(name)
+    val base = if dot > 0 then name.slice(0, dot) else: name
+    val ext = if dot > 0 then name.slice(dot, name.len()) else: ""
+    var candidate = name
+    var idx = 1
+    while rt_file_exists(dest_dir + "/" + candidate):
+        candidate = base + "-" + idx.to_text() + ext
+        idx = idx + 1
+    candidate
+
+fn editor_mcp_attachment_embed(attachment_path: text, label: text) -> text:
+    if label != "":
+        return "![" + label + "](" + attachment_path + ")"
+    "![[{attachment_path}]]"
+
+fn editor_mcp_active_lsp(session: EditSession, kind: text, payload: text) -> McpToolResult:
+    val doc = session.active_document()
+    val buffer = session.active_buffer()
+    if doc == nil or buffer == nil:
+        return McpToolResult(ok: false, content: "no active buffer")
+    var ctrl = EditorController.new(session)
+    if kind == "code-lens-resolve" or kind == "call-hierarchy-incoming" or kind == "call-hierarchy-outgoing":
+        val doc_for_payload = session.active_document()
+        if doc_for_payload == nil:
+            return McpToolResult(ok: false, content: "no active buffer")
+        ctrl._activate_active_language()
+        if doc_for_payload.language_id == "markdown":
+            var md_client = ctrl.md_lsp_state.client
+            var md_response = LspResponse(id: 0, ok: false, result_json: "", error_text: "unknown lsp request")
+            if kind == "code-lens-resolve":
+                md_response = md_client.code_lens_resolve(payload)
+            elif kind == "call-hierarchy-incoming":
+                md_response = md_client.call_hierarchy_incoming(payload)
+            elif kind == "call-hierarchy-outgoing":
+                md_response = md_client.call_hierarchy_outgoing(payload)
+            if md_response.ok:
+                return McpToolResult(ok: true, content: md_response.result_json)
+            return McpToolResult(ok: false, content: md_response.error_text)
+        var simple_client = ctrl.simple_lsp_state.client
+        var simple_response = LspResponse(id: 0, ok: false, result_json: "", error_text: "unknown lsp request")
+        if kind == "code-lens-resolve":
+            simple_response = simple_client.code_lens_resolve(payload)
+        elif kind == "call-hierarchy-incoming":
+            simple_response = simple_client.call_hierarchy_incoming(payload)
+        elif kind == "call-hierarchy-outgoing":
+            simple_response = simple_client.call_hierarchy_outgoing(payload)
+        if simple_response.ok:
+            return McpToolResult(ok: true, content: simple_response.result_json)
+        return McpToolResult(ok: false, content: simple_response.error_text)
+    if kind == "rename":
+        val response = ctrl._request_active_rename(payload)
+        if response.ok:
+            return McpToolResult(ok: true, content: response.result_json)
+        return McpToolResult(ok: false, content: response.error_text)
+    val response = ctrl._request_active_lsp_with_payload(kind, payload)
+    if response.ok:
+        return McpToolResult(ok: true, content: response.result_json)
+    McpToolResult(ok: false, content: response.error_text)
+
+fn editor_mcp_active_path(session: EditSession) -> text:
+    val doc = session.active_document()
+    if doc == nil:
+        return ""
+    doc.path()
+
+fn editor_mcp_format_wiki_links(links: [MdWikiLink]) -> text:
+    var out = ""
+    for link in links:
+        out = out + link.source_path + ":" + (link.line + 1).to_text() + ":" + (link.col + 1).to_text() + " -> " + link.target + "\n"
+    out
+
+fn editor_mcp_template_vars(args: [text], start: i64) -> [MdWikiTemplateVar]:
+    var vars: [MdWikiTemplateVar] = []
+    var i = start
+    while i < args.len():
+        val item = args[i].trim()
+        val eq = item.index_of("=") ?? -1
+        if eq > 0:
+            vars.push(md_wiki_template_var(item.slice(0, eq).trim(), item.slice(eq + 1, item.len()).trim()))
+            i = i + 1
+        elif i + 1 < args.len():
+            vars.push(md_wiki_template_var(item, args[i + 1]))
+            i = i + 2
+        else:
+            i = i + 1
+    vars
+
+fn editor_mcp_format_wiki_tags(tags: [MdWikiTag]) -> text:
+    var out = ""
+    for tag in tags:
+        out = out + tag.path + ":" + (tag.line + 1).to_text() + " #" + tag.tag + "\n"
+    out
+
+fn editor_mcp_format_wiki_properties(props: [MdWikiProperty]) -> text:
+    var out = ""
+    for prop in props:
+        out = out + prop.path + " " + prop.key + ": " + prop.value + "\n"
+    out
+
+fn editor_mcp_format_vault_search(matches: [MdVaultSearchMatch]) -> text:
+    var out = ""
+    for match in matches:
+        out = out + match.path + ":" + (match.line + 1).to_text() + ":" + (match.col + 1).to_text() + " score=" + match.score.to_text() + " " + match.block_kind + " " + match.context_text.trim() + "\n"
+    out
+
+fn editor_mcp_set_markdown_property(path: text, key: text, value: text) -> bool:
+    val content = rt_file_read_text(path) ?? ""
+    val next = editor_mcp_markdown_property_content(content, key.trim(), value)
+    rt_file_write_text(path, next)
+
+fn editor_mcp_markdown_property_content(content: text, key: text, value: text) -> text:
+    if key == "":
+        return content
+    val line = key + ": " + value
+    val lines = content.split("\n")
+    if lines.len() == 0 or lines[0].trim() != "---":
+        return "---\n" + line + "\n---\n" + content
+    var out = "---"
+    var i = 1
+    var found = false
+    var closed = false
+    while i < lines.len():
+        val trimmed = lines[i].trim()
+        if not closed and trimmed == "---":
+            if not found:
+                out = out + "\n" + line
+            out = out + "\n---"
+            closed = true
+        elif not closed:
+            val sep = md_wiki_find_char(trimmed, ":", 0)
+            val existing_key = if sep > 0 then trimmed.slice(0, sep).trim() else: ""
+            if existing_key == key:
+                out = out + "\n" + line
+                found = true
+            else:
+                out = out + "\n" + lines[i]
+        else:
+            out = out + "\n" + lines[i]
+        i = i + 1
+    if not closed:
+        if not found:
+            out = out + "\n" + line
+        out = out + "\n---"
+    out
+
+fn editor_mcp_format_wiki_tasks(tasks: [MdWikiTask]) -> text:
+    var out = ""
+    for task in tasks:
+        val mark = if task.checked then "[x]" else: "[ ]"
+        out = out + task.path + ":" + (task.line + 1).to_text() + " " + mark + " " + task.text_content + "\n"
+    out
+
+fn editor_mcp_format_wiki_documents(docs: [MdWikiDocument]) -> text:
+    var out = ""
+    for doc in docs:
+        out = out + doc.path + "\n"
+    out
+
+fn editor_mcp_format_wiki_embeds(embeds: [MdWikiEmbed]) -> text:
+    var out = ""
+    for embed in embeds:
+        val state = if embed.resolved then "resolved" else: "unresolved"
+        out = out + embed.source_path + ":" + (embed.line + 1).to_text() + ":" + (embed.col + 1).to_text() + " embed " + embed.target + " " + state + "\n"
+    out
+
+fn editor_mcp_format_wiki_callouts(callouts: [MdWikiCallout]) -> text:
+    var out = ""
+    for callout in callouts:
+        val fold = if callout.folded then " folded" else: ""
+        out = out + callout.path + ":" + (callout.line + 1).to_text() + " " + callout.callout_type + fold + " " + callout.title + "\n"
+    out
+
+fn editor_mcp_format_wiki_attachments(attachments: [MdWikiAttachment]) -> text:
+    var out = ""
+    for attachment in attachments:
+        out = out + attachment.source_path + ":" + (attachment.line + 1).to_text() + ":" + (attachment.col + 1).to_text() + " attachment " + attachment.target + "\n"
+    out
+
+fn editor_mcp_format_wiki_graph_edges(edges: [MdWikiGraphEdge]) -> text:
+    var out = ""
+    for edge in edges:
+        val state = if edge.resolved then "resolved" else: "unresolved"
+        out = out + edge.source_path + " -> " + edge.target + " " + edge.edge_type + " " + state + "\n"
+    out

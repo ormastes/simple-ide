@@ -1,0 +1,93 @@
+# Editor DAP process command smoke
+#
+# Native-only smoke entry for the controller `debug-process-start` route.
+
+use std.editor.common.types.*
+use std.editor.common.config.*
+use std.editor.common.keybindings.*
+use std.editor.buffer.piece_table.*
+use std.editor.buffer.undo.*
+use std.editor.buffer.buffer.*
+use std.editor.core.document.*
+use std.editor.core.session.{EditSession}
+use std.editor.extensions.host.*
+use std.editor.extensions.manifest.*
+use std.editor.extensions.api.*
+use std.editor.extensions.builtin.md_language.*
+use std.editor.extensions.builtin.md_commands.*
+use std.editor.extensions.builtin.md_vim_motions.*
+use std.editor.extensions.builtin.md_edit_assist.*
+use std.editor.extensions.builtin.spl_language.*
+use std.editor.view.file_tree.*
+use std.editor.view.layout.*
+use std.editor.view.split_tree.*
+use std.editor.view.tab.*
+use std.editor.view.dock_zone.*
+use std.editor.view.diagnostics_panel.*
+use std.editor.view.preview_pane.*
+use std.editor.view.outline_panel.*
+use std.editor.view.lsp_result_panel.*
+use std.editor.view.wiki_panel.*
+use std.editor.view.settings_view.*
+use std.editor.render.block_model.*
+use std.editor.services.command_palette.*
+use std.editor.services.diagnostics.*
+use std.editor.services.debug_session.*
+use std.editor.services.lsp_transport.*
+use std.editor.services.lsp_client.*
+use std.editor.services.md_lsp_config.*
+use std.editor.services.simple_lsp_config.*
+use std.editor.services.md_diagnostics.*
+use std.editor.services.md_doc_stats.*
+use std.editor.services.md_search.*
+use std.editor.services.md_wiki_index.*
+use std.editor.services.file_watcher.*
+use app.editor.commands.*
+use app.editor.md_dispatch.*
+use app.editor.debug_process_runtime.*
+use app.editor.editor_controller.{EditorController}
+
+extern fn rt_sleep_ms(ms: i64)
+
+fn main() -> i64:
+    var session = EditSession.new()
+    var ctrl = EditorController.new(session)
+    val action = ctrl._execute_palette_command("debug-process-start", "simple")
+    if not action.redraw:
+        print "STATUS: FAIL editor_dap_process_command_smoke no_redraw"
+        return 1
+    if ctrl.debug_process_pid <= 0:
+        print "STATUS: FAIL editor_dap_process_command_smoke not_process_backed"
+        return 1
+    if not ctrl.debug_status == "starting":
+        ctrl._execute_palette_command("debug-terminate", "")
+        print "STATUS: FAIL editor_dap_process_command_smoke not_starting"
+        return 1
+
+    rt_sleep_ms(500)
+    var attempts = 0
+    var saw_pause = false
+    while attempts < 1 and not saw_pause:
+        ctrl._poll_debug_dap_client()
+        if ctrl.debug_status == "paused":
+            saw_pause = true
+        attempts = attempts + 1
+
+    val final_debug_status = ctrl.debug_status
+    val final_status_msg = ctrl.status_msg
+    val final_process_pid = ctrl.debug_process_pid
+    val final_client_pid = ctrl.debug_dap_client.process_pid
+    ctrl._execute_palette_command("debug-terminate", "")
+
+    if not saw_pause:
+        print "STATUS: FAIL editor_dap_process_command_smoke no_dap_event status=" + final_debug_status + " msg=" + final_status_msg + " process_pid=" + str(final_process_pid) + " client_pid=" + str(final_client_pid)
+        return 1
+    if ctrl.debug_process_pid > 0:
+        print "STATUS: FAIL editor_dap_process_command_smoke leaked_process"
+        return 1
+    if not ctrl.debug_status == "terminated":
+        print "STATUS: FAIL editor_dap_process_command_smoke not_terminated"
+        return 1
+
+    print "STATUS: PASS editor_dap_process_command_smoke"
+    0

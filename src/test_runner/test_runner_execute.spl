@@ -1,0 +1,418 @@
+# Test Runner Execution
+#
+# Core test execution modes: interpreter, SMF, native, and safe mode.
+#
+# NOTE: PID tracking for self-protection would require refactoring to use
+# rt_process_spawn_async + rt_process_wait instead of process_run_timeout.
+# Current implementation uses synchronous execution which doesn't expose PIDs.
+# This is a future enhancement for Week 1 completion.
+#
+# Split into:
+#   - test_executor_parsing.spl: binary discovery, output parsing, coverage wrappers, static listing
+#   - test_executor_composite.spl: composite/baremetal/remote/QEMU platform execution
+#   - test_runner_execute.spl (this file): core execution modes (interpreter, SMF, native, safe)
+
+use std.test_runner.test_runner_types.{TestFileResult, TestOptions}
+use std.test_runner.test_runner_files.{strip_ansi, read_file_content}
+use std.test_runner.test_runner_fork.{run_test_file_fork}
+use std.io.{file_exists, file_write, file_delete}
+use std.io.{time_now_unix_micros}
+use std.io.{process_run_timeout, process_run_with_limits, ProcessResult}
+
+# Import from split-out files (same directory, but need use for re-export)
+use std.test_runner.test_executor_parsing.{
+    find_simple_new_binary, find_runtime_lib_dir, find_simple_binary,
+    extract_error_message, parse_test_output,
+    extract_number_before, extract_number_after_colon,
+    build_child_args, make_result_from_output,
+    coverage_wrapper_suffix, build_coverage_wrapper,
+    extract_coverage_sdn, strip_coverage_blocks,
+    COVERAGE_BEGIN, COVERAGE_END,
+    list_tests_static, extract_static_test_name
+}
+use std.test_runner.test_executor_composite.{
+    run_test_file_composite,
+    extract_base_runtime, extract_platform_layer, extract_arch_from_spec,
+    run_test_file_baremetal, run_test_file_remote,
+    run_test_file_baremetal_via_interpreter, run_test_file_baremetal_qemu,
+    find_baremetal_elf, qemu_binary_for_arch, qemu_machine_for_arch
+}
+
+# =========================================================================
+# Core Execution Modes
+# =========================================================================
+
+fn run_test_file_interpreter(file_path: text, options: TestOptions) -> TestFileResult:
+    # Fork mode: use fork() + COW instead of subprocess spawn (Linux only)
+    if options.fork_mode:
+        return run_test_file_fork(file_path, options)
+
+    # Session setup phase — not counted toward test duration
+    val setup_start = time_now_unix_micros()
+    val binary = find_simple_binary()
+    val (wrapped_path, cleanup_path) = build_coverage_wrapper(file_path, options)
+    val child_args = build_child_args(wrapped_path, options)
+    val timeout_ms = options.timeout * 1000
+    val setup_end = time_now_unix_micros()
+    val setup_ms = (setup_end - setup_start) / 1000
+
+    # Test execution phase — only this counts as duration
+    val start = time_now_unix_micros()
+    var stdout = ""
+    var stderr = ""
+    var exit_code = 0
+    if (options.max_mem_gb > 0 or options.max_procs > 0) and not options.no_limits:
+        val memory_bytes = if options.max_mem_gb > 0: options.max_mem_gb * 1024 * 1024 * 1024 else: 0
+        val result = process_run_with_limits(binary, child_args, timeout_ms, memory_bytes, 0, 0, options.max_procs)
+        stdout = result.stdout
+        stderr = result.stderr
+        exit_code = result.exit_code
+        if result.limit_exceeded:
+            val end2 = time_now_unix_micros()
+            val dur = (end2 - start) / 1000
+            if cleanup_path != "" and not options.keep_artifacts:
+                if file_exists(cleanup_path):
+                    file_delete(cleanup_path)
+            return TestFileResult(path: file_path, passed: 0, failed: 1, skipped: 0, pending: 0,
+                duration_ms: dur, setup_ms: setup_ms, error: "Memory limit exceeded ({options.max_mem_gb}GB)", timed_out: false, cached: false)
+    else:
+        val (out, err, code) = process_run_timeout(binary, child_args, timeout_ms)
+        stdout = out
+        stderr = err
+        exit_code = code
+    val end = time_now_unix_micros()
+    val duration_ms = (end - start) / 1000
+    if options.coverage:
+        val combined = stdout + "\n" + stderr
+        val sdn = extract_coverage_sdn(combined)
+        # MEMORY DEBUG: record_coverage_sdn commented out (GROUP 3 isolation)
+        # record_coverage_sdn(sdn)
+        stdout = strip_coverage_blocks(stdout)
+        stderr = strip_coverage_blocks(stderr)
+
+    if cleanup_path != "" and not options.keep_artifacts:
+        if file_exists(cleanup_path):
+            file_delete(cleanup_path)
+
+    val result = make_result_from_output(file_path, stdout, stderr, exit_code, duration_ms, options.timeout)
+    TestFileResult(
+        path: result.path, passed: result.passed, failed: result.failed,
+        skipped: result.skipped, pending: result.pending,
+        duration_ms: result.duration_ms, setup_ms: setup_ms,
+        error: result.error, timed_out: result.timed_out, cached: result.cached
+    )
+
+fn run_test_file_smf(file_path: text, options: TestOptions) -> TestFileResult:
+    if options.coverage:
+        return run_test_file_native(file_path, options)
+
+    val binary = find_simple_binary()
+    val smf_path = file_path.replace(".spl", ".smf")
+    val start = time_now_unix_micros()
+    val timeout_ms = options.timeout * 1000
+
+    # Check if pre-compiled .smf bytecode exists
+    if file_exists(smf_path):
+        # Run pre-compiled SMF bytecode directly (no "test" command to avoid recursion)
+        var run_args: [text] = [smf_path]
+        if options.gc_log:
+            run_args.push("--gc-log")
+        if options.gc_off:
+            run_args.push("--gc=off")
+        var stdout = ""
+        var stderr = ""
+        var exit_code = 0
+        if (options.max_mem_gb > 0 or options.max_procs > 0) and not options.no_limits:
+            val memory_bytes = if options.max_mem_gb > 0: options.max_mem_gb * 1024 * 1024 * 1024 else: 0
+            val result = process_run_with_limits(binary, run_args, timeout_ms, memory_bytes, 0, 0, options.max_procs)
+            stdout = result.stdout
+            stderr = result.stderr
+            exit_code = result.exit_code
+            if result.limit_exceeded:
+                val end2 = time_now_unix_micros()
+                val dur = (end2 - start) / 1000
+                return TestFileResult(path: file_path, passed: 0, failed: 1, skipped: 0, pending: 0,
+                    duration_ms: dur, setup_ms: 0, error: "Memory limit exceeded ({options.max_mem_gb}GB)", timed_out: false, cached: false)
+        else:
+            val (out, err, code) = process_run_timeout(binary, run_args, timeout_ms)
+            stdout = out
+            stderr = err
+            exit_code = code
+        val end = time_now_unix_micros()
+        val duration_ms = (end - start) / 1000
+        if options.coverage:
+            val combined = stdout + "\n" + stderr
+            val sdn = extract_coverage_sdn(combined)
+            # record_coverage_sdn(sdn)  # Deferred: coverage import removed for startup perf
+            stdout = strip_coverage_blocks(stdout)
+            stderr = strip_coverage_blocks(stderr)
+        return make_result_from_output(file_path, stdout, stderr, exit_code, duration_ms, options.timeout)
+
+    # No precompiled artifact exists. Compile to SMF instead of silently
+    # falling back to source execution.
+    run_test_file_native(file_path, options)
+
+fn run_test_file_native_old(file_path: text, options: TestOptions) -> TestFileResult:
+    val binary = find_simple_binary()
+    val start = time_now_unix_micros()
+    val timeout_ms = options.timeout * 1000
+
+    # Run file directly instead of "test" command to avoid infinite recursion
+    var run_args: [text] = [file_path]
+    if options.gc_log:
+        run_args.push("--gc-log")
+    if options.gc_off:
+        run_args.push("--gc=off")
+    val result = process_run_with_limits(binary, run_args, timeout_ms, 0, 0, 0, if options.no_limits: 0 else: options.max_procs)
+    val stdout = result.stdout
+    val stderr = result.stderr
+    val exit_code = result.exit_code
+    val end = time_now_unix_micros()
+    val duration_ms = (end - start) / 1000
+
+    make_result_from_output(file_path, stdout, stderr, exit_code, duration_ms, options.timeout)
+
+fn preprocess_spipe_file(file_path: text) -> text:
+    """Wrap SPipe file content in fn main() for native compilation.
+    Returns path to temporary wrapped file, or original path if not SPipe."""
+    if not file_path.ends_with("_spec.spl"):
+        return file_path
+
+    val content = read_file_content(file_path)
+    if content == "":
+        return file_path
+
+    # Split into imports/top-level-defs and body, wrap body in fn main():
+    val lines = content.split("\n")
+    var import_parts: [text] = []
+    var top_level_parts: [text] = []
+    var body_parts: [text] = []
+    var in_docstring = false
+    var in_top_fn = false
+    var top_fn_indent = 0
+
+    for line in lines:
+        val trimmed = line.trim()
+
+        # Track multi-line docstrings (""")
+        if trimmed.starts_with("\"\"\""):
+            # Toggle docstring state. A line with """ toggles in/out.
+            # If we see """ at start of line and we're NOT in a function body,
+            # treat docstrings at top level as body (they'll go into main).
+            if in_docstring:
+                in_docstring = false
+                if in_top_fn:
+                    top_level_parts.push(line)
+                else:
+                    body_parts.push("    " + line)
+                continue
+            else:
+                in_docstring = true
+                if in_top_fn:
+                    top_level_parts.push(line)
+                else:
+                    body_parts.push("    " + line)
+                continue
+
+        if in_docstring:
+            if in_top_fn:
+                top_level_parts.push(line)
+            else:
+                body_parts.push("    " + line)
+            continue
+
+        # Import/use statements go before fn main()
+        if trimmed.starts_with("import ") or trimmed.starts_with("use "):
+            import_parts.push(line)
+            continue
+
+        # Top-level function definitions (at column 0 only) stay outside main
+        if not in_top_fn:
+            val line_indent = line.len() - trimmed.len()
+            if line_indent == 0:
+                if trimmed.starts_with("fn ") or trimmed.starts_with("async fn ") or trimmed.starts_with("static fn "):
+                    in_top_fn = true
+                    top_fn_indent = 0
+                    top_level_parts.push(line)
+                    continue
+
+        # If we're inside a top-level function definition, keep collecting
+        # lines until we see a line at the same or lesser indentation (not blank)
+        if in_top_fn:
+            if trimmed.len() == 0:
+                top_level_parts.push("")
+                continue
+            val current_indent = line.len() - trimmed.len()
+            if current_indent > top_fn_indent:
+                top_level_parts.push(line)
+                continue
+            else:
+                # This line is at same/lesser indent — end of function
+                in_top_fn = false
+                # Fall through to body processing
+
+        # Everything else goes into fn main() body
+        if trimmed.len() > 0:
+            body_parts.push("    " + line)
+        else:
+            body_parts.push("")
+
+    val imports = import_parts.join("\n")
+    val top_level = top_level_parts.join("\n")
+    val body = body_parts.join("\n")
+    val wrapped = imports + "\n\n" + top_level + "\nfn main():\n" + body
+    val tmp_path = "/tmp/spipe_wrapped_" + file_path.replace("/", "_")
+    file_write(tmp_path, wrapped)
+    tmp_path
+
+fn run_test_file_native(file_path: text, options: TestOptions) -> TestFileResult:
+    val binary = find_simple_binary()
+    val start = time_now_unix_micros()
+    val timeout_ms = options.timeout * 1000
+
+    # Native mode: Compile test file to .smf, then run the .smf
+    # Step 1: Preprocess SPipe files (wrap in fn main())
+    val (wrapped_path, cleanup_path) = build_coverage_wrapper(file_path, options)
+    val source_path = preprocess_spipe_file(wrapped_path)
+
+    # Step 2: Compile to .smf via 'simple compile'
+    val smf_path = file_path.replace(".spl", ".smf")
+    var compile_args: [text] = ["compile", source_path, "-o", smf_path]
+    if options.verbose:
+        compile_args.push("--verbose")
+        print "[native] Compiling {file_path} to {smf_path}"
+
+    val compile_result = process_run_with_limits(binary, compile_args, timeout_ms, 0, 0, 0, if options.no_limits: 0 else: options.max_procs)
+    val compile_stdout = compile_result.stdout
+    val compile_stderr = compile_result.stderr
+    val compile_exit = compile_result.exit_code
+
+    if compile_exit != 0:
+        val end = time_now_unix_micros()
+        val duration_ms = (end - start) / 1000
+        val error_msg = "Compilation failed: {compile_stderr}"
+        if cleanup_path != "" and not options.keep_artifacts:
+            if file_exists(cleanup_path):
+                file_delete(cleanup_path)
+        return TestFileResult(
+            path: file_path,
+            passed: 0,
+            failed: 1,
+            skipped: 0,
+            pending: 0,
+            duration_ms: duration_ms,
+            setup_ms: 0,
+            error: error_msg,
+            timed_out: false,
+            cached: false
+        )
+
+    # Step 3: Run the compiled .smf
+    if options.verbose:
+        print "[native] Running {smf_path}"
+
+    var run_args: [text] = [smf_path]
+    if options.gc_log:
+        run_args.push("--gc-log")
+    if options.gc_off:
+        run_args.push("--gc=off")
+
+    var stdout = ""
+    var stderr = ""
+    var exit_code = 0
+    if (options.max_mem_gb > 0 or options.max_procs > 0) and not options.no_limits:
+        val memory_bytes = if options.max_mem_gb > 0: options.max_mem_gb * 1024 * 1024 * 1024 else: 0
+        val result = process_run_with_limits(binary, run_args, timeout_ms, memory_bytes, 0, 0, options.max_procs)
+        stdout = result.stdout
+        stderr = result.stderr
+        exit_code = result.exit_code
+        if result.limit_exceeded:
+            val end2 = time_now_unix_micros()
+            val dur = (end2 - start) / 1000
+            if not options.keep_artifacts:
+                if file_exists(smf_path):
+                    file_delete(smf_path)
+                if cleanup_path != "" and file_exists(cleanup_path):
+                    file_delete(cleanup_path)
+            return TestFileResult(path: file_path, passed: 0, failed: 1, skipped: 0, pending: 0,
+                duration_ms: dur, setup_ms: 0, error: "Memory limit exceeded ({options.max_mem_gb}GB)", timed_out: false, cached: false)
+    else:
+        val (out, err, code) = process_run_timeout(binary, run_args, timeout_ms)
+        stdout = out
+        stderr = err
+        exit_code = code
+    val end = time_now_unix_micros()
+    val duration_ms = (end - start) / 1000
+
+    # Clean up .smf artifact unless keeping
+    if not options.keep_artifacts:
+        if file_exists(smf_path):
+            file_delete(smf_path)
+        if cleanup_path != "" and file_exists(cleanup_path):
+            file_delete(cleanup_path)
+
+    if options.coverage:
+        val combined = stdout + "\n" + stderr
+        val sdn = extract_coverage_sdn(combined)
+        # MEMORY DEBUG: record_coverage_sdn commented out (GROUP 3 isolation)
+        # record_coverage_sdn(sdn)
+        stdout = strip_coverage_blocks(stdout)
+        stderr = strip_coverage_blocks(stderr)
+
+    make_result_from_output(file_path, stdout, stderr, exit_code, duration_ms, options.timeout)
+
+fn run_test_file_compile(file_path: text, options: TestOptions) -> TestFileResult:
+    """Compile mode: compile test file to .smf and run it.
+    Delegates to run_test_file_native which already does compile-then-run."""
+    run_test_file_native(file_path, options)
+
+# =========================================================================
+# G1: Safe mode execution with resource limits
+# =========================================================================
+
+fn run_test_file_safe_mode(file_path: text, options: TestOptions) -> TestFileResult:
+    val binary = find_simple_binary()
+    val start = time_now_unix_micros()
+    val timeout_ms = options.timeout * 1000
+    val memory_bytes = 512 * 1024 * 1024
+    val cpu_seconds = 30
+    val max_fds = 256
+    val max_procs = 64
+
+    var run_args: [text] = [file_path]
+    if options.gc_log:
+        run_args.push("--gc-log")
+    if options.gc_off:
+        run_args.push("--gc=off")
+
+    val result = process_run_with_limits(
+        binary, run_args, timeout_ms, memory_bytes, cpu_seconds, max_fds, max_procs
+    )
+    val end = time_now_unix_micros()
+    val duration_ms = (end - start) / 1000
+
+    if result.limit_exceeded:
+        return TestFileResult(
+            path: file_path,
+            passed: 0,
+            failed: 1,
+            skipped: 0,
+            pending: 0,
+            duration_ms: duration_ms,
+            setup_ms: 0,
+            error: "Resource limit exceeded: {result.limit_type}",
+            timed_out: result.limit_type.contains("timeout"),
+            cached: false
+        )
+
+    make_result_from_output(file_path, result.stdout, result.stderr, result.exit_code, duration_ms, options.timeout)
+
+# =========================================================================
+# Exports - includes re-exports from split-out files for backward compat
+# =========================================================================
+
+# Re-export from test_executor_parsing.spl
+
+# Re-export from test_executor_composite.spl
+
+# Exports from this file

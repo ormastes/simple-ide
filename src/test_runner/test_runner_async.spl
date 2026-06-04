@@ -1,0 +1,418 @@
+# Async Test Execution - True Parallel Test Running
+#
+# Implements parallel test execution using process_spawn_async + process_wait.
+# Manages worker pool, stdout/stderr capture via temp files, and result collection.
+
+use std.io.{process_spawn_async, process_wait, process_kill, process_is_running}
+use std.io.{shell_int, shell_output}
+use std.io.{file_write, file_read, file_delete, file_exists}
+use std.io.{time_now_unix_micros}
+use std.test_runner.test_runner_types.{TestFileResult, TestOptions}
+use std.test_runner.test_runner_execute.{find_simple_binary, build_child_args, make_result_from_output}
+use std.test_runner.test_runner_fork.{run_test_file_fork}
+use std.test_runner.runner_lifecycle.{spawn_tracked_process, untrack_process}
+use std.test_runner.resource_governor.{ResourceGovernor, governor_create, governor_can_spawn, governor_wait_until_ready}
+
+extern fn rt_thread_sleep(millis: i64)
+
+# ============================================================================
+# Async Test Execution State
+# ============================================================================
+
+struct AsyncTestRun:
+    pid: i64
+    file_path: text
+    start_time: i64          # microseconds
+    stdout_file: text
+    stderr_file: text
+    timeout_ms: i64
+
+val _WAIT_POLL_INITIAL_MS = 10
+val _WAIT_POLL_MEDIUM_MS = 50
+val _WAIT_POLL_MAX_MS = 100
+val _WAIT_POLL_MAX_ITERATIONS = 6000
+
+# ============================================================================
+# Temp File Management
+# ============================================================================
+
+fn _get_temp_dir() -> text:
+    """Get platform-appropriate temp directory"""
+    val os = _detect_os()
+    if os == "windows":
+        val temp_env = shell_output("echo %TEMP%", "")
+        if temp_env != "" and temp_env.trim() != "%TEMP%":
+            return temp_env.trim()
+        return "C:\\Temp"
+    "/tmp"
+
+fn create_temp_files(file_path: text) -> (text, text):
+    """
+    Create temp files for stdout/stderr capture.
+
+    Returns: (stdout_file, stderr_file)
+    """
+    val timestamp = time_now_unix_micros()
+
+    # Replace path separators (chained replace breaks in runtime)
+    var base = file_path
+    var temp_chars: [text] = []
+    var i = 0
+    while i < base.len():
+        val ch = base[i:i + 1]
+        if ch == "/" or ch == "\\":
+            temp_chars.push("_")
+        elif ch == ".":
+            temp_chars.push("_")
+        elif ch == ":":
+            temp_chars.push("_")
+        else:
+            temp_chars.push(ch)
+        i = i + 1
+    base = temp_chars.join("")
+
+    val tmp_dir = _get_temp_dir()
+    val os = _detect_os()
+    var sep = "/"
+    if os == "windows":
+        sep = "\\"
+    val stdout_file = "{tmp_dir}{sep}simple_test_{base}_{timestamp}_out.txt"
+    val stderr_file = "{tmp_dir}{sep}simple_test_{base}_{timestamp}_err.txt"
+
+    # Initialize empty files
+    file_write(stdout_file, "")
+    file_write(stderr_file, "")
+
+    (stdout_file, stderr_file)
+
+fn cleanup_temp_files(stdout_file: text, stderr_file: text):
+    """Delete temp files after result collection"""
+    if file_exists(stdout_file):
+        file_delete(stdout_file)
+    if file_exists(stderr_file):
+        file_delete(stderr_file)
+
+fn _wait_poll_sleep_ms(poll_iteration: i64) -> i64:
+    """Adaptive backoff for process polling."""
+    if poll_iteration >= 50:
+        return _WAIT_POLL_MAX_MS
+    if poll_iteration >= 10:
+        return _WAIT_POLL_MEDIUM_MS
+    _WAIT_POLL_INITIAL_MS
+
+fn _find_completed_run(runs: [AsyncTestRun]) -> i64:
+    """Return the first run whose process has exited, or -1 if none have."""
+    var idx = 0
+    while idx < runs.len():
+        val run = runs[idx]
+        if not process_is_running(run.pid):
+            return idx
+        idx = idx + 1
+    -1
+
+# ============================================================================
+# Async Test Spawning
+# ============================================================================
+
+fn spawn_async_test(file_path: text, options: TestOptions) -> AsyncTestRun:
+    """
+    Spawn test as async process with stdout/stderr redirect.
+
+    Args:
+        file_path: Path to test file
+        options: Test options
+
+    Returns: AsyncTestRun tracking structure
+    """
+    val binary = find_simple_binary()
+    val child_args = build_child_args(file_path, options)
+    val timeout_ms = options.timeout * 1000
+
+    # Create temp files for stdout/stderr
+    val (stdout_file, stderr_file) = create_temp_files(file_path)
+
+    # Build redirected command (shell wrapper)
+    # NOTE: process_spawn_async doesn't support redirection directly,
+    # so we wrap in shell command
+    val args_str = child_args.join(" ")
+
+    val shell_cmd = "{binary} {args_str} > {stdout_file} 2> {stderr_file}"
+
+    # Spawn via platform-appropriate shell.
+    # Route through spawn_tracked_process so the PID is registered for
+    # cleanup on crash/Ctrl-C (process_spawn_async bypasses the tracker).
+    val os = _detect_os()
+    val pid = if os == "windows" then spawn_tracked_process("cmd.exe", ["/c", shell_cmd]) else spawn_tracked_process("/bin/sh", ["-c", shell_cmd])
+
+    val start_time = time_now_unix_micros()
+
+    AsyncTestRun(
+        pid: pid,
+        file_path: file_path,
+        start_time: start_time,
+        stdout_file: stdout_file,
+        stderr_file: stderr_file,
+        timeout_ms: timeout_ms
+    )
+
+# ============================================================================
+# Result Collection
+# ============================================================================
+
+fn collect_async_result(run: AsyncTestRun) -> TestFileResult:
+    """
+    Wait for async test to complete and collect results.
+
+    Args:
+        run: AsyncTestRun tracking structure
+
+    Returns: TestFileResult
+    """
+    # Wait for process to complete (with timeout)
+    val exit_code = process_wait(run.pid, run.timeout_ms)
+    # Unregister from tracker now that the process has been reaped
+    untrack_process(run.pid)
+
+    val end_time = time_now_unix_micros()
+    val duration_ms = (end_time - run.start_time) / 1000
+
+    # Read stdout/stderr from temp files
+    var stdout = ""
+    var stderr = ""
+
+    if file_exists(run.stdout_file):
+        stdout = file_read(run.stdout_file)
+
+    if file_exists(run.stderr_file):
+        stderr = file_read(run.stderr_file)
+
+    # Cleanup temp files
+    cleanup_temp_files(stdout_file: run.stdout_file, stderr_file: run.stderr_file)
+
+    # Build result using same logic as sync execution
+    make_result_from_output(
+        run.file_path,
+        stdout,
+        stderr,
+        exit_code,
+        duration_ms,
+        run.timeout_ms / 1000
+    )
+
+# ============================================================================
+# Fork-based Test Execution (for parallel + fork mode)
+# ============================================================================
+
+fn spawn_fork_test(file_path: text, options: TestOptions) -> TestFileResult:
+    """Run a single test via fork() instead of subprocess spawn.
+    Returns the result directly (fork is synchronous from parent perspective).
+    Used when fork_mode is enabled to eliminate 220ms CLI startup overhead."""
+    run_test_file_fork(file_path, options)
+
+# ============================================================================
+# Wait for Any Process
+# ============================================================================
+
+fn wait_for_any_process(runs: [AsyncTestRun]) -> i64:
+    """
+    Wait for any process to complete (polling-based).
+
+    Args:
+        runs: List of active AsyncTestRun structures
+
+    Returns: Index of completed run, or -1 if timeout
+
+    NOTE: Uses polling (100ms interval) since rt_process_wait_any doesn't exist
+    """
+    var poll_iteration = 0
+    while poll_iteration < _WAIT_POLL_MAX_ITERATIONS:
+        val completed_idx = _find_completed_run(runs)
+        if completed_idx >= 0:
+            return completed_idx
+
+        rt_thread_sleep(_wait_poll_sleep_ms(poll_iteration))
+        poll_iteration = poll_iteration + 1
+
+    -1  # Timeout
+
+# ============================================================================
+# Parallel Test Execution
+# ============================================================================
+
+fn run_tests_parallel(
+    files: [text],
+    options: TestOptions,
+    max_workers: i64
+) -> [TestFileResult]:
+    """
+    Run tests in parallel with worker pool.
+
+    Args:
+        files: List of test file paths
+        options: Test options
+        max_workers: Maximum parallel workers
+
+    Returns: List of TestFileResult (in completion order)
+    """
+    var results: [TestFileResult] = []
+    var active_runs: [AsyncTestRun] = []
+    var next_file_idx = 0
+
+    while next_file_idx < files.len() or active_runs.len() > 0:
+        # Spawn new tests up to max_workers
+        while active_runs.len() < max_workers and next_file_idx < files.len():
+            val file_path = files[next_file_idx]
+
+            # Spawn async test
+            val run = spawn_async_test(file_path, options)
+            active_runs.push(run)
+
+            next_file_idx = next_file_idx + 1
+
+        # Wait for any process to complete
+        if active_runs.len() > 0:
+            val completed_idx = wait_for_any_process(active_runs)
+
+            if completed_idx >= 0:
+                # Collect result
+                val run = active_runs[completed_idx]
+                val result = collect_async_result(run)
+                results.push(result)
+
+                # Remove from active runs
+                var new_runs: [AsyncTestRun] = []
+                var idx = 0
+                while idx < active_runs.len():
+                    if idx != completed_idx:
+                        new_runs.push(active_runs[idx])
+                    idx = idx + 1
+                active_runs = new_runs
+
+    results
+
+# ============================================================================
+# Parallel Execution with Timeout Check
+# ============================================================================
+
+fn run_tests_parallel_with_monitoring(
+    files: [text],
+    options: TestOptions,
+    max_workers: i64
+) -> [TestFileResult]:
+    """
+    Run tests in parallel with timeout monitoring and resource governor.
+
+    Checks each active process for timeout and kills if exceeded.
+    Uses resource governor to avoid exceeding system memory/CPU limits.
+
+    Args:
+        files: List of test file paths
+        options: Test options
+        max_workers: Maximum parallel workers
+
+    Returns: List of TestFileResult
+    """
+    var results: [TestFileResult] = []
+    var active_runs: [AsyncTestRun] = []
+    var next_file_idx = 0
+    var poll_iteration = 0
+
+    # Fork mode is sequential — skip it when parallel is explicitly requested.
+    # Subprocess parallelism with N workers is faster than sequential fork
+    # even with the per-test startup overhead.
+
+    # Create resource governor (default 75%, overridable via options)
+    val gov = governor_create(options.resource_limit_pct)
+    print "  [parallel] Resource governor: max {gov.max_cpu_cores} cores, {gov.max_memory_mb}MB memory ({gov.resource_limit_pct}% limit)"
+
+    while next_file_idx < files.len() or active_runs.len() > 0:
+        # Spawn new tests (respecting both max_workers and resource governor)
+        while active_runs.len() < max_workers and next_file_idx < files.len():
+            # Check resource governor before spawning
+            if not governor_can_spawn(gov, active_runs.len()):
+                governor_wait_until_ready(gov, active_runs.len())
+
+            val file_path = files[next_file_idx]
+            val run = spawn_async_test(file_path, options)
+            active_runs.push(run)
+            next_file_idx = next_file_idx + 1
+
+        # Check for timeouts and completions
+        var new_runs: [AsyncTestRun] = []
+        val current_time = time_now_unix_micros()
+        var had_completion = false
+
+        for run in active_runs:
+            val elapsed_ms = (current_time - run.start_time) / 1000
+
+            if elapsed_ms > run.timeout_ms:
+                process_kill(run.pid)
+                val result = collect_async_result(run)
+                results.push(result)
+                had_completion = true
+            elif not process_is_running(run.pid):
+                val result = collect_async_result(run)
+                results.push(result)
+                had_completion = true
+            else:
+                new_runs.push(run)
+
+        active_runs = new_runs
+
+        # Only sleep after a full pass with no completion.
+        if had_completion:
+            poll_iteration = 0
+        else:
+            rt_thread_sleep(_wait_poll_sleep_ms(poll_iteration))
+            poll_iteration = poll_iteration + 1
+
+    results
+
+# ============================================================================
+# Helper: CPU Count Detection
+# ============================================================================
+
+fn get_cpu_count() -> i64:
+    """
+    Detect number of CPU cores on Linux, macOS, FreeBSD, and Windows.
+
+    Returns: CPU count, or 4 if detection fails
+    """
+    val os = _detect_os()
+    if os == "windows":
+        # Windows: use NUMBER_OF_PROCESSORS env var or wmic
+        val env_count = shell_int("echo %NUMBER_OF_PROCESSORS%", 0)
+        if env_count > 0:
+            return env_count
+        val wmic_out = shell_output("wmic cpu get NumberOfLogicalProcessors", "")
+        if wmic_out != "":
+            val lines = wmic_out.split("\n")
+            if lines.len() >= 2:
+                val count = shell_int("echo {lines[1].trim()}", 0)
+                if count > 0:
+                    return count
+        return 4
+    # Linux: nproc; macOS/FreeBSD: sysctl -n hw.ncpu
+    val count = shell_int("nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null", 4)
+    if count > 0:
+        count
+    else:
+        4
+
+fn _detect_os() -> text:
+    """Detect current OS for platform-specific logic"""
+    val uname = shell_output("uname -s 2>/dev/null", "")
+    if uname == "":
+        return "windows"
+    val trimmed = uname.trim()
+    if trimmed == "Linux":
+        return "linux"
+    if trimmed == "Darwin":
+        return "macos"
+    if trimmed == "FreeBSD":
+        return "freebsd"
+    trimmed.lower()
+
+# ============================================================================
+# Exports
+# ============================================================================

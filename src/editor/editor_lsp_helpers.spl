@@ -1,0 +1,221 @@
+# Editor LSP Helpers
+#
+# LSP code-action, workspace-edit, and command helpers.
+
+use std.editor.buffer.buffer.*
+use std.editor.common.types.*
+use std.editor.services.diagnostics.*
+use app.editor.editor_controller_types.*
+use app.editor.editor_json_helpers.*
+use app.editor.editor_path_text_helpers.*
+
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_file_write_text(path: text, content: text) -> bool
+
+fn _editor_apply_code_action_content(buffer: EditorBuffer, path: text, edit_json: text) -> EditorAppliedCodeAction:
+    if edit_json == "":
+        return EditorAppliedCodeAction(applied: false, content: "", line: 0, col: 0)
+    if edit_json.contains("\"changes\""):
+        return _editor_apply_workspace_edit_content(buffer, path, edit_json)
+    val line = _editor_json_number_field(edit_json, "\"line\"")
+    val new_text = _editor_json_string_field(edit_json, "\"newText\"")
+    if line < 0 or new_text == "":
+        return EditorAppliedCodeAction(applied: false, content: "", line: 0, col: 0)
+    if line >= buffer.line_count():
+        return EditorAppliedCodeAction(applied: false, content: "", line: 0, col: 0)
+    var content = ""
+    var i = 0
+    while i < buffer.line_count():
+        if i > 0:
+            content = content + "\n"
+        if i == line:
+            content = content + new_text
+        else:
+            content = content + buffer.line_at(i)
+        i = i + 1
+    EditorAppliedCodeAction(applied: true, content: content, line: line, col: new_text.len())
+
+fn _editor_apply_workspace_edit_content(buffer: EditorBuffer, path: text, edit_json: text) -> EditorAppliedCodeAction:
+    val edit_slice = _editor_workspace_edit_slice(edit_json, path)
+    if edit_slice == "":
+        return EditorAppliedCodeAction(applied: false, content: "", line: 0, col: 0)
+    val start_line = _editor_json_number_after(edit_slice, "\"start\"", "\"line\"")
+    val start_col = _editor_json_number_after(edit_slice, "\"start\"", "\"character\"")
+    val end_line = _editor_json_number_after(edit_slice, "\"end\"", "\"line\"")
+    val end_col = _editor_json_number_after(edit_slice, "\"end\"", "\"character\"")
+    val new_text = _editor_json_string_field(edit_slice, "\"newText\"")
+    if start_line < 0 or start_col < 0 or end_line < 0 or end_col < 0:
+        return EditorAppliedCodeAction(applied: false, content: "", line: 0, col: 0)
+    if start_line >= buffer.line_count() or end_line >= buffer.line_count() or start_line > end_line:
+        return EditorAppliedCodeAction(applied: false, content: "", line: 0, col: 0)
+    val first = buffer.line_at(start_line)
+    val last = buffer.line_at(end_line)
+    if start_col > first.len() or end_col > last.len():
+        return EditorAppliedCodeAction(applied: false, content: "", line: 0, col: 0)
+    var content = ""
+    var i = 0
+    while i < buffer.line_count():
+        if i > 0:
+            content = content + "\n"
+        if i == start_line:
+            content = content + first.slice(0, start_col) + new_text + last.slice(end_col, last.len())
+        elif i > start_line and i <= end_line:
+            content = content
+        else:
+            content = content + buffer.line_at(i)
+        i = i + 1
+    EditorAppliedCodeAction(applied: true, content: content, line: start_line, col: start_col + new_text.len())
+
+fn _editor_apply_workspace_edit_disk_files(active_path: text, edit_json: text) -> i64:
+    var applied_count = 0
+    val paths = _editor_workspace_edit_paths(edit_json)
+    for path in paths:
+        if path != "" and path != active_path:
+            val existing = rt_file_read_text(path) ?? ""
+            var buffer = EditorBuffer.from_text(EditorBufferId(value: 0), existing)
+            buffer.path = path
+            val applied = _editor_apply_workspace_edit_content(buffer, path, edit_json)
+            if applied.applied and rt_file_write_text(path, applied.content):
+                applied_count = applied_count + 1
+    applied_count
+
+fn _editor_workspace_edit_slice(edit_json: text, path: text) -> text:
+    if path == "":
+        return edit_json
+    val uri = "file://" + path
+    var i = 0
+    while i < edit_json.len():
+        if edit_json.slice(i, edit_json.len()).starts_with(uri):
+            var end = edit_json.len()
+            var j = i + uri.len()
+            while j < edit_json.len():
+                if edit_json.slice(j, edit_json.len()).starts_with("\"file://"):
+                    end = j
+                    break
+                j = j + 1
+            return edit_json.slice(i, end)
+        i = i + 1
+    ""
+
+fn _editor_workspace_edit_paths(edit_json: text) -> [text]:
+    var paths: [text] = []
+    var i = 0
+    while i < edit_json.len():
+        if edit_json.slice(i, edit_json.len()).starts_with("\"file://"):
+            var j = i + 8
+            var path = ""
+            while j < edit_json.len() and edit_json.char_at(j) != "\"":
+                path = path + edit_json.char_at(j)
+                j = j + 1
+            if path != "" and not _editor_text_list_contains(paths, path):
+                paths.push(path)
+            i = j
+        else:
+            i = i + 1
+    paths
+
+fn _editor_lsp_execute_command_params(command_json: text) -> text:
+    val trimmed = command_json.trim()
+    if trimmed == "":
+        return ""
+    if trimmed.starts_with("{"):
+        val command_name = _editor_json_string_field(trimmed, "\"command\"")
+        if command_name == "":
+            return ""
+        val args = _editor_json_value_field(trimmed, "\"arguments\"")
+        val arg_json = if args == "" then "[]" else: args
+        return "{\"command\":\"" + _editor_escape_json(command_name) + "\",\"arguments\":" + arg_json + "}"
+    if trimmed.starts_with("\""):
+        val command_name = _editor_unescape_json_string(trimmed, 0)
+        if command_name == "":
+            return ""
+        return "{\"command\":\"" + _editor_escape_json(command_name) + "\",\"arguments\":[]}"
+    "{\"command\":\"" + _editor_escape_json(trimmed) + "\",\"arguments\":[]}"
+
+fn _editor_lsp_command_name(command_json: text) -> text:
+    val trimmed = command_json.trim()
+    if trimmed == "":
+        return ""
+    if trimmed.starts_with("{"):
+        val command_name = _editor_json_string_field(trimmed, "\"command\"")
+        if command_name != "":
+            return command_name
+    if trimmed.starts_with("\""):
+        return _editor_unescape_json_string(trimmed, 0)
+    trimmed
+
+fn _editor_code_actions_from_response(result_json: text) -> [EditorCodeAction]:
+    var actions: [EditorCodeAction] = []
+    var i = 0
+    while i < result_json.len():
+        if result_json.char_at(i) == "{":
+            val action_json = _editor_json_balanced(result_json, i, "{")
+            if action_json != "":
+                actions.push(EditorCodeAction(
+                    title: _editor_json_string_field(action_json, "\"title\""),
+                    kind: _editor_json_string_field(action_json, "\"kind\""),
+                    edit_json: _editor_json_value_field(action_json, "\"edit\""),
+                    command: _editor_json_value_field(action_json, "\"command\"")
+                ))
+                i = i + action_json.len()
+            else:
+                i = i + 1
+        else:
+            i = i + 1
+    actions
+
+fn _editor_code_action_matches_filter(action: EditorCodeAction, filter: text) -> bool:
+    if filter == "" or filter == "all":
+        return true
+    if filter == "quickfix":
+        return action.kind == "quickfix" or action.kind.starts_with("quickfix")
+    if filter == "source":
+        return action.kind.starts_with("source")
+    action.kind.contains(filter)
+
+fn _editor_code_action_group_count(actions: [EditorCodeAction], filter: text, kind: text) -> i64:
+    var count = 0
+    for action in actions:
+        if action.kind == kind and _editor_code_action_matches_filter(action, filter):
+            count = count + 1
+    count
+
+fn _editor_lsp_kind_has_panel(kind: text) -> bool:
+    kind == "definition" or kind == "references" or kind == "selection-ranges" or kind == "document-symbols" or kind == "workspace-symbols" or kind == "signature-help" or kind == "folding-ranges" or kind == "document-links" or kind == "call-hierarchy" or kind == "call-hierarchy-incoming" or kind == "call-hierarchy-outgoing" or kind == "semantic-tokens" or kind == "inlay-hints" or kind == "code-lens" or kind == "code-lens-resolve" or kind == "hover" or kind == "code-action"
+
+fn _editor_lsp_method_to_kind(method: text) -> text:
+    if method == "textDocument/definition":
+        return "definition"
+    if method == "textDocument/references":
+        return "references"
+    if method == "textDocument/selectionRange":
+        return "selection-ranges"
+    if method == "textDocument/documentSymbol":
+        return "document-symbols"
+    if method == "workspace/symbol":
+        return "workspace-symbols"
+    if method == "textDocument/signatureHelp":
+        return "signature-help"
+    if method == "textDocument/foldingRange":
+        return "folding-ranges"
+    if method == "textDocument/documentLink":
+        return "document-links"
+    if method == "textDocument/prepareCallHierarchy":
+        return "call-hierarchy"
+    if method == "callHierarchy/incomingCalls":
+        return "call-hierarchy-incoming"
+    if method == "callHierarchy/outgoingCalls":
+        return "call-hierarchy-outgoing"
+    if method == "textDocument/semanticTokens/full":
+        return "semantic-tokens"
+    if method == "textDocument/inlayHint":
+        return "inlay-hints"
+    if method == "textDocument/codeLens":
+        return "code-lens"
+    if method == "codeLens/resolve":
+        return "code-lens-resolve"
+    if method == "textDocument/hover":
+        return "hover"
+    if method == "textDocument/codeAction":
+        return "code-action"
+    ""

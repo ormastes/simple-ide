@@ -1,0 +1,245 @@
+# Test Runner Type Definitions
+#
+# Core types used throughout the test runner.
+
+# =========================================================================
+# Execution Mode
+# =========================================================================
+
+enum TestExecutionMode:
+    Interpreter
+    Smf
+    Native
+    Compile
+    Composite(spec: text)
+
+# =========================================================================
+# Test Level Filter
+# =========================================================================
+
+enum TestLevel:
+    All
+    Unit
+    Integration
+    System
+
+# =========================================================================
+# Output Format
+# =========================================================================
+
+enum OutputFormat:
+    Default
+    Doc
+
+# =========================================================================
+# Test Options
+# =========================================================================
+
+struct TestOptions:
+    path: text
+    level: TestLevel
+    tag: text
+    fail_fast: bool
+    mode: TestExecutionMode
+    timeout: i64
+    list: bool
+    list_ignored: bool
+    only_slow: bool
+    only_skipped: bool
+    show_tags: bool
+    gc_log: bool
+    gc_off: bool
+    seed: i64
+    seed_set: bool
+    safe_mode: bool
+    force_rebuild: bool
+    keep_artifacts: bool
+    run_all: bool
+    format: OutputFormat
+    list_skip_features: bool
+    planned_only: bool
+    no_limits: bool
+    sdoctest: bool
+    sdoctest_env: text
+    sdoctest_force: bool
+    no_db: bool
+    verbose: bool
+    coverage: bool
+    execution_mode: text
+    container_sequential: bool
+    self_protect: bool
+    resume: bool
+    cpu_threshold: f64
+    mem_threshold: f64
+    parallel: bool
+    sequential: bool
+    max_workers: i64
+    parallel_timeout: i64
+    closure_warnings: bool
+    ci_mode: bool
+    # Advanced testing modes (fuzz, chaos, deploy, security)
+    fuzz_mode: bool
+    fuzz_time_secs: i64
+    fuzz_corpus_dir: text
+    fuzz_differential: bool
+    fuzz_shrink: bool
+    chaos_mode: bool
+    chaos_trials: i64
+    chaos_fault_rate: i64
+    deploy_mode: bool
+    deploy_platform: text
+    deploy_upgrade: bool
+    security_mode: bool
+    security_scan: bool
+    security_supply_chain: bool
+    spl_doctest: bool
+    max_mem_gb: i64
+    mem_check: bool
+    fork_mode: bool
+    # Resource governor options
+    resource_limit_pct: i64
+    # Manifest/cache options
+    no_cache: bool
+    refresh_manifest: bool
+    manifest_status: bool
+    clean: bool
+    # Session sharing options
+    session_share: bool
+    session_daemon: bool
+    session_kind: text
+    max_sessions: i64
+    session_debug: bool
+    session_reset: text
+    assert_ran: bool
+    # Coverage annotation check
+    no_cover_check: bool
+
+# =========================================================================
+# Test File Result
+# =========================================================================
+
+struct TestFileResult:
+    path: text
+    passed: i64
+    failed: i64
+    skipped: i64
+    pending: i64
+    duration_ms: i64
+    setup_ms: i64
+    error: text
+    timed_out: bool
+    cached: bool
+
+impl TestFileResult:
+    fn is_ok() -> bool:
+        self.failed == 0 and self.error == "" and not self.timed_out
+
+# =========================================================================
+# Test Run Result
+# =========================================================================
+
+struct TestRunResult:
+    files: [TestFileResult]
+    total_passed: i64
+    total_failed: i64
+    total_skipped: i64
+    total_pending: i64
+    total_timed_out: i64
+    total_duration_ms: i64
+    total_setup_ms: i64
+    total_cached: i64
+
+impl TestRunResult:
+    fn is_ok() -> bool:
+        self.total_failed == 0 and self.total_timed_out == 0
+
+# =========================================================================
+# Skip Feature Info
+# =========================================================================
+
+struct SkipFeatureInfo:
+    file_path: text
+    title: text
+    feature_ids: text
+    category: text
+    status: text
+
+# =========================================================================
+# Platform Specification Helper Functions
+# =========================================================================
+
+fn execution_mode_from_string(mode: text) -> TestExecutionMode:
+    """Parse execution mode from string, supporting nested syntax."""
+    val trimmed = mode.trim()
+    if trimmed.contains("("):
+        return TestExecutionMode.Composite(trimmed)
+    match trimmed.lower():
+        case "interpreter": TestExecutionMode.Interpreter
+        case "smf": TestExecutionMode.Smf
+        case "native": TestExecutionMode.Native
+        case "compile": TestExecutionMode.Compile
+        case _: TestExecutionMode.Interpreter
+
+fn execution_mode_base_runtime(mode: TestExecutionMode) -> text:
+    """Extract base runtime layer (interpreter, smf, native)."""
+    match mode:
+        case Interpreter: "interpreter"
+        case Smf: "smf"
+        case Native: "native"
+        case Compile: "compile"
+        case Composite(spec):
+            val first_paren = spec.find("(")
+            if first_paren > 0:
+                spec[0:first_paren].trim()
+            else:
+                "interpreter"
+
+fn execution_mode_is_composite(mode: TestExecutionMode) -> bool:
+    """Check if this is a composite platform spec."""
+    match mode:
+        case Composite(_): true
+        case _: false
+
+fn execution_mode_has_layer(mode: TestExecutionMode, layer: text) -> bool:
+    """Check if spec contains a specific layer."""
+    match mode:
+        case Composite(spec): spec.contains(layer)
+        case _: false
+
+fn execution_mode_is_remote(mode: TestExecutionMode) -> bool:
+    """Check if execution happens on remote target."""
+    execution_mode_has_layer(mode, "remote")
+
+fn execution_mode_is_baremetal(mode: TestExecutionMode) -> bool:
+    """Check if target is bare-metal (no OS)."""
+    execution_mode_has_layer(mode, "baremetal")
+
+fn execution_mode_is_container(mode: TestExecutionMode) -> bool:
+    """Check if execution happens in container."""
+    execution_mode_has_layer(mode, "container")
+
+fn execution_mode_target_arch(mode: TestExecutionMode) -> text:
+    """Extract target architecture from spec."""
+    match mode:
+        case Composite(spec):
+            val archs = ["riscv32", "arm32", "x86_64", "aarch64", "mips"]
+            var i = 0
+            while i < archs.len():
+                if spec.contains(archs[i]):
+                    return archs[i]
+                i = i + 1
+            "host"
+        case _: "host"
+
+fn execution_mode_to_string(mode: TestExecutionMode) -> text:
+    """Convert to string representation."""
+    match mode:
+        case Interpreter: "interpreter"
+        case Smf: "smf"
+        case Native: "native"
+        case Compile: "compile"
+        case Composite(spec): spec
+
+# =========================================================================
+# Exports
+# =========================================================================

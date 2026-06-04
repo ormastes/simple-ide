@@ -1,0 +1,50 @@
+# Desktop Commands
+#
+# Editor commands wired to desktop APIs (clipboard, file dialogs).
+# These functions bridge the editor dispatch with host-OS services.
+
+use std.nogc_sync_mut.desktop.clipboard.{clipboard_read, clipboard_write}
+use std.nogc_sync_mut.desktop.dialog.{open_file_dialog, save_file_dialog, DialogOptions, DialogFilter}
+
+fn _default_dialog_options(title: text) -> DialogOptions:
+    DialogOptions(
+        title: title,
+        default_path: "",
+        filters: [],
+        multiple: false
+    )
+
+fn _spl_dialog_options(title: text) -> DialogOptions:
+    var filters: [DialogFilter] = []
+    filters.push(DialogFilter(name: "Simple", patterns: [".spl"]))
+    DialogOptions(
+        title: title,
+        default_path: "",
+        filters: filters,
+        multiple: false
+    )
+
+fn editor_open_file_dialog() -> text:
+    val opts = _spl_dialog_options("Open File")
+    val result = open_file_dialog(opts)
+    val paths = result ?? []
+    if paths.len() == 0:
+        return ""
+    paths[0] ?? ""
+
+fn editor_save_file_dialog() -> text:
+    val opts = _default_dialog_options("Save File")
+    val result = save_file_dialog(opts)
+    result ?? ""
+
+fn editor_clipboard_copy(content: text) -> bool:
+    val result = clipboard_write(content)
+    result ?? false
+
+fn editor_clipboard_paste() -> text:
+    val result = clipboard_read()
+    result ?? ""
+
+fn editor_clipboard_cut(content: text) -> bool:
+    val result = clipboard_write(content)
+    result ?? false

@@ -1,0 +1,47 @@
+# Environment Collector
+#
+# Collects Claude Code artifact data for the dashboard.
+# Uses llm_diagnostics.env_scanner to discover CLAUDE.md, skills, agents, MCPs.
+
+use std.nogc_async_mut.llm_diagnostics.env_scanner.{
+    EnvSummary, ClaudeMdFile, SkillDef, AgentDef, McpServerDef,
+    HookDef, MemoryFile, TemplateDef,
+    scan_environment, new_env_summary
+}
+
+extern fn rt_env_get(name: text) -> text
+extern fn rt_file_exists(path: text) -> bool
+
+# --- Cached State ---
+
+var ENV_CACHE: EnvSummary = new_env_summary()
+var ENV_CACHED = false
+var ENV_PROJECT_DIR = ""
+
+fn env_collect(project_dir: text) -> EnvSummary:
+    """Collect environment data, caching the result."""
+    if ENV_CACHED and ENV_PROJECT_DIR == project_dir:
+        return ENV_CACHE
+    ENV_PROJECT_DIR = project_dir
+    ENV_CACHE = scan_environment(project_dir)
+    ENV_CACHED = true
+    ENV_CACHE
+
+fn env_refresh(project_dir: text) -> EnvSummary:
+    """Force re-scan of environment."""
+    ENV_CACHED = false
+    env_collect(project_dir)
+
+fn env_get_cached() -> EnvSummary:
+    """Get cached environment data."""
+    ENV_CACHE
+
+fn detect_project_dir() -> text:
+    """Detect project directory from cwd or env."""
+    val pwd = rt_env_get("PWD")
+    if pwd.len() > 0:
+        return pwd
+    val home = rt_env_get("HOME")
+    if home.len() > 0:
+        return home
+    "."

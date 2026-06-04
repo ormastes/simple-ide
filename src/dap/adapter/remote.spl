@@ -1,0 +1,6 @@
+# Remote Debug Adapter — app.dap.adapter.remote
+#
+# Re-exports RemoteAdapter from the nogc_sync_mut DAP library.
+# Consumed by app/dap/server.spl.
+
+export use std.nogc_sync_mut.dap.adapter.remote.RemoteAdapter

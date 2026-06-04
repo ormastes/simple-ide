@@ -1,0 +1,14 @@
+# LLM Agent Dashboard
+#
+# Real-time monitoring of LLM agent activity (Claude, Codex, Gemini).
+# Tracks agent hierarchy, file I/O, URL fetches, tool usage, and
+# provides room-based TUI and GUI visualization.
+#
+# The render_adapter module bridges existing TUI/GUI views to the
+# shared ui.render contract for preview/export.
+
+export run_llm_dashboard
+
+# Render adapter (shared ui.render contract)
+# RenderConfig, RenderRequest, RenderResult are now imported from app.ui.render.types
+export render_dashboard, render_text_snapshot, render_html_snapshot

@@ -1,0 +1,305 @@
+# Assistant Dashboard Collectors
+#
+# Collects a KAIROS-like assistant surface from local Claude transcript
+# files. The collector is standalone: it can replay persisted transcripts
+# without a live bridge, but it will mark a session live when the source
+# file is still being updated.
+
+use std.nogc_sync_mut.io.file_ops.{file_exists, file_read, file_modified_time}
+use std.nogc_sync_mut.io.process_ops.{shell_output_trimmed}
+use std.json.parser.{json_parse}
+use std.json.types.{json_get_type, json_to_string, json_to_number, json_to_boolean}
+use std.json.object_ops.{json_object_get}
+use std.json.array_ops.{json_array_get, json_array_length}
+use std.json.path_ops.{json_path_get}
+use app.dashboard.assistant_collectors_parsing.*
+use app.dashboard.assistant_collectors_text_json.*
+
+extern fn rt_env_get(key: text) -> text
+extern fn rt_time_now_seconds() -> i64
+
+# =========================================================================
+# Constants
+# =========================================================================
+
+val ASSISTANT_CACHE_TTL_SECS: i64 = 3
+val ASSISTANT_LIVE_WINDOW_SECS: i64 = 180
+val ASSISTANT_MAX_SESSIONS: i64 = 24
+val ASSISTANT_MAX_TIMELINE_EVENTS: i64 = 24
+val ASSISTANT_STORE_ROOT = ".build/llm_dashboard/assistant"
+val ASSISTANT_STORE_SESSIONS = ASSISTANT_STORE_ROOT + "/sessions"
+val ASSISTANT_STORE_TIMELINES = ASSISTANT_STORE_ROOT + "/timelines"
+val ASSISTANT_STORE_NOTIFICATIONS = ASSISTANT_STORE_ROOT + "/notifications"
+
+# =========================================================================
+# Snapshot Types
+# =========================================================================
+
+class AssistantSession:
+    session_id: text
+    transcript_path: text
+    project_name: text
+    title: text
+    objective: text
+    wake_reason: text
+    model: text
+    provider: text
+    source_state: text
+    session_state: text
+    parent_tool_use_id: text
+    parent_session_id: text
+    last_event_kind: text
+    last_event_detail: text
+    last_event_time: text
+    last_modified_time: i64
+    turn_count: i64
+    user_turns: i64
+    assistant_turns: i64
+    tool_turns: i64
+    error_count: i64
+    token_input: i64
+    token_output: i64
+    token_cache_read: i64
+    token_cache_create: i64
+    tool_use_ids: [text]
+    children: [text]
+    warnings: [text]
+
+    static fn new(session_id: text, transcript_path: text) -> AssistantSession:
+        return AssistantSession(
+            session_id: session_id,
+            transcript_path: transcript_path,
+            project_name: assistant_project_name(transcript_path),
+            title: assistant_session_title(transcript_path),
+            objective: "",
+            wake_reason: "",
+            model: "",
+            provider: "",
+            source_state: "replay",
+            session_state: "stale",
+            parent_tool_use_id: "",
+            parent_session_id: "",
+            last_event_kind: "",
+            last_event_detail: "",
+            last_event_time: "",
+            last_modified_time: 0,
+            turn_count: 0,
+            user_turns: 0,
+            assistant_turns: 0,
+            tool_turns: 0,
+            error_count: 0,
+            token_input: 0,
+            token_output: 0,
+            token_cache_read: 0,
+            token_cache_create: 0,
+            tool_use_ids: [],
+            children: [],
+            warnings: []
+        )
+
+class AssistantTimelineEvent:
+    session_id: text
+    timestamp: text
+    kind: text
+    severity: text
+    title: text
+    detail: text
+    source: text
+
+    static fn new(session_id: text, timestamp: text, kind: text, severity: text, title: text, detail: text, source: text) -> AssistantTimelineEvent:
+        return AssistantTimelineEvent(
+            session_id: session_id,
+            timestamp: timestamp,
+            kind: kind,
+            severity: severity,
+            title: title,
+            detail: detail,
+            source: source
+        )
+
+class AssistantDashboardSnapshot:
+    source_label: text
+    source_path: text
+    surface_state: text
+    selected_session_id: text
+    collected_at: text
+    sessions: [AssistantSession]
+    timeline: [AssistantTimelineEvent]
+    warnings: [text]
+    total_sessions: i64
+    live_sessions: i64
+    replay_sessions: i64
+    degraded_sessions: i64
+    total_events: i64
+
+    static fn empty() -> AssistantDashboardSnapshot:
+        return AssistantDashboardSnapshot(
+            source_label: "",
+            source_path: "",
+            surface_state: "degraded",
+            selected_session_id: "",
+            collected_at: "",
+            sessions: [],
+            timeline: [],
+            warnings: [],
+            total_sessions: 0,
+            live_sessions: 0,
+            replay_sessions: 0,
+            degraded_sessions: 0,
+            total_events: 0
+        )
+
+# =========================================================================
+# Cache
+# =========================================================================
+
+var ASSISTANT_CACHE: AssistantDashboardSnapshot = AssistantDashboardSnapshot.empty()
+var ASSISTANT_CACHE_SIGNATURE = ""
+var ASSISTANT_CACHE_EXPIRES_AT: i64 = 0
+
+# =========================================================================
+# Public Collector API
+# =========================================================================
+
+fn collect_assistant_snapshot() -> AssistantDashboardSnapshot:
+    val now = rt_time_now_seconds()
+    val files = discover_assistant_transcripts()
+    val signature = assistant_cache_signature(files)
+    if ASSISTANT_CACHE_EXPIRES_AT > now and signature == ASSISTANT_CACHE_SIGNATURE:
+        return ASSISTANT_CACHE
+
+    var snapshot = AssistantDashboardSnapshot.empty()
+    snapshot.collected_at = assistant_clock_label(now)
+    snapshot.source_path = assistant_source_root()
+    snapshot.source_label = assistant_source_label(files)
+
+    if files.len() == 0:
+        snapshot.surface_state = "degraded"
+        snapshot.warnings.push("No assistant transcripts or MCP assistant store sessions found")
+        snapshot.selected_session_id = ""
+        ASSISTANT_CACHE = snapshot
+        ASSISTANT_CACHE_SIGNATURE = signature
+        ASSISTANT_CACHE_EXPIRES_AT = now + ASSISTANT_CACHE_TTL_SECS
+        return snapshot
+
+    var sessions: [AssistantSession] = []
+    var total_events = 0
+    for path in files:
+        val session = parse_assistant_session(path, now)
+        if session.session_id != "":
+            sessions.push(session)
+            total_events = total_events + session.turn_count
+        if sessions.len() >= ASSISTANT_MAX_SESSIONS:
+            break
+
+    sessions = sort_sessions_by_activity(sessions)
+
+    snapshot.sessions = sessions
+    snapshot.total_sessions = sessions.len()
+    snapshot.total_events = total_events
+    snapshot.live_sessions = count_sessions_with_state(sessions, "live")
+    snapshot.replay_sessions = count_sessions_with_state(sessions, "replay")
+    snapshot.degraded_sessions = count_sessions_with_state(sessions, "degraded")
+    snapshot.surface_state = assistant_surface_state(snapshot)
+    snapshot.selected_session_id = assistant_pick_primary_session(sessions)
+
+    if snapshot.selected_session_id != "":
+        snapshot.timeline = build_session_timeline(snapshot, snapshot.selected_session_id, ASSISTANT_MAX_TIMELINE_EVENTS)
+
+    if snapshot.live_sessions == 0 and snapshot.replay_sessions == 0 and snapshot.degraded_sessions == 0:
+        snapshot.surface_state = "degraded"
+        snapshot.warnings.push("No usable assistant sessions were parsed")
+
+    ASSISTANT_CACHE = snapshot
+    ASSISTANT_CACHE_SIGNATURE = signature
+    ASSISTANT_CACHE_EXPIRES_AT = now + ASSISTANT_CACHE_TTL_SECS
+    snapshot
+
+fn collect_assistant_sessions() -> [AssistantSession]:
+    collect_assistant_snapshot().sessions
+
+fn collect_assistant_timeline(session_id: text) -> [AssistantTimelineEvent]:
+    val snapshot = collect_assistant_snapshot()
+    if session_id == "":
+        if snapshot.selected_session_id == "":
+            return []
+        return build_session_timeline(snapshot, snapshot.selected_session_id, ASSISTANT_MAX_TIMELINE_EVENTS)
+    build_session_timeline(snapshot, session_id, ASSISTANT_MAX_TIMELINE_EVENTS)
+
+# =========================================================================
+# Discovery
+# =========================================================================
+
+fn assistant_source_root() -> text:
+    val home = rt_env_get("HOME")
+    if home == "":
+        return ""
+    return "{home}/.claude/projects"
+
+fn assistant_history_path() -> text:
+    val home = rt_env_get("HOME")
+    if home == "":
+        return ""
+    return "{home}/.claude/history.jsonl"
+
+fn discover_assistant_transcripts() -> [text]:
+    var files: [text] = []
+
+    val store_files = discover_assistant_store_sessions()
+    if store_files.len() > 0:
+        for path in store_files:
+            files.push(path)
+        return files
+
+    # Conservative fallback: do not parse arbitrary Claude transcript trees here.
+    # The dashboard assistant surface is driven by the managed local assistant
+    # store under `.build/llm_dashboard/assistant`. When that store is absent,
+    # degrade cleanly instead of attempting best-effort transcript replay.
+    files
+
+fn discover_assistant_store_sessions() -> [text]:
+    var files: [text] = []
+    if ASSISTANT_STORE_SESSIONS != "" and file_exists(ASSISTANT_STORE_SESSIONS):
+        val out = shell_output_trimmed("find '{ASSISTANT_STORE_SESSIONS}' -type f -name '*.json' 2>/dev/null | sort", "")
+        if out.trim() != "":
+            for line in out.split("\n"):
+                val path = line.trim()
+                if path != "":
+                    files.push(path)
+    files
+
+fn assistant_cache_signature(files: [text]) -> text:
+    if files.len() == 0:
+        return "empty"
+    var newest = 0
+    var count = 0
+    for path in files:
+        count = count + 1
+        val mtime = file_modified_time(path)
+        if mtime > newest:
+            newest = mtime
+    "{count}:{newest}"
+
+fn assistant_source_label(files: [text]) -> text:
+    if files.len() == 0:
+        return "degraded"
+    var has_store = false
+    var has_transcripts = false
+    val root = assistant_source_root()
+    val history = assistant_history_path()
+    for path in files:
+        if assistant_is_store_session_path(path):
+            has_store = true
+        elif root != "" and path.starts_with(root):
+            has_transcripts = true
+        elif history != "" and path == history:
+            has_transcripts = true
+    if has_store and has_transcripts:
+        return "assistant store + Claude transcripts"
+    if has_store:
+        return "assistant store"
+    if root != "" and has_transcripts:
+        return "live/replay transcripts"
+    if has_transcripts:
+        return "replay history"
+    "replay history"

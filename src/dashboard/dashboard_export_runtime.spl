@@ -1,0 +1,210 @@
+use std.cli.cli_parser.{cli_spec, cli_spec_flag, cli_spec_option, parse_cli_args, parsed_flag, parsed_option}
+use std.nogc_sync_mut.io.file_ops.{file_exists, file_read, file_write, file_remove}
+use std.nogc_sync_mut.io.dir_ops.{dir_create_all}
+use std.text.{to_int_or, escape_json}
+use app.ui.detect.{has_tauri_shell}
+use app.llm_dashboard.main.{run_llm_dashboard}
+use app.dashboard.main.{
+    DASHBOARD_CACHE_PATH, DASHBOARD_HISTORY_DIR, DASHBOARD_TABLE_DIR,
+    TABLE_COUNT, TABLE_HEADERS, TABLE_NAMES, current_month, ensure_dirs,
+    load_table, today_date
+}
+use app.dashboard.dashboard_collectors.{compute_summary}
+
+extern fn rt_platform_name() -> text
+
+fn run_export(args: [text]):
+    val spec = cli_spec()
+    val spec2 = cli_spec_option(spec, "format", "f", "Export format", default: "html", choices: ["html", "json"])
+    val parsed = parse_cli_args(spec2, args)
+    val format = parsed_option(parsed, "format")
+
+    if format == "json":
+        print export_json()
+    else:
+        print export_html()
+
+fn run_invalidate_cache(args: [text]):
+    if file_exists(DASHBOARD_CACHE_PATH):
+        file_remove(DASHBOARD_CACHE_PATH)
+        print "Cache cleared."
+    else:
+        print "Cache not found."
+
+fn run_snapshot(args: [text]):
+    ensure_dirs()
+    val month = current_month()
+    val date = today_date()
+    if month == "" or date == "":
+        print "Error: unable to determine date."
+        return
+    val dir = "{DASHBOARD_HISTORY_DIR}/{month}"
+    dir_create_all(dir)
+    val path = "{dir}/{date}.sdn"
+
+    var content_parts: [text] = []
+    var i = 0
+    while i < TABLE_COUNT:
+        val name = TABLE_NAMES[i]
+        val table_path = "{DASHBOARD_TABLE_DIR}/{name}.sdn"
+        if file_exists(table_path):
+            content_parts.push(file_read(table_path))
+            content_parts.push("\n")
+        else:
+            val headers = TABLE_HEADERS[i]
+            content_parts.push("{name} |{headers.join(', ')}|")
+            content_parts.push("\n\n")
+        i = i + 1
+
+    file_write(path, content_parts.join("").trim() + "\n")
+    print "Snapshot saved to {path}"
+
+fn export_json() -> text:
+    val summary = compute_summary()
+    var parts: [text] = []
+    parts.push("{\n")
+    parts.push("  \"summary\": {\n")
+    val s_keys = summary.keys()
+    var i = 0
+    while i < s_keys.len():
+        val key = s_keys[i]
+        val value = summary[key]
+        val comma = if i < s_keys.len() - 1: "," else: ""
+        parts.push("    \"{escape_json(key)}\": {value}{comma}\n")
+        i = i + 1
+    parts.push("  },\n")
+    parts.push("  \"tables\": {\n")
+
+    var t = 0
+    while t < TABLE_COUNT:
+        val name = TABLE_NAMES[t]
+        val table = load_table("{DASHBOARD_TABLE_DIR}/{name}.sdn")
+        val comma = if t < TABLE_COUNT - 1: "," else: ""
+        parts.push("    \"{name}\": {\n")
+        var header_parts: [text] = []
+        var h = 0
+        while h < table.headers.len():
+            header_parts.push("\"{escape_json(table.headers[h])}\"")
+            h = h + 1
+        parts.push("      \"headers\": [{header_parts.join(", ")}],\n")
+        parts.push("      \"rows\": [\n")
+        var r = 0
+        while r < table.rows.len():
+            val row = table.rows[r]
+            var cell_parts: [text] = []
+            var c = 0
+            while c < row.len():
+                cell_parts.push("\"{escape_json(row[c])}\"")
+                c = c + 1
+            val rcomma = if r < table.rows.len() - 1: "," else: ""
+            parts.push("        [{cell_parts.join(", ")}]{rcomma}\n")
+            r = r + 1
+        parts.push("      ]\n")
+        parts.push("    }{comma}\n")
+        t = t + 1
+    parts.push("  }\n")
+    parts.push("}\n")
+    parts.join("")
+
+fn export_html() -> text:
+    val summary = compute_summary()
+    val features_total = if summary.has("features_total"): summary["features_total"] else: "0"
+    val features_complete = if summary.has("features_complete"): summary["features_complete"] else: "0"
+    val todos_total = if summary.has("todos_total"): summary["todos_total"] else: "0"
+    val coverage_pct = if summary.has("coverage_pct"): summary["coverage_pct"] else: "0"
+
+    var html_parts: [text] = []
+    html_parts.push("<!DOCTYPE html>\n")
+    html_parts.push("<html>\n")
+    html_parts.push("<head>\n")
+    html_parts.push("  <meta charset=\"utf-8\">\n")
+    html_parts.push("  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n")
+    html_parts.push("  <title>Simple Dashboard</title>\n")
+    html_parts.push("  <style>\n")
+    html_parts.push("    body { font-family: system-ui, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }\n")
+    html_parts.push("    .container { max-width: 1200px; margin: 0 auto; }\n")
+    html_parts.push("    .card { background: #fff; padding: 20px; margin: 20px 0; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.08); }\n")
+    html_parts.push("    .metric { display: inline-block; margin-right: 24px; }\n")
+    html_parts.push("    .metric-label { color: #666; font-size: 13px; }\n")
+    html_parts.push("    .metric-value { font-size: 28px; font-weight: bold; color: #1565c0; }\n")
+    html_parts.push("    table { border-collapse: collapse; width: 100%; }\n")
+    html_parts.push("    th, td { border: 1px solid #ddd; padding: 8px; font-size: 13px; }\n")
+    html_parts.push("    th { background: #fafafa; text-align: left; }\n")
+    html_parts.push("  </style>\n")
+    html_parts.push("</head>\n")
+    html_parts.push("<body>\n")
+    html_parts.push("  <div class=\"container\">\n")
+    html_parts.push("    <h1>Simple Dashboard</h1>\n")
+    html_parts.push("    <div class=\"card\">\n")
+    html_parts.push("      <div class=\"metric\"><div class=\"metric-label\">Features</div><div class=\"metric-value\">{features_complete}/{features_total}</div></div>\n")
+    html_parts.push("      <div class=\"metric\"><div class=\"metric-label\">Coverage</div><div class=\"metric-value\">{coverage_pct}%</div></div>\n")
+    html_parts.push("      <div class=\"metric\"><div class=\"metric-label\">TODOs</div><div class=\"metric-value\">{todos_total}</div></div>\n")
+    html_parts.push("    </div>\n")
+
+    val todo_table = load_table("{DASHBOARD_TABLE_DIR}/todos.sdn")
+    if todo_table.rows.len() > 0:
+        html_parts.push("    <div class=\"card\">\n")
+        html_parts.push("      <h2>Top TODOs</h2>\n")
+        html_parts.push("      <table>\n")
+        html_parts.push("        <tr><th>ID</th><th>Priority</th><th>Description</th><th>File</th></tr>\n")
+        var i = 0
+        while i < todo_table.rows.len() and i < 10:
+            val row = todo_table.rows[i]
+            val id = if row.len() > 0: row[0] else: ""
+            val priority = if row.len() > 3: row[3] else: ""
+            val desc = if row.len() > 4: row[4] else: ""
+            val file = if row.len() > 5: row[5] else: ""
+            html_parts.push("        <tr><td>{id}</td><td>{priority}</td><td>{desc}</td><td>{file}</td></tr>\n")
+            i = i + 1
+        html_parts.push("      </table>\n")
+        html_parts.push("    </div>\n")
+
+    html_parts.push("  </div>\n")
+    html_parts.push("</body>\n")
+    html_parts.push("</html>\n")
+    html_parts.join("")
+
+fn _run_serve_result(args: [text]) -> text:
+    val spec = cli_spec()
+    val spec2 = cli_spec_option(spec, "port", "p", "Server port", default: "3000", choices: [])
+    val parsed = parse_cli_args(spec2, args)
+    val port = to_int_or(parsed_option(parsed, "port"), 3000)
+    "Starting dashboard web server on port {port} (delegating to run_llm_dashboard)"
+
+fn _run_gui_result(args: [text]) -> text:
+    val spec = cli_spec()
+    val spec2 = cli_spec_option(spec, "port", "p", "Server port", default: "3000", choices: [])
+    val spec3 = cli_spec_flag(spec2, "browser", "b", "Open in browser instead of desktop window")
+    val parsed = parse_cli_args(spec3, args)
+    val port = to_int_or(parsed_option(parsed, "port"), 3000)
+    val use_browser = parsed_flag(parsed, "browser")
+    "Starting Dashboard GUI on http://localhost:{port} (use_browser={use_browser}, delegating to run_llm_dashboard)"
+
+fn _run_agents_result(args: [text]) -> text:
+    "Starting LLM agent dashboard (delegating to run_llm_dashboard)"
+
+fn run_serve(args: [text]):
+    val spec = cli_spec()
+    val spec2 = cli_spec_option(spec, "port", "p", "Server port", default: "3000", choices: [])
+    val parsed = parse_cli_args(spec2, args)
+    val port = to_int_or(parsed_option(parsed, "port"), 3000)
+    val delegated_args = ["--web", "--port", "{port}"]
+    run_llm_dashboard(delegated_args)
+
+fn run_gui(args: [text]):
+    val spec = cli_spec()
+    val spec2 = cli_spec_option(spec, "port", "p", "Server port", default: "3000", choices: [])
+    val spec3 = cli_spec_flag(spec2, "browser", "b", "Open in browser instead of desktop window")
+    val parsed = parse_cli_args(spec3, args)
+    val port = to_int_or(parsed_option(parsed, "port"), 3000)
+    val use_browser = parsed_flag(parsed, "browser")
+
+    print "Starting Dashboard GUI on http://localhost:{port}"
+
+    if use_browser and rt_platform_name() != "simpleos":
+        print "Opening http://localhost:{port} in browser"
+    elif not use_browser and has_tauri_shell():
+        print "Opening in Tauri shell"
+    else:
+        print "Open http://localhost:{port} in your browser"
+    run_llm_dashboard(["--web", "--port", "{port}"])

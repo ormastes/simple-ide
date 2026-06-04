@@ -1,0 +1,47 @@
+# Message Panel HTML
+#
+# Agent-to-agent message timeline for the Observability tab.
+# Shows send/receive messages between parent and child agents.
+
+use app.llm_dashboard.data.store.{AgentDashboardStore}
+use app.llm_dashboard.data.types.{AgentMessage, format_timestamp, truncate_text}
+
+# =========================================================================
+# Message Panel CSS
+# =========================================================================
+
+fn generate_message_panel_css() -> text:
+    return """
+.message-panel { padding: 16px; }
+.message-timeline { display: flex; flex-direction: column; gap: 8px; }
+.msg-entry { display: flex; gap: 10px; align-items: flex-start; }
+.msg-send .msg-arrow { color: #3fb950; }
+.msg-receive .msg-arrow { color: #58a6ff; }
+.msg-arrow { font-weight: bold; font-size: 1rem; min-width: 20px; }
+.msg-meta { font-size: 0.78rem; color: #8b949e; min-width: 80px; }
+.msg-content { font-size: 0.83rem; color: #e6edf3; background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 5px 10px; flex: 1; font-family: monospace; white-space: pre-wrap; word-break: break-word; }
+.msg-no-data { color: #8b949e; font-size: 0.85rem; padding: 16px; }
+"""
+
+# =========================================================================
+# Message Panel HTML
+# =========================================================================
+
+fn generate_message_panel_html(store: AgentDashboardStore) -> text:
+    val messages = store.get_agent_messages(100)
+
+    if messages.len() == 0:
+        return """<div class="message-panel"><p class="msg-no-data">No agent messages captured yet.<br>Agent-to-agent payloads appear here when subagents are spawned with prompts.</p></div>"""
+
+    var entries = ""
+    for msg in messages:
+        val arrow = if msg.direction == "send": "→" else: "←"
+        val css_class = if msg.direction == "send": "msg-send" else: "msg-receive"
+        val time = format_timestamp(msg.timestamp)
+        val who = if msg.direction == "send":
+            "{truncate_text(msg.parent_id, 10)} → {truncate_text(msg.child_id, 10)}"
+        else:
+            "← agent"
+        entries = "{entries}<div class=\"msg-entry {css_class}\"><span class=\"msg-arrow\">{arrow}</span><span class=\"msg-meta\">{time}<br>{who}</span><div class=\"msg-content\">{msg.content}</div></div>"
+
+    return """<div class="message-panel"><div class="message-timeline">{entries}</div></div>"""

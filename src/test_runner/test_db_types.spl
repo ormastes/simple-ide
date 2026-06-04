@@ -1,0 +1,193 @@
+# Test Database Types
+#
+# Core data types for the V3 SDN test database format.
+
+use std.io.{time_now_unix_micros}
+
+# =========================================================================
+# Enums
+# =========================================================================
+
+enum TestStatus:
+    Passed
+    Failed
+    Skipped
+    Ignored
+    QualifiedIgnore
+    Pending
+
+enum ChangeType:
+    NoChange
+    PassToFail
+    FailToPass
+    NewTest
+    SkipToPass
+    SkipToFail
+    PassToSkip
+    FailToSkip
+    PendingToPass
+    PendingToFail
+
+# =========================================================================
+# Records
+# =========================================================================
+
+struct FileRecord:
+    file_id: i64
+    path_str: i64
+
+struct SuiteRecord:
+    suite_id: i64
+    file_id: i64
+    name_str: i64
+
+struct TestRecord:
+    suite_id: i64
+    name_str: i64
+    category_str: i64
+    status_str: i64
+    tags_str: text
+    description_str: text
+    valid: bool
+    qualified_by: text
+    qualified_at: text
+    qualified_reason: text
+
+struct CounterRecord:
+    test_id: i64
+    total_runs: i64
+    passed: i64
+    failed: i64
+    flaky_count: i64
+    last_change: text
+    last_10_runs: text
+    failure_rate_pct: f64
+
+struct TimingSummary:
+    test_id: i64
+    last_ms: f64
+    p50: f64
+    p90: f64
+    p95: f64
+    baseline_median: f64
+    p99: f64
+    min_time: f64
+    max_time: f64
+    iqr: f64
+    mean: f64
+    std_dev: f64
+    cv_pct: f64
+    baseline_mean: f64
+    baseline_std_dev: f64
+    baseline_cv_pct: f64
+    baseline_last_updated: text
+    baseline_run_count: i64
+    baseline_update_reason: text
+
+struct TimingRun:
+    test_id: i64
+    timestamp: text
+    duration_ms: f64
+    outlier: bool
+
+struct ChangeEvent:
+    test_id: i64
+    change_type: text
+    run_id: text
+
+struct RunRecord:
+    run_id: text
+    start_time: text
+    end_time: text
+    pid: i64
+    hostname: text
+    status: text
+    test_count: i64
+    passed: i64
+    failed: i64
+    crashed: i64
+    timed_out: i64
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn status_to_str(status: TestStatus) -> text:
+    match status:
+        case TestStatus.Passed: "passed"
+        case TestStatus.Failed: "failed"
+        case TestStatus.Skipped: "skipped"
+        case TestStatus.Ignored: "ignored"
+        case TestStatus.QualifiedIgnore: "qualifiedignore"
+        case TestStatus.Pending: "pending"
+
+fn str_to_status(s: text) -> TestStatus:
+    match s:
+        case "passed": TestStatus.Passed
+        case "failed": TestStatus.Failed
+        case "skipped": TestStatus.Skipped
+        case "ignored": TestStatus.Ignored
+        case "qualifiedignore": TestStatus.QualifiedIgnore
+        case "pending": TestStatus.Pending
+        case _: TestStatus.Skipped
+
+fn change_type_str(old_status: text, new_status: text, is_new: bool) -> text:
+    if is_new:
+        return "new_test"
+    if old_status == new_status:
+        return "no_change"
+    if old_status == "passed" and new_status == "failed":
+        return "pass_to_fail"
+    if old_status == "failed" and new_status == "passed":
+        return "fail_to_pass"
+    if old_status == "skipped" and new_status == "passed":
+        return "skip_to_pass"
+    if old_status == "skipped" and new_status == "failed":
+        return "skip_to_fail"
+    if old_status == "passed" and new_status == "skipped":
+        return "pass_to_skip"
+    if old_status == "failed" and new_status == "skipped":
+        return "fail_to_skip"
+    if old_status == "pending" and new_status == "passed":
+        return "pending_to_pass"
+    if old_status == "pending" and new_status == "failed":
+        return "pending_to_fail"
+    "no_change"
+
+fn is_flaky_change(change: text) -> bool:
+    change == "pass_to_fail" or change == "fail_to_pass"
+
+# =========================================================================
+# Individual Test Result (per-test granularity from output parsing)
+# =========================================================================
+
+struct IndividualTestResult:
+    name: text
+    group: text
+    status: TestStatus
+    error_message: text
+
+struct TestFailure:
+    test_name: text
+    error_message: text
+    assertion: text
+    location: text
+    stack_trace: text
+
+# =========================================================================
+# Timing Config
+# =========================================================================
+
+struct TimingConfig:
+    max_runs_per_test: i64
+    baseline_change_threshold: f64
+    outlier_iqr_multiplier: f64
+
+impl TimingConfig:
+    static fn defaults() -> TimingConfig:
+        TimingConfig(
+            max_runs_per_test: 10,
+            baseline_change_threshold: 0.10,
+            outlier_iqr_multiplier: 1.5
+        )
+

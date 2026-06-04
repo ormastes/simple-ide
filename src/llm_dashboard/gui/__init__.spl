@@ -1,0 +1,11 @@
+# LLM Dashboard GUI
+#
+# Web-based GUI rendering for the LLM Agent Dashboard.
+# HTML generation, CSS sprites, WebSocket real-time updates.
+# Terminal and Tmux panels (ported from web_dashboard).
+
+export generate_agents_html, generate_agents_html_with_ios, generate_agents_css
+export ios_css_overrides
+export AgentWsHandler
+export handle_terminal_ws, generate_terminal_panel_html, generate_terminal_css, generate_terminal_js
+export handle_tmux_api

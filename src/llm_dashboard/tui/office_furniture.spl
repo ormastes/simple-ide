@@ -1,0 +1,189 @@
+# Office Furniture — ASCII Art Assets
+#
+# Desk, monitor, bookshelf, whiteboard, plant, and other
+# office furniture rendered as ASCII/Unicode art for TUI rooms.
+#
+# Each piece returns [text] lines that can be composited onto the screen.
+# Dimensions are kept small to fit multiple desks per room.
+
+use app.ui.render.ansi.{RESET, BOLD, DIM, FG_BLUE, FG_GREEN, FG_YELLOW,
+    FG_MAGENTA, FG_CYAN, FG_WHITE, FG_RED, BG_BLACK}
+
+# =========================================================================
+# Desk with Monitor (5w × 3h)  — agent sits here
+# =========================================================================
+#
+#   ┌─┐     (monitor)
+#   └┬┘     (stand)
+#   ═══     (desk surface)
+#
+
+fn desk_with_monitor() -> [text]:
+    [
+        DIM + "┌─┐" + RESET,
+        DIM + "└┬┘" + RESET,
+        FG_YELLOW + "═══" + RESET
+    ]
+
+fn desk_with_monitor_active() -> [text]:
+    [
+        FG_CYAN + "┌─┐" + RESET,
+        FG_CYAN + "└┬┘" + RESET,
+        FG_YELLOW + "═══" + RESET
+    ]
+
+val DESK_WIDTH: i32 = 3
+val DESK_HEIGHT: i32 = 3
+
+# =========================================================================
+# Agent at Desk (combined: desk + character above)
+# Total: 6h = 3 sprite + 3 desk
+# =========================================================================
+#
+#    C*       (agent head + activity)
+#   /|\       (agent body)
+#   ┌─┐      (monitor, overlaps with legs visually)
+#   └┬┘
+#   ═══
+#
+
+fn agent_at_desk_lines(agent_sprite: [text], active: bool) -> [text]:
+    """Combine agent sprite (3 lines) sitting above desk (3 lines)."""
+    var lines: [text] = []
+    # Agent sprite
+    for line in agent_sprite:
+        lines.push(line)
+    # Desk
+    val desk = if active: desk_with_monitor_active() else: desk_with_monitor()
+    for line in desk:
+        lines.push(line)
+    lines
+
+val AGENT_AT_DESK_HEIGHT: i32 = 6
+val AGENT_AT_DESK_WIDTH: i32 = 6
+
+# =========================================================================
+# Room Furniture Pieces
+# =========================================================================
+
+# Bookshelf (3w × 3h) — Research room
+fn bookshelf() -> [text]:
+    [
+        FG_YELLOW + "┌┬┐" + RESET,
+        FG_YELLOW + "├┼┤" + RESET,
+        FG_YELLOW + "└┴┘" + RESET
+    ]
+
+# Whiteboard (5w × 3h) — Chat/meeting room
+fn whiteboard() -> [text]:
+    [
+        FG_WHITE + "╔═══╗" + RESET,
+        FG_WHITE + "║   ║" + RESET,
+        FG_WHITE + "╚═══╝" + RESET
+    ]
+
+# Server rack (3w × 3h) — Server room
+fn server_rack() -> [text]:
+    [
+        FG_GREEN + "┌─┐" + RESET,
+        FG_GREEN + "│█│" + RESET,
+        FG_GREEN + "└─┘" + RESET
+    ]
+
+# Test beaker (3w × 3h) — TestLab
+fn test_beaker() -> [text]:
+    [
+        FG_MAGENTA + " ▽ " + RESET,
+        FG_MAGENTA + "│ │" + RESET,
+        FG_MAGENTA + "└─┘" + RESET
+    ]
+
+# Plant (2w × 2h) — decoration
+fn plant() -> [text]:
+    [
+        FG_GREEN + "🌿" + RESET,
+        FG_GREEN + "┃ " + RESET
+    ]
+
+# Coffee mug (2w × 1h) — decoration
+fn coffee_mug() -> text:
+    FG_YELLOW + "☕" + RESET
+
+# =========================================================================
+# Room Templates — Static furniture layout per room type
+# =========================================================================
+#
+# Each template returns a list of (row_offset, col_offset, lines) tuples
+# for furniture placement within a room.
+#
+
+struct FurniturePlacement:
+    row_offset: i32
+    col_offset: i32
+    lines: [text]
+
+fn research_room_furniture(room_w: i32) -> [FurniturePlacement]:
+    """Research room: bookshelf on wall + plant in corner."""
+    var placements: [FurniturePlacement] = []
+    # Bookshelf on right wall
+    placements.push(FurniturePlacement(
+        row_offset: 0,
+        col_offset: room_w - 6,
+        lines: bookshelf()
+    ))
+    placements
+
+fn code_room_furniture(room_w: i32) -> [FurniturePlacement]:
+    """Code room: extra monitor rack on wall."""
+    []   # desks placed dynamically with agents
+
+fn skills_room_furniture(room_w: i32) -> [FurniturePlacement]:
+    """Skills room: whiteboard on wall."""
+    var placements: [FurniturePlacement] = []
+    placements.push(FurniturePlacement(
+        row_offset: 0,
+        col_offset: room_w - 8,
+        lines: whiteboard()
+    ))
+    placements
+
+fn server_room_furniture(room_w: i32) -> [FurniturePlacement]:
+    """Server room: server racks along wall."""
+    var placements: [FurniturePlacement] = []
+    placements.push(FurniturePlacement(
+        row_offset: 0,
+        col_offset: room_w - 6,
+        lines: server_rack()
+    ))
+    placements
+
+fn chat_room_furniture(room_w: i32) -> [FurniturePlacement]:
+    """Chat room: whiteboard for meetings."""
+    var placements: [FurniturePlacement] = []
+    placements.push(FurniturePlacement(
+        row_offset: 0,
+        col_offset: 1,
+        lines: whiteboard()
+    ))
+    placements
+
+fn testlab_room_furniture(room_w: i32) -> [FurniturePlacement]:
+    """TestLab: beaker decoration."""
+    var placements: [FurniturePlacement] = []
+    placements.push(FurniturePlacement(
+        row_offset: 0,
+        col_offset: room_w - 6,
+        lines: test_beaker()
+    ))
+    placements
+
+# =========================================================================
+# Room-specific Floor Pattern
+# =========================================================================
+
+fn room_floor_char(is_empty: bool) -> text:
+    """Subtle floor pattern for empty desk slots."""
+    if is_empty:
+        DIM + "·" + RESET
+    else:
+        " "

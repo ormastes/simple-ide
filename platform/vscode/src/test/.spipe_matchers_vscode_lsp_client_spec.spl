@@ -1,0 +1,308 @@
+"""
+VSCode Extension LSP Client Specification.
+
+**Feature IDs:** #VSCODE-LSP-001
+**Category:** Infrastructure
+**Difficulty:** 2/5
+**Status:** Implemented
+**Requirements:** N/A
+**Plan:** N/A
+**Design:** N/A
+**Research:** N/A
+**Artifacts:** N/A
+**Screenshots:** N/A
+**TUI Captures:** N/A
+**Logs:** N/A
+
+## Overview
+
+Validates the VSCode extension LSP client infrastructure: capability flags,
+code actions provider, debug adapter configuration, and workspace settings.
+Covers AC-1 through AC-5 of the vscode-extension-lsp feature.
+
+## Syntax
+
+```simple
+use std.spipe.*
+```
+
+## Key Concepts
+
+- `lsp_client_config_capabilities` returns all 12 server capability flags
+- `code_actions_provider_*` functions manage CodeAction lifecycle
+- `debug_adapter_config_create` builds launch/attach configurations
+- `workspace_config_is_feature_enabled` checks named feature toggles
+
+## Behavior
+
+All functions return pure data structs with no side effects.
+
+## Related Specifications
+
+- src/lib/nogc_sync_mut/lsp/ — server-side LSP handlers
+
+## Implementation Notes
+
+Pure data+function modules — no inheritance, no classes.
+
+## Examples
+
+```simple
+use std.spipe.*
+
+describe "LspClientConfig":
+    it "capabilities has code_action_provider":
+        val caps = lsp_client_config_capabilities()
+        expect caps.code_action_provider == true
+```
+"""
+
+use std.spipe.*
+use app.vscode_extension.src.lsp_client_config.{lsp_client_config_create, lsp_client_config_capabilities, lsp_client_config_server_path, lsp_client_config_language_selector}
+use app.vscode_extension.src.code_actions_provider.{CodeActionsProvider, code_actions_provider_create, code_actions_provider_add, code_actions_provider_clear, code_actions_provider_by_kind, code_actions_provider_preferred, code_actions_provider_count, code_action_from_lsp, code_action_kind_quickfix, code_action_kind_refactor, code_action_kind_source, code_action_kind_organize_imports}
+use app.vscode_extension.src.debug_adapter_config.{debug_adapter_config_create, dap_server_path, dap_server_args, dap_session_dir}
+use app.vscode_extension.src.workspace_config.{workspace_config_create, workspace_config_server_path, workspace_config_is_feature_enabled, workspace_config_with_override}
+
+fn make_mixed_provider() -> CodeActionsProvider:
+    """Build a provider with one quickfix (preferred) and one refactor action."""
+    val qf = code_action_from_lsp("Fix import", code_action_kind_quickfix(), true)
+    val rf = code_action_from_lsp("Extract fn", code_action_kind_refactor(), false)
+    var actions = [qf, rf]
+    CodeActionsProvider(actions: actions)
+
+# ===========================================================================
+# LspClientConfig — capability flags (AC-1)
+# ===========================================================================
+
+describe "LspClientConfig capabilities":
+    """
+    ## AC-1: Capability Flags
+
+    Validates that `lsp_client_config_capabilities` returns all required
+    capability flags including the newly added code_action_provider,
+    document_formatting_provider, and debug_adapter_support flags.
+    """
+
+    it "has completion provider enabled":
+        val caps = lsp_client_config_capabilities()
+        expect caps.completion_provider == true
+
+    it "has definition provider enabled":
+        val caps = lsp_client_config_capabilities()
+        expect caps.definition_provider == true
+
+    it "has hover provider enabled":
+        val caps = lsp_client_config_capabilities()
+        expect caps.hover_provider == true
+
+    it "has references provider enabled":
+        val caps = lsp_client_config_capabilities()
+        expect caps.references_provider == true
+
+    it "has semantic tokens provider enabled":
+        val caps = lsp_client_config_capabilities()
+        expect caps.semantic_tokens_provider == true
+
+    it "has diagnostic provider enabled":
+        val caps = lsp_client_config_capabilities()
+        expect caps.diagnostic_provider == true
+
+    it "has code_action_provider enabled":
+        val caps = lsp_client_config_capabilities()
+        expect caps.code_action_provider == true
+
+    it "has document_formatting_provider enabled":
+        val caps = lsp_client_config_capabilities()
+        expect caps.document_formatting_provider == true
+
+    it "has code_lens_provider enabled":
+        val caps = lsp_client_config_capabilities()
+        expect caps.code_lens_provider == true
+
+    it "has workspace_symbol_provider enabled":
+        val caps = lsp_client_config_capabilities()
+        expect caps.workspace_symbol_provider == true
+
+    it "has debug_adapter_support enabled":
+        val caps = lsp_client_config_capabilities()
+        expect caps.debug_adapter_support == true
+
+    it "has text_document_sync set to 1 (incremental)":
+        val caps = lsp_client_config_capabilities()
+        expect caps.text_document_sync == 1
+
+describe "LspClientConfig creation":
+    """
+    ## Client Config Defaults
+
+    Validates that lsp_client_config_create returns a valid initial config.
+    """
+
+    it "creates config with correct server path":
+        val path = lsp_client_config_server_path()
+        expect path == "bin/simple_lsp_server"
+
+    it "creates config with simple language selector":
+        val langs = lsp_client_config_language_selector()
+        expect langs.len() == 3
+
+    it "creates config with server_ready false":
+        val cfg = lsp_client_config_create()
+        expect cfg.server_ready == false
+
+# ===========================================================================
+# CodeActionsProvider (AC-2)
+# ===========================================================================
+
+describe "CodeActionsProvider lifecycle":
+    """
+    ## AC-2: Code Actions Provider
+
+    Validates create, add, clear, filter, and count operations.
+    """
+
+    it "starts with zero actions":
+        val provider = code_actions_provider_create()
+        expect code_actions_provider_count(provider) == 0
+
+    it "count is 2 for provider with two actions":
+        val provider = make_mixed_provider()
+        expect code_actions_provider_count(provider) == 2
+
+    it "clear resets count to zero":
+        val provider = code_actions_provider_create()
+        code_actions_provider_clear(provider)
+        expect code_actions_provider_count(provider) == 0
+
+    it "by_kind returns matching quickfix actions":
+        val provider = make_mixed_provider()
+        val quickfixes = code_actions_provider_by_kind(provider, code_action_kind_quickfix())
+        expect quickfixes.len() == 1
+
+    it "preferred returns only preferred actions":
+        val provider = make_mixed_provider()
+        val results = code_actions_provider_preferred(provider)
+        expect results.len() == 1
+
+describe "CodeAction kind constants":
+    """
+    ## Action Kind Values
+
+    Validates kind string constants used in LSP protocol.
+    """
+
+    it "quickfix kind is correct":
+        expect code_action_kind_quickfix() == "quickfix"
+
+    it "refactor kind is correct":
+        expect code_action_kind_refactor() == "refactor"
+
+    it "source kind is correct":
+        expect code_action_kind_source() == "source"
+
+    it "organize imports kind is correct":
+        expect code_action_kind_organize_imports() == "source.organizeImports"
+
+# ===========================================================================
+# DebugAdapterConfig (AC-3)
+# ===========================================================================
+
+describe "DebugAdapterConfig creation":
+    """
+    ## AC-3: Debug Adapter Configuration
+
+    Validates DAP launch/attach config creation and server defaults.
+    """
+
+    it "creates config with 3 launch configs":
+        val cfg = debug_adapter_config_create()
+        expect cfg.launch_configs.len() == 3
+
+    it "creates config with 1 attach config":
+        val cfg = debug_adapter_config_create()
+        expect cfg.attach_configs.len() == 1
+
+    it "server path is bin/simple":
+        expect dap_server_path() == "bin/simple"
+
+    it "server args contain dap and daemon":
+        val args = dap_server_args()
+        expect args.len() == 2
+
+    it "session dir is .build/dap_sessions":
+        expect dap_session_dir() == ".build/dap_sessions"
+
+    it "first launch config is run type":
+        val cfg = debug_adapter_config_create()
+        val first = cfg.launch_configs[0]
+        expect first.request_type == "launch"
+
+    it "debug launch config stops on entry":
+        val cfg = debug_adapter_config_create()
+        val debug_cfg = cfg.launch_configs[1]
+        expect debug_cfg.stop_on_entry == true
+
+    it "attach config request type is attach":
+        val cfg = debug_adapter_config_create()
+        val att = cfg.attach_configs[0]
+        expect att.request_type == "attach"
+
+# ===========================================================================
+# WorkspaceConfig (AC-5)
+# ===========================================================================
+
+describe "WorkspaceConfig defaults":
+    """
+    ## AC-5: Workspace Configuration
+
+    Validates default feature toggles and server path override logic.
+    """
+
+    it "all features enabled by default":
+        val cfg = workspace_config_create()
+        expect workspace_config_is_feature_enabled(cfg, "diagnostics") == true
+
+    it "code_actions enabled by default":
+        val cfg = workspace_config_create()
+        expect workspace_config_is_feature_enabled(cfg, "code_actions") == true
+
+    it "formatting enabled by default":
+        val cfg = workspace_config_create()
+        expect workspace_config_is_feature_enabled(cfg, "formatting") == true
+
+    it "semantic_tokens enabled by default":
+        val cfg = workspace_config_create()
+        expect workspace_config_is_feature_enabled(cfg, "semantic_tokens") == true
+
+    it "debug_adapter enabled by default":
+        val cfg = workspace_config_create()
+        expect workspace_config_is_feature_enabled(cfg, "debug_adapter") == true
+
+    it "code_lens enabled by default":
+        val cfg = workspace_config_create()
+        expect workspace_config_is_feature_enabled(cfg, "code_lens") == true
+
+    it "unknown feature returns false":
+        val cfg = workspace_config_create()
+        expect workspace_config_is_feature_enabled(cfg, "nonexistent") == false
+
+    it "server path returns default when no override":
+        val cfg = workspace_config_create()
+        expect workspace_config_server_path(cfg) == "bin/simple_lsp_server"
+
+    it "server path returns override when set":
+        val cfg = workspace_config_create()
+        val overridden = workspace_config_with_override(cfg, "/custom/lsp")
+        expect workspace_config_server_path(overridden) == "/custom/lsp"
+
+    it "max_file_size_kb defaults to 1024":
+        val cfg = workspace_config_create()
+        expect cfg.max_file_size_kb == 1024
+
+    it "log_level defaults to error":
+        val cfg = workspace_config_create()
+        expect cfg.log_level == "error"
+
+    it "watch patterns include spl files":
+        val cfg = workspace_config_create()
+        expect cfg.file_watch_patterns.len() == 4

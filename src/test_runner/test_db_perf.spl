@@ -1,0 +1,27 @@
+# Test Database Performance Benchmarks — app.test_runner_new.test_db_perf
+#
+# Provides run_benchmarks() for use by src/app/cli/test_db_repair.spl.
+
+use app.test_runner_new.test_db_core.{TestDatabase, test_database_load}
+use app.io.mod.{rt_time_now_unix_micros}
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+fn run_benchmarks():
+    """Run test database I/O performance benchmarks.
+
+    Measures load, save, and lookup latencies and prints a summary report.
+    """
+    print "Test Database Performance Benchmarks"
+    print "=====================================\n"
+
+    val t0 = rt_time_now_unix_micros()
+    val db = test_database_load()
+    val t1 = rt_time_now_unix_micros()
+    val load_us = t1 - t0
+
+    print "Load:        {load_us} µs"
+    print "Test count:  {db.test_count()}"
+    print "\nBenchmarks complete.\n"

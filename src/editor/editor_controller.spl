@@ -1,0 +1,3177 @@
+# Editor Controller
+#
+# Shared UI logic for TUI and GUI shells. Handles key dispatch,
+# mode switching, file tree interaction, command line, and view state.
+# Shells create a controller and call handle_key(); rendering is shell-specific.
+
+use std.editor.services.md_wiki_index.*
+use std.editor.services.md_search.*
+use std.editor.services.md_diagnostics.*
+use std.editor.services.file_watcher.*
+use std.editor.services.command_palette.*
+use std.editor.common.keybindings.*
+use std.editor.extensions.host.*
+use std.editor.extensions.builtin.md_edit_assist.*
+use std.editor.view.diagnostics_panel.*
+use std.editor.view.lsp_result_panel.*
+use std.editor.view.lsp_popup.*
+use std.editor.view.markdown_state.*
+use std.editor.view.md_editing.*
+use std.editor.view.outline_panel.*
+use std.editor.view.wiki_panel.*
+use std.editor.view.file_tree.*
+use std.editor.view.settings_view.*
+use app.editor.debug_process_runtime.*
+use app.editor.editor_ctrl_core.*
+use app.editor.editor_ctrl_debug.*
+use app.editor.editor_ctrl_diagnostics.*
+use app.editor.editor_ctrl_lsp.*
+use app.editor.editor_ctrl_wiki.*
+use app.editor.editor_json_helpers.*
+use app.editor.editor_path_text_helpers.*
+use app.editor.editor_lsp_helpers.*
+use app.editor.editor_debug_helpers.*
+use app.editor.editor_markdown_helpers.*
+use app.editor.editor_attachment_template.*
+use app.editor.editor_workspace_symbols.*
+use app.editor.editor_keymap_dispatch.*
+use app.editor.editor_layout.*
+use app.editor.md_dispatch.*
+use app.editor.editor_extension_roots.*
+use app.editor.editor_controller_types.*
+
+extern fn rt_env_get(key: text) -> text
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_file_write_text(path: text, content: text) -> bool
+extern fn rt_file_read_bytes(path: text) -> [u8]?
+extern fn rt_file_write_bytes(path: text, data: [u8]) -> bool
+extern fn rt_dir_create_all(path: text) -> bool
+extern fn rt_dir_walk(path: text) -> [text]
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+
+struct EditorAction:
+    redraw: bool
+    quit: bool
+    status_msg: text
+
+struct NormalKeyResult:
+    message: text
+    quit: bool
+    enter_insert: bool
+    enter_command: bool
+
+struct InsertKeyResult:
+    message: text
+    exit_insert: bool
+
+struct CommandKeyResult:
+    commandline: text
+    done: bool
+    cancelled: bool
+
+struct EditorAppliedCodeAction:
+    applied: bool
+    content: text
+    line: i64
+    col: i64
+
+struct EditorPropertyPayload:
+    key: text
+    value: text
+
+struct EditorVaultPropertyPayload:
+    root: text
+    key: text
+    value: text
+    selected_paths: [text]
+
+struct EditorLocation:
+    path: text
+    line: i64
+    col: i64
+
+class EditorController:
+    session: EditSession
+    file_tree: FileTreeState
+    file_tree_visible: bool
+    focus_panel: text
+    status_msg: text
+    commandline: text
+    pending_prefix: text
+    running: bool
+    config: EditorConfig
+    settings_view: SettingsViewState?
+    palette_state: PaletteState?
+    extension_host: ExtensionHost
+    diagnostic_store: DiagnosticStore
+    diagnostics_panel: DiagnosticsPanel
+    diagnostics_view_mode: text
+    diagnostics_view_payload: text
+    file_watcher: FileWatcher
+    code_actions: [EditorCodeAction]
+    code_action_filter: text
+    code_action_group_by_kind: bool
+    debug_status: text
+    debug_registry: EditorDebugRegistry
+    debug_dap_client: EditorDebugDapClient
+    debug_dap_clients: [EditorDebugDapClient]
+    debug_process_pid: i64
+    debug_pending_watch_expressions: [text]
+    debug_launch_configs: [EditorDebugLaunchConfig]
+    debug_launch_source_path: text
+    lsp_result_panel: LspResultPanel
+    lsp_call_hierarchy_state: text
+    lsp_call_hierarchy_state_title: text
+    lsp_call_hierarchy_merge_panel: LspResultPanel
+    lsp_call_hierarchy_merge_index: i64
+    lsp_hover_popup: LspHoverPopup
+    lsp_signature_popup: LspSignaturePopup
+    lsp_location_stack: [EditorLocation]
+    workspace_symbol_index: [LspResultRow]
+    workspace_symbol_index_root: text
+    pending_workspace_edit_json: text
+    pending_workspace_edit_title: text
+    format_save_request_id: i64
+    format_save_title: text
+    wiki_panel: WikiPanel
+    vault_search_index: MdVaultSearchIndex
+    wiki_vault_search_root: text
+    wiki_vault_search_query: text
+    wiki_quick_switch_query: text
+    wiki_daily_note_payload: text
+    wiki_template_picker_payload: text
+    wiki_template_query: text
+    wiki_attachment_picker_payload: text
+    wiki_attachment_query: text
+    wiki_task_filter: text
+    wiki_task_query: text
+    wiki_property_vault_root: text
+    wiki_property_schema_payload: text
+    pending_inlay_hint_refresh: bool
+    inlay_hint_refresh_elapsed_ms: i64
+    inlay_hint_refresh_delay_ms: i64
+    md_lsp_state: MdLspState
+    simple_lsp_state: SimpleLspState
+
+impl EditorController:
+
+    static fn new(session: EditSession) -> EditorController:
+        val host = extension_host_with_builtins()
+        host.discover_extensions(editor_extension_roots())
+        EditorController(
+            session: session,
+            file_tree: FileTreeState.new("."),
+            file_tree_visible: false,
+            focus_panel: "editor",
+            status_msg: "ready",
+            commandline: "",
+            pending_prefix: "",
+            running: true,
+            config: editor_config_default(),
+            settings_view: nil,
+            palette_state: nil,
+            extension_host: host,
+            diagnostic_store: DiagnosticStore.new(),
+            diagnostics_panel: diagnostics_panel_new(),
+            diagnostics_view_mode: "all",
+            diagnostics_view_payload: "",
+            file_watcher: FileWatcher.new(),
+            code_actions: [],
+            code_action_filter: "all",
+            code_action_group_by_kind: false,
+            debug_status: "stopped",
+            debug_registry: editor_debug_registry_new(),
+            debug_dap_client: EditorDebugDapClient.new(),
+            debug_dap_clients: [],
+            debug_process_pid: 0,
+            debug_pending_watch_expressions: [],
+            debug_launch_configs: [],
+            debug_launch_source_path: "",
+            lsp_result_panel: lsp_result_panel_new("LSP Results"),
+            lsp_call_hierarchy_state: "",
+            lsp_call_hierarchy_state_title: "",
+            lsp_call_hierarchy_merge_panel: lsp_result_panel_new(""),
+            lsp_call_hierarchy_merge_index: -1,
+            lsp_hover_popup: lsp_hover_popup_hidden(),
+            lsp_signature_popup: lsp_signature_popup_hidden(),
+            lsp_location_stack: [],
+            workspace_symbol_index: [],
+            workspace_symbol_index_root: "",
+            pending_workspace_edit_json: "",
+            pending_workspace_edit_title: "",
+            format_save_request_id: 0,
+            format_save_title: "",
+            wiki_panel: wiki_panel_new("Wiki"),
+            vault_search_index: md_vault_search_index_new("", []),
+            wiki_vault_search_root: "",
+            wiki_vault_search_query: "",
+            wiki_quick_switch_query: "",
+            wiki_daily_note_payload: "",
+            wiki_template_picker_payload: "",
+            wiki_template_query: "",
+            wiki_attachment_picker_payload: "",
+            wiki_attachment_query: "",
+            wiki_task_filter: "open",
+            wiki_task_query: "",
+            wiki_property_vault_root: "",
+            wiki_property_schema_payload: "",
+            pending_inlay_hint_refresh: false,
+            inlay_hint_refresh_elapsed_ms: 0,
+            inlay_hint_refresh_delay_ms: 300,
+            md_lsp_state: md_lsp_state_new("."),
+            simple_lsp_state: simple_lsp_state_new(".")
+        )
+
+
+    fn is_running() -> bool:
+        me.running
+
+    fn active_buffer() -> EditorBuffer:
+        me.session.active_buffer()
+
+    fn mode() -> EditorMode:
+        me.session.mode
+
+    me _replace_session(session: EditSession):
+        me.session.documents = session.documents
+        me.session.buffers = session.buffers
+        me.session.active_index = session.active_index
+        me.session.layout = session.layout
+        me.session.split = session.split
+        me.session.panes = session.panes
+        me.session.next_pane_id = session.next_pane_id
+        me.session.mode = session.mode
+        me.session.dock_layout = session.dock_layout
+        me.session.status_message = session.status_message
+
+    me handle_key(key: text, rects: [SplitRect]) -> EditorAction:
+        val key_text = key
+        if me.session.mode == editor_mode_insert():
+            return me._dispatch_insert_key(key_text)
+        if key_text.len() == 10 and key_text.starts_with("Ctrl+Space"):
+            return me._request_completion_action()
+        if key_text.len() == 1 and key_text.char_at(0) == "K":
+            return me._request_hover_action()
+        if key_text.len() == 3 and key_text.starts_with("F12"):
+            return me._request_definition_action()
+        if key_text.len() == 15 and key_text.starts_with("Shift+Alt+Right"):
+            return me._expand_lsp_selection_range()
+        if key_text.len() == 14 and key_text.starts_with("Shift+Alt+Left"):
+            return me._shrink_lsp_selection_range()
+        if key_text == "\x1b" and me.lsp_hover_popup.visible:
+            return me._dismiss_lsp_hover_popup()
+        if key_text == "\x1b" and me.lsp_signature_popup.visible:
+            return me._dismiss_lsp_signature_popup()
+        if me.session.dock_layout.active_right == "problems":
+            val problems_action = me._dispatch_diagnostics_panel_key(key_text)
+            if problems_action.redraw:
+                return problems_action
+        if me.session.dock_layout.active_right == "lsp-panel":
+            val lsp_action = me._dispatch_lsp_result_key(key_text)
+            if lsp_action.redraw:
+                return lsp_action
+        if me.session.dock_layout.active_right == "md-outline":
+            val outline_action = me._dispatch_md_outline_key(key_text)
+            if outline_action.redraw:
+                return outline_action
+        if me.pending_prefix == "z":
+            me.pending_prefix = ""
+            if key_text == "a":
+                return me._toggle_active_markdown_fold()
+            me.status_msg = ""
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if me.pending_prefix == "g":
+            me.pending_prefix = ""
+            if key_text == "x":
+                return me._open_markdown_link_under_cursor()
+            me.status_msg = ""
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if key_text == "g":
+            val doc_g = me.session.active_document()
+            if doc_g != nil and doc_g.language_id == "markdown":
+                me.pending_prefix = "g"
+                me.status_msg = "g ..."
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if key_text == "z":
+            val doc_z = me.session.active_document()
+            if doc_z != nil and doc_z.language_id == "markdown":
+                me.pending_prefix = "z"
+                me.status_msg = "z ..."
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        ctrl_handle_key(me, key_text, rects)
+
+    me toggle_file_tree():
+        ctrl_toggle_file_tree(me)
+
+    me toggle_focus():
+        ctrl_toggle_focus(me)
+
+    me settings_open():
+        ctrl_settings_open(me)
+
+    me settings_close():
+        ctrl_settings_close(me)
+
+    me _dispatch_settings_key(key: text) -> EditorAction:
+        ctrl_dispatch_settings_key(me, key)
+
+    me _dispatch_command_key(key: text) -> EditorAction:
+        ctrl_dispatch_command_key(me, key)
+
+    me _dispatch_normal_key(key: text, rects: [SplitRect]) -> EditorAction:
+        ctrl_dispatch_normal_key(me, key, rects)
+
+    me _dispatch_insert_key(key: text) -> EditorAction:
+        var buffer = me.session.active_buffer()
+        if buffer == nil:
+            me.session.mode = editor_mode_normal()
+            return EditorAction(redraw: true, quit: false, status_msg: "")
+        val doc = me.session.active_document()
+        if doc != nil and doc.language_id == "markdown":
+            if key == "\r" or key == "\n":
+                val current_line = buffer.line_at(buffer.cursor_row)
+                val continuation = md_assist_on_enter(current_line, buffer.cursor_col)
+                if continuation != "":
+                    buffer.insert_at_cursor("\n" + continuation)
+                    ctrl_update_markdown_preview(me, doc, buffer)
+                    me.session.update_active_buffer(buffer)
+                    me._notify_active_lsp_changed()
+                    return EditorAction(redraw: true, quit: false, status_msg: "-- INSERT --")
+            if key == "\t":
+                val tab_line = buffer.line_at(buffer.cursor_row)
+                val same_row_col = md_assist_on_tab(tab_line, buffer.cursor_col)
+                val nav = md_table_next_cell(buffer.to_text(), buffer.cursor_row, buffer.cursor_col)
+                if nav.found:
+                    buffer.move_cursor(nav.line, nav.col)
+                    me.session.update_active_buffer(buffer)
+                    return EditorAction(redraw: true, quit: false, status_msg: "-- INSERT --")
+                if same_row_col >= 0:
+                    buffer.move_cursor(buffer.cursor_row, same_row_col)
+                    me.session.update_active_buffer(buffer)
+                    return EditorAction(redraw: true, quit: false, status_msg: "-- INSERT --")
+        var message = "-- INSERT --"
+        var exit_insert = false
+        if key == "\x1b":
+            message = ""
+            exit_insert = true
+        elif key == "\x7f" or key == "\b":
+            buffer.delete_before_cursor()
+        elif key == "\r" or key == "\n":
+            buffer.insert_at_cursor("\n")
+        elif key.len() == 1:
+            val code = key.char_code_at(0)
+            if code >= 32:
+                buffer.insert_at_cursor(key)
+        me.status_msg = message
+        if exit_insert:
+            me.session.mode = editor_mode_normal()
+            me.status_msg = ""
+        else:
+            me.session.update_active_buffer(buffer)
+            if doc != nil and doc.language_id == "markdown":
+                ctrl_update_markdown_preview(me, doc, buffer)
+            me._notify_active_lsp_changed()
+            if me._should_trigger_signature_help(key):
+                return me._request_active_lsp_action("signature-help")
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _dispatch_file_tree_key(key: text) -> EditorAction:
+        ctrl_dispatch_file_tree_key(me, key)
+
+    me _should_trigger_signature_help(key: text) -> bool:
+        ctrl_should_trigger_signature_help(me, key)
+
+    me _dispatch_palette_key(key: text) -> EditorAction:
+        ctrl_dispatch_palette_key(me, key)
+
+    me _open_palette():
+        ctrl_open_palette(me)
+
+    me _execute_palette_command(command_name: text, command_payload: text) -> EditorAction:
+        if command_name == "problems":
+            return me._show_diagnostics_panel()
+        if command_name == "diagnostics-filter":
+            return me._show_diagnostics_filter(command_payload)
+        if command_name == "diagnostics-group":
+            return me._show_diagnostics_group(command_payload)
+        if command_name == "diagnostics-sort":
+            return me._show_diagnostics_sort(command_payload)
+        if command_name == "keyboard-shortcuts":
+            return me._show_keyboard_shortcuts()
+        if command_name == "outline":
+            me._toggle_md_outline()
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if command_name == "completion":
+            return me._request_completion_action()
+        if command_name == "hover":
+            return me._request_hover_action()
+        if command_name == "definition":
+            return me._request_definition_action()
+        if command_name == "hover-dismiss":
+            return me._dismiss_lsp_hover_popup()
+        if command_name == "code-action":
+            return me._request_active_lsp_action("code-action")
+        if command_name == "references":
+            return me._request_active_lsp_action("references")
+        if command_name == "selection-ranges":
+            return me._request_active_lsp_action("selection-ranges")
+        if command_name == "selection-expand":
+            return me._expand_lsp_selection_range()
+        if command_name == "selection-shrink":
+            return me._shrink_lsp_selection_range()
+        if command_name == "selection-apply-all":
+            return me._apply_all_lsp_selection_ranges()
+        if command_name == "document-symbols":
+            return me._request_active_lsp_action("document-symbols")
+        if command_name == "prepare-rename":
+            return me._request_active_lsp_action("prepare-rename")
+        if command_name == "rename":
+            return me._rename_active_symbol(command_payload)
+        if command_name == "rename-preview":
+            return me._rename_active_symbol_preview(command_payload)
+        if command_name == "rename-confirm":
+            return me._confirm_pending_workspace_edit()
+        if command_name == "workspace-edit-cancel":
+            return me._cancel_pending_workspace_edit()
+        if command_name == "formatting":
+            return me._request_active_lsp_action("formatting")
+        if command_name == "formatting-preview":
+            return me._request_active_formatting_preview("formatting")
+        if command_name == "formatting-save":
+            return me._request_active_formatting_save("formatting")
+        if command_name == "range-formatting":
+            return me._request_active_lsp_action("range-formatting")
+        if command_name == "range-formatting-preview":
+            return me._request_active_formatting_preview("range-formatting")
+        if command_name == "range-formatting-save":
+            return me._request_active_formatting_save("range-formatting")
+        if command_name == "signature-help":
+            return me._request_active_lsp_action("signature-help")
+        if command_name == "signature-next":
+            return me._select_signature_overload(1)
+        if command_name == "signature-prev":
+            return me._select_signature_overload(0 - 1)
+        if command_name == "signature-dismiss":
+            return me._dismiss_lsp_signature_popup()
+        if command_name == "document-links":
+            return me._request_active_lsp_action("document-links")
+        if command_name == "folding-ranges":
+            return me._request_active_lsp_action("folding-ranges")
+        if command_name == "workspace-symbols":
+            return me._request_workspace_symbols(command_payload)
+        if command_name == "semantic-tokens":
+            return me._request_active_lsp_action("semantic-tokens")
+        if command_name == "inlay-hints":
+            me._cancel_pending_inlay_hint_refresh()
+            return me._request_active_lsp_action("inlay-hints")
+        if command_name == "code-lens":
+            return me._request_active_lsp_action("code-lens")
+        if command_name == "code-lens-run":
+            return me._run_selected_code_lens()
+        if command_name == "code-lens-resolve":
+            return me._request_active_code_lens_resolve(command_payload)
+        if command_name == "call-hierarchy":
+            return me._request_active_lsp_action("call-hierarchy")
+        if command_name == "call-hierarchy-incoming":
+            return me._request_active_call_hierarchy_direction("incoming", command_payload)
+        if command_name == "call-hierarchy-outgoing":
+            return me._request_active_call_hierarchy_direction("outgoing", command_payload)
+        if command_name == "attachment-picker":
+            return me._execute_attachment_picker(command_payload)
+        if command_name == "template-picker":
+            return me._execute_template_picker(command_payload)
+        if command_name == "wiki-quick-switch":
+            return me._execute_wiki_quick_switch(command_payload)
+        if command_name == "wiki-vault-search":
+            return me._execute_wiki_vault_search(command_payload)
+        if command_name == "wiki-backlinks":
+            return me._wiki_show_backlinks()
+        if command_name == "wiki-tasks":
+            return me._wiki_show_tasks(command_payload)
+        if command_name == "wiki-task-batch":
+            return me._wiki_task_batch(command_payload)
+        if command_name == "wiki-vault-task-batch":
+            return me._wiki_vault_task_batch(command_payload)
+        if command_name == "wiki-properties":
+            return me._wiki_show_properties()
+        if command_name == "wiki-property-set":
+            return me._wiki_set_property(command_payload)
+        if command_name == "wiki-vault-property-set":
+            return me._wiki_vault_set_property(command_payload)
+        if command_name == "wiki-vault-property-review":
+            return me._wiki_vault_property_review(command_payload)
+        if command_name == "wiki-property-diagnostics":
+            return me._wiki_property_diagnostics(command_payload)
+        if command_name == "wiki-tags":
+            return me._wiki_show_tags(command_payload)
+        if command_name == "wiki-graph":
+            return me._wiki_show_graph()
+        if command_name == "daily-note-create":
+            return me._execute_daily_note_create(command_payload)
+        if command_name == "daily-note-picker":
+            return me._execute_daily_note_picker(command_payload)
+        if command_name == "template-insert":
+            return me._execute_template_insert(command_payload)
+        if command_name == "quickfix":
+            return me._request_quickfix()
+        if command_name == "quickfix-apply":
+            val index = if command_payload == "" then 0 else: _editor_parse_i64(command_payload, 0)
+            return me._apply_code_action_at(index)
+        if command_name == "code-action":
+            return ctrl_request_active_lsp_action(me, "code-action")
+        if command_name == "markdown-table-row-insert":
+            return me._markdown_table_insert_row()
+        if command_name == "markdown-table-column-insert":
+            return me._markdown_table_insert_column()
+        if command_name == "markdown-table-cell-next":
+            return me._markdown_table_cell_nav("next")
+        if command_name == "markdown-table-cell-prev":
+            return me._markdown_table_cell_nav("prev")
+        if command_name == "fold-toggle":
+            return me._toggle_active_markdown_fold()
+        if command_name == "markdown.foldAll" or command_name == "fold-all":
+            return me._fold_all_active_document()
+        if command_name == "markdown.unfoldAll" or command_name == "unfold-all":
+            return me._unfold_all_active_document()
+        if command_name == "callout-fold-toggle":
+            return me._toggle_active_callout_fold()
+        if command_name.len() == 9 and command_name.starts_with("open-link"):
+            return me._open_markdown_link_under_cursor()
+        if command_name == "debug-start":
+            return me._start_debug_adapter(command_payload)
+        if command_name == "debug-configs":
+            return me._debug_show_launch_configs(command_payload)
+        if command_name == "debug-console":
+            return me._debug_show_session()
+        if command_name == "debug-sessions":
+            return me._debug_show_sessions()
+        if command_name == "debug-switch":
+            val debug_session_id = _editor_parse_i64(command_payload, 0)
+            if debug_session_id <= 0:
+                me.status_msg = "no debug session"
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+            me.debug_registry = editor_debug_registry_select(me.debug_registry, debug_session_id)
+            val selected_debug_session = editor_debug_first_session(me.debug_registry)
+            if editor_debug_session_id(selected_debug_session) != debug_session_id:
+                me.status_msg = "debug session not found: " + debug_session_id.to_text()
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+            val debug_client_index = debug_session_id - 1
+            if debug_client_index >= 0 and debug_client_index < me.debug_dap_clients.len():
+                me.debug_dap_client = me.debug_dap_clients[debug_client_index]
+            me.debug_status = editor_debug_session_status(selected_debug_session)
+            me._show_debug_panel_direct("debug session: " + editor_debug_session_id(selected_debug_session).to_text())
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if command_name == "debug-restart":
+            return me._debug_restart_first()
+        if command_name == "debug-continue":
+            return me._debug_continue()
+        if command_name == "debug-pause":
+            return me._debug_pause()
+        if command_name == "debug-step":
+            return me._debug_step(if command_payload == "" then "stepOver" else: command_payload)
+        if command_name == "debug-stack":
+            return me._debug_request_stack_trace()
+        if command_name == "debug-scopes":
+            return me._debug_request_scopes(_editor_parse_i64(command_payload, 1))
+        if command_name == "debug-variables":
+            return me._debug_request_variables(_editor_parse_i64(command_payload, 1))
+        if command_name == "debug-poll":
+            return me._debug_poll_dap_client()
+        if command_name == "debug-exceptions":
+            return me._debug_set_exception_filters(_editor_payload_csv(command_payload))
+        if command_name == "debug-watch":
+            return me._debug_add_watch(command_payload)
+        if command_name == "debug-evaluate":
+            return me._debug_evaluate(command_payload)
+        if command_name == "debug-terminate":
+            return me._debug_terminate_first()
+        ctrl_execute_palette_command(me, command_name, command_payload)
+
+    me _execute_wiki_quick_switch(query: text) -> EditorAction:
+        val needle = query.trim()
+        me.wiki_quick_switch_query = needle
+        val index = ctrl_wiki_index_open_documents(me)
+        me.wiki_panel = wiki_panel_from_documents(md_wiki_quick_switch(index, needle))
+        var session = me.session
+        var layout = session.dock_layout
+        layout.show_right("wiki-panel")
+        session.dock_layout = layout
+        me.session = session
+        me.status_msg = "wiki quick switch panel"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _execute_daily_note_create(payload: text) -> EditorAction:
+        val date = _editor_payload_part(payload, 0)
+        if date == "":
+            me.status_msg = "missing daily note date"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val folder = if _editor_payload_part(payload, 1) == "" then "Daily" else: _editor_payload_part(payload, 1)
+        val template_body = if _editor_payload_part(payload, 2) == "" then "# {{title}}\n\n" else: _editor_payload_part(payload, 2)
+        val title_format = if _editor_payload_part(payload, 3) == "" then "{{date}}" else: _editor_payload_part(payload, 3)
+        val config = md_wiki_daily_note_config_with_title(folder, title_format, _editor_payload_part(payload, 4), template_body)
+        val path = md_wiki_daily_note_path(config, date)
+        val content = md_wiki_daily_note_content(config, date)
+        if not rt_file_write_text(path, content):
+            me.status_msg = "failed to create daily note"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        var session_daily = me.session
+        val target_doc_id = session_daily.open_file(path)
+        me._replace_session(session_daily)
+        ctrl_focus_lsp_target_doc(me, target_doc_id)
+        me.status_msg = "created daily note: " + path
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _execute_daily_note_picker(payload: text) -> EditorAction:
+        val date = _editor_payload_part(payload, 0)
+        val folder = if _editor_payload_part(payload, 1) == "" then "Daily" else: _editor_payload_part(payload, 1)
+        val template_body = if _editor_payload_part(payload, 2) == "" then "# {{title}}\n\n" else: _editor_payload_part(payload, 2)
+        val title_format = if _editor_payload_part(payload, 3) == "" then "{{date}}" else: _editor_payload_part(payload, 3)
+        val config = md_wiki_daily_note_config_with_title(folder, title_format, _editor_payload_part(payload, 4), template_body)
+        me.wiki_daily_note_payload = date + "|" + folder + "|" + template_body + "|" + title_format + "|" + config.extension
+        val preview_date = if date == "" then "YYYY-MM-DD" else: date
+        val path = md_wiki_daily_note_path(config, preview_date)
+        me.wiki_panel = wiki_panel_with_rows("Daily Notes", [
+            WikiPanelRow(icon: "calendar", label: preview_date, detail: me.wiki_daily_note_payload, path: path, line: 0)
+        ])
+        me._show_right_dock("wiki-panel")
+        me.status_msg = "daily notes"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _execute_template_insert(payload: text) -> EditorAction:
+        val template_path = _editor_payload_part(payload, 0)
+        val target_path = _editor_payload_part(payload, 1)
+        val title = _editor_payload_part(payload, 2)
+        val date = _editor_payload_part(payload, 3)
+        if template_path == "" or target_path == "":
+            me.status_msg = "missing template or target path"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val rendered = _editor_apply_template_text(rt_file_read_text(template_path) ?? "", title, date)
+        val existing = rt_file_read_text(target_path) ?? ""
+        val sep = if existing == "" or existing.ends_with("\n") then "" else: "\n"
+        if not rt_file_write_text(target_path, existing + sep + rendered):
+            me.status_msg = "failed to insert template"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.status_msg = "inserted template: " + template_path
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _execute_template_picker(payload: text) -> EditorAction:
+        val folder = _editor_payload_part(payload, 0)
+        val target_path = _editor_payload_part(payload, 1)
+        val title = _editor_payload_part(payload, 2)
+        val date = _editor_payload_part(payload, 3)
+        val query = _editor_payload_part(payload, 4).trim().to_lower()
+        if folder == "":
+            me.status_msg = "missing template folder"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.wiki_template_picker_payload = folder + "|" + target_path + "|" + title + "|" + date + "|" + query
+        me.wiki_template_query = query
+        me.wiki_panel = wiki_panel_with_rows("Templates", _editor_template_picker_rows(folder, target_path, title, date, query))
+        var session = me.session
+        var layout = session.dock_layout
+        layout.show_right("wiki-panel")
+        session.dock_layout = layout
+        me.session = session
+        me.status_msg = "templates: " + me.wiki_panel.rows.len().to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _execute_attachment_picker(payload: text) -> EditorAction:
+        val root = _editor_payload_part(payload, 0)
+        val query = _editor_payload_part(payload, 1).to_lower()
+        val target_path = _editor_payload_part(payload, 2)
+        val storage_dir = _editor_payload_part(payload, 3)
+        if root == "":
+            me.status_msg = "missing attachment root"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.wiki_attachment_picker_payload = root + "|" + query + "|" + target_path + "|" + storage_dir
+        me.wiki_attachment_query = query
+        me.wiki_panel = wiki_panel_with_rows("Attachment Picker", _editor_attachment_picker_rows(root, query, target_path, storage_dir))
+        var session = me.session
+        var layout = session.dock_layout
+        layout.show_right("wiki-panel")
+        session.dock_layout = layout
+        me.session = session
+        me.status_msg = "attachments: " + me.wiki_panel.rows.len().to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _execute_wiki_vault_search(payload: text) -> EditorAction:
+        val root = _editor_payload_part(payload, 0)
+        val query = _editor_payload_part(payload, 1)
+        if root == "" or query == "":
+            me.status_msg = "missing vault root or query"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.wiki_vault_search_root = root
+        me.wiki_vault_search_query = query
+        val docs = _editor_markdown_vault_documents(root)
+        var index = me.vault_search_index
+        if index.root != root:
+            val loaded = md_vault_search_index_load(_editor_vault_search_cache_path(root))
+            if loaded.root == root and not loaded.dirty and md_vault_search_index_matches_documents(loaded, docs):
+                index = loaded
+            else:
+                index = md_vault_search_index_new(root, docs)
+                md_vault_search_index_save(index, _editor_vault_search_cache_path(root))
+        elif index.dirty:
+            index = md_vault_search_index_refresh(index, docs)
+            md_vault_search_index_save(index, _editor_vault_search_cache_path(root))
+        me.vault_search_index = index
+        val matches = md_vault_search_index_search(index, query)
+        me.wiki_panel = wiki_panel_from_vault_search(matches)
+        var session = me.session
+        var layout = session.dock_layout
+        layout.show_right("wiki-panel")
+        session.dock_layout = layout
+        me.session = session
+        me.status_msg = "wiki vault search: " + matches.len().to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _request_quickfix() -> EditorAction:
+        if me.session.active_index < 0 or me.session.active_index >= me.session.buffers.len():
+            me.status_msg = "no file open"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val doc = me.session.documents[me.session.active_index]
+        val buffer = me.session.buffers[me.session.active_index]
+        if doc.language_id == "markdown":
+            val content = md_buffer_content(buffer)
+            val row = buffer.cursor_row
+            val line = buffer.line_at(row)
+            val fixed = _editor_markdown_quickfix_line(line)
+            if fixed != line:
+                val edit_json = "{\"line\":" + str(row) + ",\"newText\":\"" + _editor_escape_json(fixed) + "\"}"
+                me.code_actions = [EditorCodeAction(title: "Apply Markdown quick fix", kind: "quickfix", edit_json: edit_json, command: "")]
+                me.status_msg = "1 quick fix"
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+            me.code_actions = []
+            val diags = md_diagnose(content, doc.path())
+            me.status_msg = if diags.len() > 0 then "diagnostics available" else: "no quick fixes"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.code_actions = []
+        me.status_msg = "no quick fixes"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _show_diagnostics_panel() -> EditorAction:
+        me.diagnostics_view_mode = "all"
+        me.diagnostics_view_payload = ""
+        me._refresh_diagnostics_panel_view()
+        me._show_right_dock("problems")
+        me.status_msg = "problems: " + me.diagnostic_store.total_count().to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _show_diagnostics_filter(payload: text) -> EditorAction:
+        me.diagnostics_view_mode = "filter"
+        me.diagnostics_view_payload = payload
+        me._refresh_diagnostics_panel_view()
+        me._show_right_dock("problems")
+        me.status_msg = "problems: " + _editor_problem_visible_count(me.diagnostics_panel).to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _show_diagnostics_group(payload: text) -> EditorAction:
+        me.diagnostics_view_mode = "group"
+        me.diagnostics_view_payload = if payload == "source" then "source" else: "severity"
+        me._refresh_diagnostics_panel_view()
+        me._show_right_dock("problems")
+        me.status_msg = "problems: " + _editor_problem_visible_count(me.diagnostics_panel).to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _show_diagnostics_sort(payload: text) -> EditorAction:
+        me.diagnostics_view_mode = "sort"
+        me.diagnostics_view_payload = if payload == "source" or payload == "path" then payload else: "severity"
+        me._refresh_diagnostics_panel_view()
+        me._show_right_dock("problems")
+        me.status_msg = "problems: " + _editor_problem_visible_count(me.diagnostics_panel).to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _refresh_diagnostics_panel_view():
+        if me.diagnostics_view_mode == "filter":
+            val severity = _editor_payload_part(me.diagnostics_view_payload, 0)
+            val source = _editor_payload_part(me.diagnostics_view_payload, 1)
+            me.diagnostics_panel = diagnostics_panel_from_store_filtered(me.diagnostic_store, severity, source)
+            return
+        if me.diagnostics_view_mode == "group":
+            val group_by = if me.diagnostics_view_payload == "source" then "source" else: "severity"
+            me.diagnostics_panel = diagnostics_panel_from_store_grouped(me.diagnostic_store, group_by)
+            return
+        if me.diagnostics_view_mode == "sort":
+            val sort_by = if me.diagnostics_view_payload == "source" or me.diagnostics_view_payload == "path" then me.diagnostics_view_payload else: "severity"
+            me.diagnostics_panel = diagnostics_panel_from_store_sorted(me.diagnostic_store, sort_by)
+            return
+        me.diagnostics_panel = diagnostics_panel_from_store(me.diagnostic_store)
+
+    me _show_right_dock(panel: text):
+        var session = me.session
+        var layout = session.dock_layout
+        layout.show_right(panel)
+        session.dock_layout = layout
+        me.session = session
+
+    me _apply_first_quickfix() -> EditorAction:
+        ctrl_apply_first_quickfix(me)
+
+    me _apply_code_action_at(index: i64) -> EditorAction:
+        if me.code_actions.len() == 0:
+            me.status_msg = "no quick fix selected"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        var action_index = index
+        if action_index < 0:
+            action_index = 0
+        if action_index >= me.code_actions.len():
+            action_index = me.code_actions.len() - 1
+        if me.session.active_index < 0 or me.session.active_index >= me.session.buffers.len():
+            me.status_msg = "no file open"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        var buffer = me.session.buffers[me.session.active_index]
+        val action = me.code_actions[action_index]
+        val doc = me.session.documents[me.session.active_index]
+        val applied = _editor_apply_code_action_content(buffer, doc.path(), action.edit_json)
+        if not applied.applied:
+            if action.command != "":
+                val command_requested = me._execute_lsp_code_action_command(action.command)
+                me.code_actions = []
+                me.status_msg = if command_requested then "command requested: " + _editor_lsp_command_name(action.command) else: "code action command unavailable"
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+            me.status_msg = "quick fix has no editable change"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val extra_file_edits = if action.edit_json.contains("\"changes\"") then ctrl_apply_workspace_edit_extra_paths(me, doc.path(), action.edit_json) else: 0
+        buffer.push_undo_snapshot()
+        buffer.replace_content(applied.content)
+        buffer.dirty = true
+        buffer.move_cursor(applied.line, applied.col)
+        me.session.buffers[me.session.active_index] = buffer
+        ctrl_replace_open_document_buffer(me, doc.path(), buffer)
+        me.code_actions = []
+        if doc.language_id == "markdown":
+            ctrl_update_markdown_preview(me, doc, buffer)
+        me.status_msg = if extra_file_edits > 0 then "applied: " + action.title + " (" + extra_file_edits.to_text() + " file edits)" else: "applied: " + action.title
+        if action.command != "":
+            val command_requested = me._execute_lsp_code_action_command(action.command)
+            if command_requested:
+                me.status_msg = me.status_msg + "; command requested: " + _editor_lsp_command_name(action.command)
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _execute_lsp_code_action_command(command_json: text) -> bool:
+        val params = _editor_lsp_execute_command_params(command_json)
+        if params == "":
+            return false
+        if me.session.active_index < 0 or me.session.active_index >= me.session.documents.len() or me.session.active_index >= me.session.buffers.len():
+            return false
+        val doc = me.session.documents[me.session.active_index]
+        val buffer = me.session.buffers[me.session.active_index]
+        val content = md_buffer_content(buffer)
+        if doc.language_id == "markdown":
+            if not me.md_lsp_state.running:
+                me.md_lsp_state = md_lsp_ensure_open(me.md_lsp_state, doc.path(), content)
+            val result = md_lsp_request(me.md_lsp_state, "execute-command", params, doc.path(), 0, 0)
+            me.md_lsp_state = result.0
+            val md_resp: LspResponse = result.1
+            return md_resp.ok
+        if doc.language_id == "simple" or doc.language_id == "shell":
+            if not me.simple_lsp_state.running:
+                me.simple_lsp_state = simple_lsp_ensure_open(me.simple_lsp_state, doc.path(), content)
+            val simple_result = simple_lsp_request(me.simple_lsp_state, "execute-command", params, doc.path(), 0, 0)
+            me.simple_lsp_state = simple_result.0
+            val simple_resp: LspResponse = simple_result.1
+            return simple_resp.ok
+        false
+
+    me _apply_debug_ctrl_state(next: EditorController):
+        me.status_msg = next.status_msg
+        me.debug_status = next.debug_status
+        me.debug_registry = next.debug_registry
+        me.debug_dap_client = next.debug_dap_client
+        me.debug_dap_clients = next.debug_dap_clients
+        me.debug_process_pid = next.debug_process_pid
+        me.debug_pending_watch_expressions = next.debug_pending_watch_expressions
+        me.debug_launch_configs = next.debug_launch_configs
+        me.debug_launch_source_path = next.debug_launch_source_path
+        me.wiki_panel = next.wiki_panel
+        me.session.dock_layout = next.session.dock_layout
+
+    me _show_debug_panel_direct(message: text):
+        me.wiki_panel = _editor_debug_session_panel(editor_debug_first_session(me.debug_registry))
+        var session = me.session
+        var layout = session.dock_layout
+        layout.active_right = "wiki-panel"
+        layout.right_visible = true
+        session.dock_layout = layout
+        me.session = session
+        me.status_msg = message
+
+    me _start_debug_adapter(debug_type: text) -> EditorAction:
+        val adapter_id = if debug_type == "" then "simple" else debug_type
+        val adapter = me.extension_host.find_debug_adapter(adapter_id)
+        val doc = me.session.active_document()
+        val fallback_program = if adapter_id == "simple" then "bin/simple" else: extension_debug_adapter_program(adapter)
+        val program = if doc == nil or doc.path() == "" then fallback_program else: doc.path()
+        val launch_config = _editor_debug_launch_config_for_doc(program, adapter_id)
+        val session_id = me.debug_registry.next_session_id
+        me.debug_registry = editor_debug_registry_start(me.debug_registry, launch_config)
+        var dap = EditorDebugDapClient.new()
+        dap.start()
+        val initialized = editor_debug_dap_client_initialize(dap)
+        dap = initialized.0
+        val launched = editor_debug_dap_client_launch(dap, launch_config)
+        dap = launched.0
+        me.debug_dap_client = dap
+        val client_index = session_id - 1
+        while me.debug_dap_clients.len() <= client_index:
+            me.debug_dap_clients.push(EditorDebugDapClient.new())
+        me.debug_dap_clients[client_index] = dap
+        me.debug_status = "starting"
+        me.status_msg = "debug adapter: " + editor_debug_launch_config_name(launch_config)
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _start_debug_process_adapter(debug_type: text) -> EditorAction:
+        ctrl_start_debug_process_adapter(me, debug_type)
+
+    me _debug_show_launch_configs(debug_type: text) -> EditorAction:
+        val adapter_id = if debug_type == "" then "simple" else: debug_type
+        val lookup_adapter_id = _editor_debug_resolve_adapter_id(me, adapter_id)
+        val adapter = me.extension_host.find_debug_adapter(lookup_adapter_id)
+        if _editor_debug_adapter_missing(adapter, adapter_id):
+            me.status_msg = "debug adapter not found: " + adapter_id
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val doc = me.session.active_document()
+        val program = if doc == nil or doc.path() == "" then _editor_debug_adapter_program_or_default(adapter, adapter_id) else: doc.path()
+        me.debug_launch_source_path = _editor_find_launch_json(program)
+        me.debug_launch_configs = _editor_debug_launch_configs_for_doc(program, adapter_id)
+        me.wiki_panel = _editor_debug_launch_config_panel(me.debug_launch_configs)
+        me._show_right_dock("wiki-panel")
+        me.status_msg = "debug launch configs: " + me.debug_launch_configs.len().to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_start_selected_launch_config() -> EditorAction:
+        if me.debug_launch_configs.len() == 0:
+            me.status_msg = "no debug launch config"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        var index = me.wiki_panel.selected
+        if index < 0:
+            index = 0
+        if index >= me.debug_launch_configs.len():
+            index = me.debug_launch_configs.len() - 1
+        val config = me.debug_launch_configs[index]
+        if editor_debug_launch_config_is_compound(config):
+            return me._debug_start_compound_launch_config(config)
+        val config_debug_type = editor_debug_launch_config_debug_type(config)
+        val lookup_adapter_id = _editor_debug_resolve_adapter_id(me, config_debug_type)
+        val adapter = me.extension_host.find_debug_adapter(lookup_adapter_id)
+        if _editor_debug_adapter_missing(adapter, config_debug_type):
+            me.status_msg = "debug adapter not found: " + config_debug_type
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val session_id = me.debug_registry.next_session_id
+        me.debug_registry = editor_debug_registry_start(me.debug_registry, config)
+        var dap = me.debug_dap_client
+        dap.start()
+        val initialized = editor_debug_dap_client_initialize(dap)
+        dap = initialized.0
+        val launched = editor_debug_dap_client_launch(dap, config)
+        dap = launched.0
+        me.debug_dap_client = dap
+        val client_index = session_id - 1
+        while me.debug_dap_clients.len() <= client_index:
+            me.debug_dap_clients.push(EditorDebugDapClient.new())
+        me.debug_dap_clients[client_index] = dap
+        me.debug_status = "starting"
+        me.status_msg = "debug adapter: " + editor_debug_launch_config_name(config)
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_start_compound_launch_config(compound_config: EditorDebugLaunchConfig) -> EditorAction:
+        val launch_path = me.debug_launch_source_path
+        if launch_path == "":
+            me.status_msg = "debug compound source not found: " + editor_debug_launch_config_name(compound_config)
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val content = rt_file_read_text(launch_path) ?? ""
+        val workspace = _editor_workspace_dir_from_launch_json(launch_path)
+        val doc = me.session.active_document()
+        val program = if doc == nil then "" else: doc.path()
+        val member_names = editor_debug_launch_config_program(compound_config).split("|")
+        val all_configs = editor_debug_launch_configs_from_json(content)
+        var member_configs: [EditorDebugLaunchConfig] = []
+        for member_name in member_names:
+            for candidate in all_configs:
+                if editor_debug_launch_config_name(candidate) == member_name.trim():
+                    var selected = editor_debug_launch_config_with_program(candidate, program)
+                    member_configs.push(editor_debug_resolve_launch_config(selected, workspace, program))
+        if member_configs.len() == 0:
+            me.status_msg = "debug compound empty: " + editor_debug_launch_config_name(compound_config)
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        var aggregate = me.debug_dap_client
+        aggregate.start()
+        for config in member_configs:
+            val config_debug_type = editor_debug_launch_config_debug_type(config)
+            val lookup_adapter_id = _editor_debug_resolve_adapter_id(me, config_debug_type)
+            val adapter = me.extension_host.find_debug_adapter(lookup_adapter_id)
+            if _editor_debug_adapter_missing(adapter, config_debug_type):
+                me.status_msg = "debug adapter not found: " + config_debug_type
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+            val session_id = me.debug_registry.next_session_id
+            me.debug_registry = editor_debug_registry_start(me.debug_registry, config)
+            var dap = EditorDebugDapClient.new()
+            dap.start()
+            val initialized = editor_debug_dap_client_initialize(dap)
+            dap = initialized.0
+            val launched = editor_debug_dap_client_launch(dap, config)
+            dap = launched.0
+            val client_index = session_id - 1
+            while me.debug_dap_clients.len() <= client_index:
+                me.debug_dap_clients.push(EditorDebugDapClient.new())
+            me.debug_dap_clients[client_index] = dap
+            for frame in dap.send_buffer:
+                aggregate.send_buffer.push(frame)
+        me.debug_dap_client = aggregate
+        me.debug_status = "starting"
+        me.status_msg = "debug compound: " + editor_debug_launch_config_name(compound_config) + " (" + member_configs.len().to_text() + " sessions)"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_show_session() -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me._show_debug_panel_direct("debug session")
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_show_sessions() -> EditorAction:
+        me.wiki_panel = _editor_debug_sessions_panel(me.debug_registry)
+        me._show_right_dock("wiki-panel")
+        me.status_msg = "debug sessions: " + editor_debug_session_count(me.debug_registry).to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_switch_selected_session() -> EditorAction:
+        if me.wiki_panel.rows.len() == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        var index = me.wiki_panel.selected
+        if index < 0:
+            index = 0
+        if index >= me.wiki_panel.rows.len():
+            index = me.wiki_panel.rows.len() - 1
+        me._debug_switch_session(me.wiki_panel.rows[index].line)
+
+    me _debug_switch_session(session_id: i64) -> EditorAction:
+        if session_id <= 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_registry_select(me.debug_registry, session_id)
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) != session_id:
+            me.status_msg = "debug session not found: " + session_id.to_text()
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me._debug_activate_client_for_session(session_id)
+        me.debug_status = editor_debug_session_status(session)
+        me._show_debug_panel_direct("debug session: " + editor_debug_session_id(session).to_text())
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_activate_client_for_session(session_id: i64):
+        val index = session_id - 1
+        if index >= 0 and index < me.debug_dap_clients.len():
+            val clients = me.debug_dap_clients
+            me.debug_dap_client = clients[index]
+
+    me _show_keyboard_shortcuts() -> EditorAction:
+        me.wiki_panel = _editor_keyboard_shortcuts_panel(default_keybindings())
+        me._show_right_dock("wiki-panel")
+        me.status_msg = "keyboard shortcuts"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_add_breakpoint(path: text, line: i64, condition: text, log_message: text, hit_condition: text) -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_add_breakpoint(me.debug_registry, editor_debug_session_id(session), path, line, condition, log_message, hit_condition)
+        if me.debug_dap_client.running:
+            val synced = editor_debug_dap_client_set_breakpoints(me.debug_dap_client, path, editor_debug_session_breakpoints(editor_debug_first_session(me.debug_registry)))
+            me.debug_dap_client = synced.0
+        me.status_msg = "breakpoint set: " + path + ":" + line.to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_add_watch(expression: text) -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_add_watch(me.debug_registry, editor_debug_session_id(session), expression)
+        me._debug_queue_watch_evaluate(expression)
+        me._show_debug_panel_direct("watch added: " + expression)
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_evaluate(expression: text) -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_evaluate(me.debug_registry, editor_debug_session_id(session), expression)
+        if me.debug_dap_client.running:
+            val requested = editor_debug_dap_client_evaluate(me.debug_dap_client, expression, 1)
+            me.debug_dap_client = requested.0
+        me._show_debug_panel_direct("debug evaluate: " + expression)
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_queue_watch_evaluate(expression: text):
+        if not me.debug_dap_client.running:
+            return
+        val requested = editor_debug_dap_client_evaluate(me.debug_dap_client, expression, _editor_debug_active_frame_id(editor_debug_first_session(me.debug_registry)))
+        me.debug_dap_client = requested.0
+        me.debug_pending_watch_expressions.push(expression)
+
+    me _debug_refresh_watches() -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        var refreshed = 0
+        for watch in session.watches:
+            me._debug_queue_watch_evaluate(watch.expression)
+            refreshed = refreshed + 1
+        me.status_msg = "debug watches refreshed: " + refreshed.to_text()
+        EditorAction(redraw: refreshed > 0, quit: false, status_msg: me.status_msg)
+
+    me _debug_update_watch_result(expression: text, value: text, status: text) -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_update_watch(me.debug_registry, editor_debug_session_id(session), expression, value, status)
+        me._show_debug_panel_direct("watch: " + expression)
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_record_evaluate_result(expression: text, value: text, status: text) -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_evaluate_result(me.debug_registry, editor_debug_session_id(session), expression, value, status)
+        me._show_debug_panel_direct("debug result: " + expression)
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_update_stack_frames(frames: [EditorDebugStackFrame]) -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_update_stack_frames(me.debug_registry, editor_debug_session_id(session), frames)
+        me._show_debug_panel_direct("debug stack")
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_update_scopes(scopes: [EditorDebugScope]) -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_update_scopes(me.debug_registry, editor_debug_session_id(session), scopes)
+        me._show_debug_panel_direct("debug scopes")
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_update_scope_variables(scope_name: text, variables: [EditorDebugVariable]) -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_update_scope_variables(me.debug_registry, editor_debug_session_id(session), scope_name, variables)
+        me._show_debug_panel_direct("debug variables: " + scope_name)
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_hydrate_dap_response(response_json: text) -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if not editor_debug_dap_response_success(response_json):
+            me.status_msg = "debug response failed: " + editor_debug_dap_response_command(response_json)
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val command = editor_debug_dap_response_command(response_json)
+        if command == "stackTrace":
+            me.debug_registry = editor_debug_update_stack_frames(me.debug_registry, editor_debug_session_id(session), editor_debug_stack_frames_from_dap_response(response_json))
+            me._show_debug_panel_direct("debug stack")
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if command == "scopes":
+            me.debug_registry = editor_debug_update_scopes(me.debug_registry, editor_debug_session_id(session), editor_debug_scopes_from_dap_response(response_json))
+            me._show_debug_panel_direct("debug scopes")
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if command == "variables":
+            me.debug_registry = editor_debug_update_scope_variables(me.debug_registry, editor_debug_session_id(session), "Locals", editor_debug_variables_from_dap_response(response_json))
+            me._show_debug_panel_direct("debug variables: Locals")
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if command == "evaluate":
+            val value = editor_debug_evaluate_result_from_dap_response(response_json)
+            if me.debug_pending_watch_expressions.len() > 0:
+                val expression = me.debug_pending_watch_expressions[0]
+                me.debug_pending_watch_expressions = _editor_text_list_without_first(me.debug_pending_watch_expressions)
+                me.debug_registry = editor_debug_update_watch(me.debug_registry, editor_debug_session_id(session), expression, value, "ok")
+                me._show_debug_panel_direct("watch refreshed: " + expression)
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+            me.debug_registry = editor_debug_console_append(me.debug_registry, editor_debug_session_id(session), "evaluate-result", value)
+            me._show_debug_panel_direct("debug evaluate result")
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.status_msg = "debug response ignored: " + command
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_hydrate_dap_event(event_json: text) -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if editor_debug_dap_message_type(event_json) != "event":
+            me.status_msg = "debug event ignored"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val event = editor_debug_dap_event_name(event_json)
+        val status = editor_debug_dap_event_status(event_json)
+        if status == "":
+            me.status_msg = "debug event ignored: " + event
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_set_status(me.debug_registry, editor_debug_session_id(session), status)
+        me.debug_status = status
+        me._show_debug_panel_direct(editor_debug_dap_event_summary(event_json))
+        if status == "paused":
+            val event_status = me.status_msg
+            me._debug_refresh_watches()
+            me.status_msg = event_status
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_set_exception_filters(filters: [text]) -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_set_exception_filters(me.debug_registry, editor_debug_session_id(session), filters)
+        if me.debug_dap_client.running:
+            val requested = editor_debug_dap_client_set_exception_breakpoints(me.debug_dap_client, filters)
+            me.debug_dap_client = requested.0
+        me._show_debug_panel_direct("exception breakpoints set")
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_poll_dap_client() -> EditorAction:
+        val action = me._poll_debug_dap_client()
+        if action.redraw:
+            return action
+        me.status_msg = "no debug messages"
+        EditorAction(redraw: false, quit: false, status_msg: me.status_msg)
+
+    me _poll_debug_dap_client() -> EditorAction:
+        var messages: [EditorDebugDapInboundMessage] = []
+        if me.debug_process_pid > 0:
+            if editor_debug_process_wait_simple_stopped(me.debug_process_pid):
+                me.debug_status = "paused"
+                me.status_msg = "debug stopped: entry"
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+            return EditorAction(redraw: false, quit: false, status_msg: me.status_msg)
+        else:
+            var dap = me.debug_dap_client
+            val polled = editor_debug_dap_client_poll_messages(dap)
+            dap = polled.0
+            messages = polled.1
+            me.debug_dap_client = dap
+        var updated = false
+        for message in messages:
+            val message_type = editor_debug_dap_inbound_message_type(message)
+            val raw_json = editor_debug_dap_inbound_raw_json(message)
+            if message_type == "response":
+                val action = me._debug_hydrate_dap_response(raw_json)
+                if action.redraw:
+                    updated = true
+            elif message_type == "event":
+                val event_action = me._debug_hydrate_dap_event(raw_json)
+                if event_action.redraw:
+                    updated = true
+        if updated:
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        EditorAction(redraw: false, quit: false, status_msg: me.status_msg)
+
+    me _debug_request_stack_trace() -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if not me.debug_dap_client.running:
+            me.status_msg = "debug adapter not running"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val requested = editor_debug_dap_client_stack_trace(me.debug_dap_client, 1)
+        me.debug_dap_client = requested.0
+        me.status_msg = "debug stack requested"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_request_scopes(frame_id: i64) -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if not me.debug_dap_client.running:
+            me.status_msg = "debug adapter not running"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val requested = editor_debug_dap_client_scopes(me.debug_dap_client, frame_id)
+        me.debug_dap_client = requested.0
+        me.status_msg = "debug scopes requested"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_request_variables(variables_reference: i64) -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if not me.debug_dap_client.running:
+            me.status_msg = "debug adapter not running"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val requested = editor_debug_dap_client_variables(me.debug_dap_client, variables_reference)
+        me.debug_dap_client = requested.0
+        me.status_msg = "debug variables requested"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_sync_active_breakpoints() -> EditorAction:
+        ctrl_debug_sync_active_breakpoints(me)
+
+    me _debug_continue() -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_continue(me.debug_registry, editor_debug_session_id(session))
+        if me.debug_dap_client.running:
+            val requested = editor_debug_dap_client_continue_thread(me.debug_dap_client, 1)
+            me.debug_dap_client = requested.0
+            val client_index = editor_debug_session_id(session) - 1
+            while me.debug_dap_clients.len() <= client_index:
+                me.debug_dap_clients.push(EditorDebugDapClient.new())
+            me.debug_dap_clients[client_index] = me.debug_dap_client
+        me.debug_status = "running"
+        me.status_msg = "debug continue"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_pause() -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_pause(me.debug_registry, editor_debug_session_id(session))
+        if me.debug_dap_client.running:
+            val requested = editor_debug_dap_client_pause_thread(me.debug_dap_client, 1)
+            me.debug_dap_client = requested.0
+            val client_index = editor_debug_session_id(session) - 1
+            while me.debug_dap_clients.len() <= client_index:
+                me.debug_dap_clients.push(EditorDebugDapClient.new())
+            me.debug_dap_clients[client_index] = me.debug_dap_client
+        me.debug_status = "paused"
+        me.status_msg = "debug pause"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_step(step_kind: text) -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_step(me.debug_registry, editor_debug_session_id(session), step_kind)
+        if me.debug_dap_client.running:
+            val requested = editor_debug_dap_client_step_thread(me.debug_dap_client, step_kind, 1)
+            me.debug_dap_client = requested.0
+            val client_index = editor_debug_session_id(session) - 1
+            while me.debug_dap_clients.len() <= client_index:
+                me.debug_dap_clients.push(EditorDebugDapClient.new())
+            me.debug_dap_clients[client_index] = me.debug_dap_client
+        me.debug_status = "stepping"
+        me.status_msg = "debug " + step_kind
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_terminate_first() -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if me.debug_dap_client.running:
+            val requested = editor_debug_dap_client_disconnect(me.debug_dap_client)
+            me.debug_dap_client = requested.0
+        me.debug_registry = editor_debug_registry_terminate(me.debug_registry, editor_debug_session_id(session))
+        var stopped_dap = me.debug_dap_client
+        stopped_dap.running = false
+        me.debug_dap_client = stopped_dap
+        val client_index = editor_debug_session_id(session) - 1
+        while me.debug_dap_clients.len() <= client_index:
+            me.debug_dap_clients.push(EditorDebugDapClient.new())
+        me.debug_dap_clients[client_index] = stopped_dap
+        me.debug_process_pid = 0
+        me.debug_status = "terminated"
+        me.status_msg = "debug terminated"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_restart_first() -> EditorAction:
+        val session = editor_debug_first_session(me.debug_registry)
+        if editor_debug_session_id(session) == 0:
+            me.status_msg = "no debug session"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.debug_registry = editor_debug_registry_restart(me.debug_registry, editor_debug_session_id(session))
+        var dap = me.debug_dap_client
+        dap.start()
+        val restarted = editor_debug_dap_client_restart(dap)
+        dap = restarted.0
+        val initialized = editor_debug_dap_client_initialize(dap)
+        dap = initialized.0
+        val launched = editor_debug_dap_client_launch(dap, editor_debug_session_config(session))
+        dap = launched.0
+        me.debug_dap_client = dap
+        val client_index = editor_debug_session_id(session) - 1
+        while me.debug_dap_clients.len() <= client_index:
+            me.debug_dap_clients.push(EditorDebugDapClient.new())
+        me.debug_dap_clients[client_index] = dap
+        me.debug_status = "restarting"
+        me.status_msg = "debug restart"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _debug_store_client_for_session(session_id: i64, dap: EditorDebugDapClient):
+        val index = session_id - 1
+        if index < 0:
+            return
+        while me.debug_dap_clients.len() <= index:
+            me.debug_dap_clients.push(EditorDebugDapClient.new())
+        me.debug_dap_clients[index] = dap
+
+    me _show_debug_session_panel(message: text):
+        ctrl_show_debug_session_panel(me, message)
+
+    me _wiki_daily_note_create(payload: text) -> EditorAction:
+        ctrl_wiki_daily_note_create(me, payload)
+
+    me _wiki_daily_note_picker(payload: text) -> EditorAction:
+        ctrl_wiki_daily_note_picker(me, payload)
+
+    me _wiki_template_insert(payload: text) -> EditorAction:
+        ctrl_wiki_template_insert(me, payload)
+
+    me _wiki_template_picker(payload: text) -> EditorAction:
+        ctrl_wiki_template_picker(me, payload)
+
+    me _wiki_embed_insert(payload: text) -> EditorAction:
+        ctrl_wiki_embed_insert(me, payload)
+
+    me _wiki_attachment_insert(payload: text) -> EditorAction:
+        ctrl_wiki_attachment_insert(me, payload)
+
+    me _wiki_attachment_picker(payload: text) -> EditorAction:
+        ctrl_wiki_attachment_picker(me, payload)
+
+    me _toggle_markdown_task_line(line: i64) -> EditorAction:
+        ctrl_toggle_markdown_task_line(me, line)
+
+    me _markdown_table_insert_row() -> EditorAction:
+        val doc = me.session.active_document()
+        var buffer = me.session.active_buffer()
+        if doc == nil or buffer == nil or doc.language_id != "markdown":
+            me.status_msg = "no markdown table"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val edit = md_table_insert_row_after(buffer.to_text(), buffer.cursor_row)
+        if not edit.changed:
+            me.status_msg = edit.message
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        buffer.push_undo_snapshot()
+        buffer.replace_content(edit.content)
+        buffer.dirty = true
+        buffer.move_cursor(edit.line, edit.col)
+        ctrl_update_markdown_preview(me, doc, buffer)
+        me.session.update_active_buffer(buffer)
+        ctrl_notify_active_lsp_changed(me)
+        me.status_msg = edit.message
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _markdown_table_insert_column() -> EditorAction:
+        val doc = me.session.active_document()
+        var buffer = me.session.active_buffer()
+        if doc == nil or buffer == nil or doc.language_id != "markdown":
+            me.status_msg = "no markdown table"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val edit = md_table_insert_column_after(buffer.to_text(), buffer.cursor_row, buffer.cursor_col)
+        if not edit.changed:
+            me.status_msg = edit.message
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        buffer.push_undo_snapshot()
+        buffer.replace_content(edit.content)
+        buffer.dirty = true
+        buffer.move_cursor(edit.line, edit.col)
+        ctrl_update_markdown_preview(me, doc, buffer)
+        me.session.update_active_buffer(buffer)
+        ctrl_notify_active_lsp_changed(me)
+        me.status_msg = edit.message
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _markdown_table_set_cell(line: i64, col: i64, value: text) -> EditorAction:
+        ctrl_markdown_table_set_cell(me, line, col, value)
+
+    me _markdown_table_cell_nav(direction: text) -> EditorAction:
+        val doc = me.session.active_document()
+        var buffer = me.session.active_buffer()
+        if doc == nil or buffer == nil or doc.language_id != "markdown":
+            me.status_msg = "no markdown table"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val nav = if direction == "prev" then md_table_prev_cell(buffer.to_text(), buffer.cursor_row, buffer.cursor_col) else: md_table_next_cell(buffer.to_text(), buffer.cursor_row, buffer.cursor_col)
+        if not nav.found:
+            me.status_msg = nav.message
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        buffer.move_cursor(nav.line, nav.col)
+        me.session.update_active_buffer(buffer)
+        me.status_msg = nav.message
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _markdown_table_cell_nav(direction: text) -> EditorAction:
+        ctrl_markdown_table_cell_nav(me, direction)
+
+    me _toggle_active_callout_fold() -> EditorAction:
+        val doc = me.session.active_document()
+        var buffer = me.session.active_buffer()
+        if doc == nil or buffer == nil or doc.language_id != "markdown":
+            me.status_msg = "no callout"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val result = md_callout_toggle_fold(buffer.to_text(), buffer.cursor_row)
+        if not result.changed:
+            me.status_msg = result.message
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        buffer.push_undo_snapshot()
+        buffer.replace_content(result.content)
+        buffer.dirty = true
+        buffer.move_cursor(result.line, 0)
+        ctrl_update_markdown_preview(me, doc, buffer)
+        me.session.update_active_buffer(buffer)
+        ctrl_notify_active_lsp_changed(me)
+        me.status_msg = result.message
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _wiki_show_backlinks() -> EditorAction:
+        val doc = me.session.active_document()
+        if doc == nil or doc.language_id != "markdown":
+            me.status_msg = "no markdown note open"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.wiki_property_vault_root = _editor_dirname(doc.path())
+        val index = ctrl_wiki_index_open_documents(me)
+        me.wiki_panel = wiki_panel_from_backlinks(md_wiki_backlinks(index, doc.path()))
+        me._show_right_dock("wiki-panel")
+        me.status_msg = "wiki backlinks panel"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _wiki_show_tasks(filter: text) -> EditorAction:
+        val index = ctrl_wiki_index_open_documents(me)
+        val normalized = if _editor_payload_part(filter, 0).trim() == "" then "open" else: _editor_payload_part(filter, 0).trim().to_lower()
+        val query = _editor_payload_part(filter, 1).trim().to_lower()
+        me.wiki_task_filter = normalized
+        me.wiki_task_query = query
+        me.wiki_panel = wiki_panel_from_tasks(_editor_tasks_matching(md_wiki_tasks_filtered(index, normalized), query))
+        me._show_right_dock("wiki-panel")
+        me.status_msg = "wiki tasks: " + normalized
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _wiki_task_batch(payload: text) -> EditorAction:
+        val doc = me.session.active_document()
+        var buffer = me.session.active_buffer()
+        if doc == nil or buffer == nil or doc.language_id != "markdown":
+            me.status_msg = "no markdown task"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val normalized = payload.trim().to_lower()
+        val checked = normalized == "done" or normalized == "checked" or normalized == "complete" or normalized == "completed"
+        val next = md_tasks_set_checked(buffer.to_text(), checked)
+        if next == buffer.to_text():
+            me.status_msg = "no tasks changed"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        buffer.push_undo_snapshot()
+        buffer.replace_content(next)
+        buffer.dirty = true
+        ctrl_update_markdown_preview(me, doc, buffer)
+        me.session.update_active_buffer(buffer)
+        ctrl_notify_active_lsp_changed(me)
+        me.wiki_property_vault_root = _editor_dirname(doc.path())
+        val index = ctrl_wiki_index_open_documents(me)
+        me.wiki_panel = wiki_panel_from_tasks(md_wiki_tasks_filtered(index, if checked then "done" else: "open"))
+        me._show_right_dock("wiki-panel")
+        me.status_msg = if checked then "tasks marked done" else: "tasks marked open"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _wiki_vault_task_batch(payload: text) -> EditorAction:
+        val root = _editor_payload_part(payload, 0)
+        val mode = _editor_payload_part(payload, 1).trim().to_lower()
+        if root == "":
+            me.status_msg = "missing vault root"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val checked = mode == "done" or mode == "checked" or mode == "complete" or mode == "completed"
+        var changed_count = 0
+        val files = rt_dir_walk(root)
+        for file in files:
+            if not _editor_is_markdown_path(file):
+                continue
+            val existing = rt_file_read_text(file) ?? ""
+            val next = md_tasks_set_checked(existing, checked)
+            if next != existing:
+                if rt_file_write_text(file, next):
+                    changed_count = changed_count + 1
+                    me._refresh_open_document_from_disk_batch(file, next)
+        val index = md_wiki_index_documents(_editor_markdown_vault_documents(root))
+        me.wiki_panel = wiki_panel_from_tasks(md_wiki_tasks_filtered(index, if checked then "done" else: "open"))
+        me._show_right_dock("wiki-panel")
+        me.status_msg = "vault tasks changed: " + changed_count.to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _wiki_show_properties() -> EditorAction:
+        val doc = me.session.active_document()
+        if doc == nil or doc.language_id != "markdown":
+            me.status_msg = "no markdown note open"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val index = ctrl_wiki_index_open_documents(me)
+        me.wiki_panel = wiki_panel_from_properties(md_wiki_properties_for_path(index, doc.path()))
+        me._show_right_dock("wiki-panel")
+        me.status_msg = "wiki properties panel"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _wiki_set_property(payload: text) -> EditorAction:
+        val doc = me.session.active_document()
+        var buffer = me.session.active_buffer()
+        if doc == nil or buffer == nil or doc.language_id != "markdown":
+            me.status_msg = "no markdown note open"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val parsed = _editor_parse_property_payload(payload)
+        if parsed.key == "":
+            me.status_msg = "missing property key"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val next = _editor_markdown_property_content(buffer.to_text(), parsed.key, parsed.value)
+        buffer.push_undo_snapshot()
+        buffer.replace_content(next)
+        buffer.dirty = true
+        buffer.move_cursor(0, 0)
+        ctrl_update_markdown_preview(me, doc, buffer)
+        me.session.update_active_buffer(buffer)
+        ctrl_notify_active_lsp_changed(me)
+        val index = ctrl_wiki_index_open_documents(me)
+        me.wiki_panel = wiki_panel_from_properties(md_wiki_properties_for_path(index, doc.path()))
+        me._show_right_dock("wiki-panel")
+        me.status_msg = "property set: " + parsed.key
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _wiki_vault_set_property(payload: text) -> EditorAction:
+        val parsed = _editor_parse_vault_property_payload(payload)
+        if parsed.root == "" or parsed.key == "":
+            me.status_msg = "missing vault root or property key"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.wiki_property_vault_root = parsed.root
+        var changed_count = 0
+        val files = rt_dir_walk(parsed.root)
+        for file in files:
+            if not _editor_is_markdown_path(file):
+                continue
+            if not _editor_vault_property_path_selected(file, parsed.selected_paths):
+                continue
+            val existing = rt_file_read_text(file) ?? ""
+            val next = _editor_markdown_property_content(existing, parsed.key, parsed.value)
+            if next != existing:
+                if rt_file_write_text(file, next):
+                    changed_count = changed_count + 1
+                    me._refresh_open_document_from_disk_batch(file, next)
+        val index = md_wiki_index_documents(_editor_markdown_vault_documents(parsed.root))
+        me.wiki_panel = wiki_panel_from_properties(_editor_wiki_properties_for_key(index, parsed.key))
+        me._show_right_dock("wiki-panel")
+        me.status_msg = "vault property set: " + changed_count.to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _wiki_vault_property_review(payload: text) -> EditorAction:
+        val parsed = _editor_parse_vault_property_payload(payload)
+        if parsed.root == "" or parsed.key == "":
+            me.status_msg = "missing vault root or property key"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.wiki_property_vault_root = parsed.root
+        var rows: [WikiPanelRow] = []
+        val files = rt_dir_walk(parsed.root)
+        for file in files:
+            if not _editor_is_markdown_path(file):
+                continue
+            if not _editor_vault_property_path_selected(file, parsed.selected_paths):
+                continue
+            val existing = rt_file_read_text(file) ?? ""
+            val next = _editor_markdown_property_content(existing, parsed.key, parsed.value)
+            if next != existing:
+                rows.push(WikiPanelRow(icon: "review", label: _editor_path_basename(file), detail: parsed.key + " -> " + parsed.value, path: file, line: 0))
+        me.wiki_panel = wiki_panel_with_rows("Property Review", rows)
+        me._show_right_dock("wiki-panel")
+        me.status_msg = "vault property review: " + rows.len().to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _wiki_property_diagnostics(payload: text) -> EditorAction:
+        val doc = me.session.active_document()
+        var buffer = me.session.active_buffer()
+        if doc == nil or buffer == nil or doc.language_id != "markdown":
+            me.status_msg = "no markdown note open"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val schema_key = _editor_payload_part(payload, 0).trim()
+        if schema_key == "":
+            me.status_msg = "missing property schema"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val required_text = _editor_payload_part(payload, 1).trim()
+        val allowed_text = _editor_payload_part(payload, 2).trim()
+        val required = required_text == "required" or required_text == "true" or required_text == "yes"
+        val allowed = _editor_payload_csv(allowed_text)
+        me.wiki_property_schema_payload = payload
+        var lines: [text] = []
+        var line_cursor = 0
+        while line_cursor < buffer.line_count():
+            lines.push(buffer.line_at(line_cursor))
+            line_cursor = line_cursor + 1
+        var found = false
+        var value = ""
+        var line_index = 0
+        if lines.len() > 0 and lines[0].trim() == "---":
+            var i = 1
+            while i < lines.len():
+                val trimmed = lines[i].trim()
+                if trimmed == "---":
+                    break
+                val sep = _editor_find_text(trimmed, ":")
+                if sep > 0 and trimmed.slice(0, sep).trim() == schema_key:
+                    found = true
+                    value = trimmed.slice(sep + 1, trimmed.len()).trim()
+                    line_index = i
+                    break
+                i = i + 1
+        var diags: [EditorDiagnostic] = []
+        if required and not found:
+            diags.push(EditorDiagnostic(path: doc.path(), line: 0, col: 0, end_line: 0, end_col: 0, severity: "warning", message: "Missing required frontmatter property: " + schema_key, source: "markdown-properties"))
+        elif found and required and value == "":
+            diags.push(EditorDiagnostic(path: doc.path(), line: line_index, col: 0, end_line: line_index, end_col: lines[line_index].len(), severity: "warning", message: "Frontmatter property requires a value: " + schema_key, source: "markdown-properties"))
+        elif found and allowed.len() > 0:
+            var allowed_match = false
+            for allowed_value in allowed:
+                if allowed_value == value:
+                    allowed_match = true
+            if not allowed_match:
+                diags.push(EditorDiagnostic(path: doc.path(), line: line_index, col: 0, end_line: line_index, end_col: lines[line_index].len(), severity: "warning", message: "Invalid frontmatter value for " + schema_key + ": " + value, source: "markdown-properties"))
+        me.diagnostic_store.set_diagnostics(doc.path(), diags)
+        me.diagnostics_panel = diagnostics_panel_from_store(me.diagnostic_store)
+        me._show_right_dock("problems")
+        me.status_msg = "property diagnostics: " + diags.len().to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _wiki_show_tags(tag: text) -> EditorAction:
+        val needle = tag.trim()
+        if needle == "":
+            me.status_msg = "missing wiki tag"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val index = ctrl_wiki_index_open_documents(me)
+        me.wiki_panel = wiki_panel_from_tags(md_wiki_tags(index, needle))
+        me._show_right_dock("wiki-panel")
+        me.status_msg = "wiki tags panel"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _wiki_show_graph() -> EditorAction:
+        val doc = me.session.active_document()
+        val path = if doc == nil then "" else: doc.path()
+        val index = ctrl_wiki_index_open_documents(me)
+        val edges = md_wiki_graph_edges(index, path)
+        var ordered_edges: [MdWikiGraphEdge] = []
+        val title = md_wiki_title_from_path(path)
+        if path != "":
+            for edge in edges:
+                if edge.source_path != path and edge.target == title:
+                    ordered_edges.push(edge)
+        for edge in edges:
+            if path == "" or edge.source_path == path or edge.target != title:
+                ordered_edges.push(edge)
+        me.wiki_panel = wiki_panel_from_graph_edges_with_index(ordered_edges, index)
+        me._show_right_dock("wiki-panel")
+        me.status_msg = "wiki graph panel"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _wiki_quick_switch(query: text) -> EditorAction:
+        ctrl_wiki_quick_switch(me, query)
+
+    me _wiki_vault_search(payload: text) -> EditorAction:
+        ctrl_wiki_vault_search(me, payload)
+
+    me _show_wiki_panel(message: text):
+        ctrl_show_wiki_panel(me, message)
+
+    me _set_lsp_result_panel_from_response(kind: text, response: LspResponse):
+        if kind == "code-action" and response.ok and response.result_json != "":
+            me.code_actions = _editor_code_actions_from_response(response.result_json)
+            me.lsp_result_panel = ctrl_code_action_result_panel(me, response.id)
+            return
+        if kind == "code-action" and response.ok and response.result_json == "":
+            me.lsp_result_panel = lsp_result_panel_pending(kind, response.id)
+            return
+        if response.ok and response.result_json == "" and _editor_lsp_kind_has_panel(kind):
+            me.lsp_result_panel = lsp_result_panel_pending(kind, response.id)
+            return
+        var panel = lsp_result_panel_from_response(kind, response)
+        if kind == "call-hierarchy" or kind == "call-hierarchy-incoming" or kind == "call-hierarchy-outgoing":
+            val title = lsp_result_title(kind)
+            if panel.pending:
+                if me.lsp_result_panel.title == title:
+                    me.lsp_call_hierarchy_state = lsp_result_panel_call_state(me.lsp_result_panel)
+                    me.lsp_call_hierarchy_state_title = title
+            else:
+                if me.lsp_result_panel.title == title and me.lsp_call_hierarchy_state_title == title:
+                    panel = lsp_result_panel_restore_call_state(panel, me.lsp_call_hierarchy_state)
+                if (kind == "call-hierarchy-incoming" or kind == "call-hierarchy-outgoing") and me.lsp_call_hierarchy_merge_index >= 0 and me.lsp_call_hierarchy_merge_panel.title == "Call Hierarchy":
+                    val merge_panel = me.lsp_call_hierarchy_merge_panel
+                    val merge_index = me.lsp_call_hierarchy_merge_index
+                    if merge_index >= 0 and merge_index < merge_panel.rows.len():
+                        var merged_rows: [LspResultRow] = []
+                        var merge_row_index = 0
+                        while merge_row_index < merge_panel.rows.len():
+                            val parent = merge_panel.rows[merge_row_index]
+                            if merge_row_index == merge_index:
+                                merged_rows.push(LspResultRow(
+                                    icon: parent.icon,
+                                    label: parent.label,
+                                    detail: parent.detail,
+                                    path: parent.path,
+                                    line: parent.line,
+                                    col: parent.col,
+                                    command_name: parent.command_name,
+                                    command_payload: parent.command_payload,
+                                    depth: parent.depth,
+                                    expanded: true
+                                ))
+                                var child_index = 0
+                                while child_index < panel.rows.len():
+                                    val child = panel.rows[child_index]
+                                    merged_rows.push(LspResultRow(
+                                        icon: child.icon,
+                                        label: child.label,
+                                        detail: child.detail,
+                                        path: child.path,
+                                        line: child.line,
+                                        col: child.col,
+                                        command_name: child.command_name,
+                                        command_payload: child.command_payload,
+                                        depth: parent.depth + 1,
+                                        expanded: if child.icon == "call" then true else: child.expanded
+                                    ))
+                                    child_index = child_index + 1
+                            else:
+                                merged_rows.push(parent)
+                            merge_row_index = merge_row_index + 1
+                        panel = LspResultPanel(
+                            title: merge_panel.title,
+                            rows: merged_rows,
+                            selected: merge_panel.selected,
+                            scroll_offset: merge_panel.scroll_offset,
+                            visible: merge_panel.visible,
+                            pending: false,
+                            request_id: response.id
+                        )
+                    me.lsp_call_hierarchy_merge_index = -1
+                    me.lsp_call_hierarchy_merge_panel = lsp_result_panel_new("")
+                    me.lsp_call_hierarchy_state = lsp_result_panel_call_state(panel)
+                    me.lsp_call_hierarchy_state_title = panel.title
+                elif kind == "call-hierarchy-incoming" or kind == "call-hierarchy-outgoing":
+                    var expanded_rows: [LspResultRow] = []
+                    for row in panel.rows:
+                        expanded_rows.push(LspResultRow(
+                            icon: row.icon,
+                            label: row.label,
+                            detail: row.detail,
+                            path: row.path,
+                            line: row.line,
+                            col: row.col,
+                            command_name: row.command_name,
+                            command_payload: row.command_payload,
+                            depth: row.depth,
+                            expanded: if row.icon == "call" then true else: row.expanded
+                        ))
+                    panel = LspResultPanel(
+                        title: panel.title,
+                        rows: expanded_rows,
+                        selected: panel.selected,
+                        scroll_offset: panel.scroll_offset,
+                        visible: panel.visible,
+                        pending: panel.pending,
+                        request_id: panel.request_id
+                    )
+        me.lsp_result_panel = panel
+
+    me _request_active_lsp_action(kind: text) -> EditorAction:
+        val response = me._request_active_lsp(kind)
+        if not response.ok:
+            me.status_msg = response.error_text
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if _editor_lsp_kind_has_panel(kind):
+            me._set_lsp_result_panel_from_response(kind, response)
+            if kind == "document-symbols" and response.result_json != "":
+                me._apply_lsp_document_symbols_outline()
+            me._refresh_lsp_hover_popup(kind)
+            me._show_lsp_result_panel(kind + " results")
+            me.status_msg = kind + " results"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if kind == "formatting":
+            me.pending_workspace_edit_title = "formatting"
+        if kind == "range-formatting":
+            me.pending_workspace_edit_title = "range formatting"
+        me.status_msg = kind + " requested"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _request_completion_action() -> EditorAction:
+        val response = me._request_active_completion()
+        if not response.ok:
+            me.status_msg = response.error_text
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me._set_lsp_result_panel_from_response("completion", response)
+        me._refresh_lsp_hover_popup("completion")
+        me._show_lsp_result_panel("completion results")
+        return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _request_hover_action() -> EditorAction:
+        val response = me._request_active_hover()
+        if not response.ok:
+            me.status_msg = response.error_text
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me._set_lsp_result_panel_from_response("hover", response)
+        me._refresh_lsp_hover_popup("hover")
+        me._show_lsp_result_panel("hover results")
+        return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _request_definition_action() -> EditorAction:
+        val response = me._request_active_definition()
+        if not response.ok:
+            me.status_msg = response.error_text
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me._set_lsp_result_panel_from_response("definition", response)
+        me._refresh_lsp_hover_popup("definition")
+        me._show_lsp_result_panel("definition results")
+        return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _request_code_action_action() -> EditorAction:
+        val response = me._request_active_code_action()
+        if not response.ok:
+            me.status_msg = response.error_text
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me._set_lsp_result_panel_from_response("code-action", response)
+        me._refresh_lsp_hover_popup("code-action")
+        me._show_lsp_result_panel("code-action results")
+        return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _request_workspace_symbols(query: text) -> EditorAction:
+        val response = me._request_active_lsp_with_payload("workspace-symbols", query)
+        if not response.ok:
+            me.status_msg = response.error_text
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.lsp_result_panel = lsp_result_panel_from_response("workspace-symbols", response)
+        val indexed_rows = me._workspace_symbol_index_rows(query)
+        if indexed_rows.len() > 0:
+            me.lsp_result_panel = LspResultPanel(
+                title: "Workspace Symbols",
+                rows: indexed_rows,
+                selected: 0,
+                scroll_offset: 0,
+                visible: true,
+                pending: false,
+                request_id: response.id
+            )
+        me._refresh_lsp_hover_popup("workspace-symbols")
+        me._show_lsp_result_panel("workspace-symbols results")
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _rebuild_workspace_symbol_index(root: text) -> EditorAction:
+        me.workspace_symbol_index_root = root
+        me.workspace_symbol_index = _editor_workspace_symbol_index(root)
+        me.status_msg = "workspace symbols indexed: " + me.workspace_symbol_index.len().to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _workspace_symbol_index_rows(query: text) -> [LspResultRow]:
+        var rows: [LspResultRow] = []
+        val clean_query = query.trim().lower()
+        if clean_query == "":
+            return rows
+        for row in me.workspace_symbol_index:
+            if row.label.lower().contains(clean_query):
+                rows.push(row)
+                if rows.len() >= 100:
+                    return rows
+        rows
+
+    me _dismiss_lsp_hover_popup() -> EditorAction:
+        me.lsp_hover_popup = lsp_hover_popup_hidden()
+        me.status_msg = "hover dismissed"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _dismiss_lsp_signature_popup() -> EditorAction:
+        me.lsp_signature_popup = lsp_signature_popup_hidden()
+        me.status_msg = "signature dismissed"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _select_signature_overload(delta: i64) -> EditorAction:
+        ctrl_select_signature_overload(me, delta)
+
+    me _request_active_formatting_preview(kind: text) -> EditorAction:
+        val response = me._request_active_lsp(kind)
+        if not response.ok:
+            me.status_msg = response.error_text
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val title = if kind == "range-formatting" then "range formatting" else: "formatting"
+        me.pending_workspace_edit_json = ""
+        me.pending_workspace_edit_title = title
+        if response.result_json != "":
+            me._show_workspace_edit_preview(response.result_json, title)
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val pending_kind = if kind == "range-formatting" then "range-formatting-preview" else: "formatting-preview"
+        me.lsp_result_panel = lsp_result_panel_pending(pending_kind, response.id)
+        me._show_lsp_result_panel(title + " preview requested")
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _request_active_formatting_save(kind: text) -> EditorAction:
+        val response = me._request_active_lsp(kind)
+        if not response.ok:
+            me.status_msg = response.error_text
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val title = if kind == "range-formatting" then "range formatting" else: "formatting"
+        me.format_save_request_id = response.id
+        me.format_save_title = title
+        if response.result_json != "":
+            me._apply_workspace_edit_result(response.result_json, title)
+            me.format_save_request_id = 0
+            me.format_save_title = ""
+            return me._save_active_after_format(title)
+        me.status_msg = title + " save requested"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _save_active_after_format(title: text) -> EditorAction:
+        val saved = me.session.save_active()
+        if saved:
+            me.status_msg = "applied and saved: " + title
+        else:
+            me.status_msg = "applied: " + title + " (save failed)"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _rename_active_symbol(new_name: text) -> EditorAction:
+        val name = new_name.trim()
+        if name == "":
+            me.status_msg = "missing rename target"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val response = me._request_active_rename(name)
+        if not response.ok:
+            me.status_msg = response.error_text
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if response.result_json != "":
+            return me._apply_workspace_edit_result(response.result_json, "rename")
+        me.pending_workspace_edit_title = "rename"
+        me.status_msg = "rename requested: " + name
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _rename_active_symbol_preview(new_name: text) -> EditorAction:
+        val name = new_name.trim()
+        if name == "":
+            me.status_msg = "missing rename target"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val response = me._request_active_rename(name)
+        if not response.ok:
+            me.status_msg = response.error_text
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.pending_workspace_edit_json = ""
+        me.pending_workspace_edit_title = "rename"
+        if response.result_json != "":
+            me._show_workspace_edit_preview(response.result_json, "rename")
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me.lsp_result_panel = lsp_result_panel_pending("rename-preview", response.id)
+        me._show_lsp_result_panel("rename preview requested: " + name)
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _show_workspace_edit_preview(edit_json: text, title: text):
+        me.pending_workspace_edit_json = edit_json
+        me.pending_workspace_edit_title = title
+        me.lsp_result_panel = lsp_result_panel_workspace_edit_preview(title, edit_json, 0)
+        var rows: [LspResultRow] = []
+        for row in me.lsp_result_panel.rows:
+            if row.path != "" and not rt_file_exists(row.path):
+                rows.push(LspResultRow(
+                    icon: "conflict",
+                    label: row.label,
+                    detail: row.detail + " [conflict: missing file]",
+                    path: row.path,
+                    line: row.line,
+                    col: row.col,
+                    command_name: row.command_name,
+                    command_payload: row.command_payload,
+                    depth: row.depth,
+                    expanded: row.expanded
+                ))
+            else:
+                rows.push(row)
+        me.lsp_result_panel = LspResultPanel(
+            title: me.lsp_result_panel.title,
+            rows: rows,
+            selected: me.lsp_result_panel.selected,
+            scroll_offset: me.lsp_result_panel.scroll_offset,
+            visible: me.lsp_result_panel.visible,
+            pending: me.lsp_result_panel.pending,
+            request_id: me.lsp_result_panel.request_id
+        )
+        me.lsp_hover_popup = lsp_hover_popup_hidden()
+        me.lsp_signature_popup = lsp_signature_popup_hidden()
+        me._show_right_dock("lsp-panel")
+        me.status_msg = title + " preview: " + me.lsp_result_panel.rows.len().to_text() + " edits"
+
+    me _mark_workspace_edit_preview_conflicts():
+        var rows: [LspResultRow] = []
+        for row in me.lsp_result_panel.rows:
+            if row.path != "" and not rt_file_exists(row.path):
+                rows.push(LspResultRow(
+                    icon: "conflict",
+                    label: row.label,
+                    detail: row.detail + " [conflict: missing file]",
+                    path: row.path,
+                    line: row.line,
+                    col: row.col,
+                    command_name: row.command_name,
+                    command_payload: row.command_payload,
+                    depth: row.depth,
+                    expanded: row.expanded
+                ))
+            else:
+                rows.push(row)
+        me.lsp_result_panel = LspResultPanel(
+            title: me.lsp_result_panel.title,
+            rows: rows,
+            selected: me.lsp_result_panel.selected,
+            scroll_offset: me.lsp_result_panel.scroll_offset,
+            visible: me.lsp_result_panel.visible,
+            pending: me.lsp_result_panel.pending,
+            request_id: me.lsp_result_panel.request_id
+        )
+
+    me _confirm_pending_workspace_edit() -> EditorAction:
+        if me.pending_workspace_edit_json == "":
+            me.status_msg = "no pending workspace edit"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val edit_json = me.pending_workspace_edit_json
+        val title = me.pending_workspace_edit_title
+        me.pending_workspace_edit_json = ""
+        me.pending_workspace_edit_title = ""
+        me._apply_workspace_edit_result(edit_json, title)
+
+    me _cancel_pending_workspace_edit() -> EditorAction:
+        ctrl_cancel_pending_workspace_edit(me)
+
+    me _request_active_call_hierarchy_direction(direction: text, item_json: text) -> EditorAction:
+        val payload = item_json.trim()
+        if payload == "":
+            me.status_msg = "missing call hierarchy item"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val response = me._request_call_hierarchy_direction(direction, payload)
+        if not response.ok:
+            me.lsp_call_hierarchy_merge_index = -1
+            me.lsp_call_hierarchy_merge_panel = lsp_result_panel_new("")
+            me.status_msg = response.error_text
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val kind = if direction == "outgoing" then "call-hierarchy-outgoing" else: "call-hierarchy-incoming"
+        me._set_lsp_result_panel_from_response(kind, response)
+        me._refresh_lsp_hover_popup(kind)
+        me._show_lsp_result_panel(kind + " results")
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _request_selected_call_hierarchy_direction(direction: text) -> EditorAction:
+        if me.lsp_result_panel.rows.len() == 0:
+            me.status_msg = "missing call hierarchy item"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val row = me.lsp_result_panel.rows[me.lsp_result_panel.selected]
+        if row.icon != "call":
+            me.status_msg = "missing call hierarchy item"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if me.lsp_result_panel.title == "Call Hierarchy":
+            me.lsp_call_hierarchy_merge_panel = me.lsp_result_panel
+            me.lsp_call_hierarchy_merge_index = me.lsp_result_panel.selected
+        var payload = row.command_payload.trim()
+        if payload == "":
+            payload = "{\"name\":\"" + row.label + "\",\"kind\":12,\"uri\":\"file://" + row.path + "\",\"range\":{\"start\":{\"line\":" + row.line.to_text() + ",\"character\":" + row.col.to_text() + "},\"end\":{\"line\":" + row.line.to_text() + ",\"character\":" + row.col.to_text() + "}},\"selectionRange\":{\"start\":{\"line\":" + row.line.to_text() + ",\"character\":" + row.col.to_text() + "},\"end\":{\"line\":" + row.line.to_text() + ",\"character\":" + row.col.to_text() + "}}}"
+        return me._request_active_call_hierarchy_direction(direction, payload)
+
+    me _request_active_code_lens_resolve(item_json: text) -> EditorAction:
+        val payload = item_json.trim()
+        if payload == "":
+            me.status_msg = "missing code lens item"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val response = me._request_code_lens_resolve(payload)
+        if not response.ok:
+            me.status_msg = response.error_text
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if response.result_json == "":
+            me.lsp_result_panel = lsp_result_panel_pending("code-lens-resolve", response.id)
+        else:
+            me.lsp_result_panel = lsp_result_panel_from_response("code-lens-resolve", response)
+        me._refresh_lsp_hover_popup("code-lens-resolve")
+        me._show_lsp_result_panel("code-lens-resolve results")
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _run_selected_code_lens() -> EditorAction:
+        ctrl_run_selected_code_lens(me)
+
+    me _show_lsp_result_panel(message: text):
+        var layout = me.session.dock_layout
+        layout.show_right("lsp-panel")
+        me.session.dock_layout = layout
+        me.status_msg = message
+
+    me _code_action_result_panel(request_id: i64) -> LspResultPanel:
+        ctrl_code_action_result_panel(me, request_id)
+
+    me _filter_code_actions(filter: text) -> EditorAction:
+        me.code_action_filter = if filter == "" then "all" else: filter
+        me.lsp_result_panel = ctrl_code_action_result_panel(me, me.lsp_result_panel.request_id)
+        me.status_msg = "code actions filtered: " + me.code_action_filter
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _group_code_actions_by_kind() -> EditorAction:
+        me.code_action_group_by_kind = true
+        me.lsp_result_panel = ctrl_code_action_result_panel(me, me.lsp_result_panel.request_id)
+        me.status_msg = "code actions grouped: kind"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _refresh_lsp_hover_popup(kind: text):
+        var buffer = me.session.active_buffer()
+        val line = if buffer == nil then 0 else: buffer.cursor_row
+        val col = if buffer == nil then 0 else: buffer.cursor_col
+        if kind == "hover":
+            me.lsp_hover_popup = lsp_hover_popup_from_panel(me.lsp_result_panel, line, col)
+        else:
+            me.lsp_hover_popup = lsp_hover_popup_hidden()
+        if kind == "signature-help":
+            me.lsp_signature_popup = lsp_signature_popup_from_panel(me.lsp_result_panel, line, col)
+        else:
+            me.lsp_signature_popup = lsp_signature_popup_hidden()
+
+    me _lsp_jump_selected() -> EditorAction:
+        ctrl_lsp_jump_selected(me)
+
+    me _apply_selected_lsp_selection_range() -> EditorAction:
+        if me.lsp_result_panel.rows.len() == 0:
+            me.status_msg = "no selection range"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if me.lsp_result_panel.selected < 0 or me.lsp_result_panel.selected >= me.lsp_result_panel.rows.len():
+            me.status_msg = "no selection range"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val row = me.lsp_result_panel.rows[me.lsp_result_panel.selected]
+        if row.icon != "selection":
+            me.status_msg = "no selection range"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        var buffer = me.session.active_buffer()
+        if buffer == nil:
+            me.status_msg = "no file open"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val end_line = _editor_parse_i64(_editor_payload_part(row.command_payload, 0), row.line)
+        val end_col = _editor_parse_i64(_editor_payload_part(row.command_payload, 1), row.col)
+        var preserved_ranges: [SelectionRangeDeco] = []
+        for existing in buffer.selection_ranges:
+            val same_range = existing.start_row == row.line and existing.start_col == row.col and existing.end_row == end_line and existing.end_col == end_col
+            if not same_range:
+                preserved_ranges.push(existing)
+        buffer.set_primary_selection_range(row.line, row.col, end_line, end_col)
+        for preserved in preserved_ranges:
+            buffer.add_selection_range(preserved.start_row, preserved.start_col, preserved.end_row, preserved.end_col)
+        buffer.move_cursor(row.line, row.col)
+        me.session.update_active_buffer(buffer)
+        me.status_msg = "selection range: " + (row.line + 1).to_text() + ":" + (row.col + 1).to_text() + "-" + (end_line + 1).to_text() + ":" + (end_col + 1).to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _apply_all_lsp_selection_ranges() -> EditorAction:
+        if me.lsp_result_panel.title != "Selection Ranges" or me.lsp_result_panel.rows.len() == 0:
+            me.status_msg = "no selection range"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        var buffer = me.session.active_buffer()
+        if buffer == nil:
+            me.status_msg = "no file open"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        buffer.clear_selection_range()
+        var applied = 0
+        var i = 0
+        while i < me.lsp_result_panel.rows.len():
+            val row = me.lsp_result_panel.rows[i]
+            if row.icon == "selection":
+                val end_line = _editor_parse_i64(_editor_payload_part(row.command_payload, 0), row.line)
+                val end_col = _editor_parse_i64(_editor_payload_part(row.command_payload, 1), row.col)
+                buffer.add_selection_range(row.line, row.col, end_line, end_col)
+                applied = applied + 1
+            i = i + 1
+        me.session.update_active_buffer(buffer)
+        me.status_msg = "selection ranges applied: " + applied.to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _expand_lsp_selection_range() -> EditorAction:
+        if me.lsp_result_panel.title == "Selection Ranges" and me.lsp_result_panel.rows.len() > 0:
+            var buffer = me.session.active_buffer()
+            if buffer != nil and buffer.has_active_selection_range() and me.lsp_result_panel.selected < me.lsp_result_panel.rows.len() - 1:
+                me.lsp_result_panel = lsp_result_panel_select(me.lsp_result_panel, me.lsp_result_panel.selected + 1)
+            return me._apply_selected_lsp_selection_range()
+        return me._request_active_lsp_action("selection-ranges")
+
+    me _shrink_lsp_selection_range() -> EditorAction:
+        if me.lsp_result_panel.title != "Selection Ranges" or me.lsp_result_panel.rows.len() == 0:
+            me.status_msg = "no selection range"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if me.lsp_result_panel.selected > 0:
+            me.lsp_result_panel = lsp_result_panel_select(me.lsp_result_panel, me.lsp_result_panel.selected - 1)
+        me._apply_selected_lsp_selection_range()
+
+    me _lsp_push_current_location():
+        ctrl_lsp_push_current_location(me)
+
+    me _lsp_back() -> EditorAction:
+        ctrl_lsp_back(me)
+
+    me _open_markdown_link_under_cursor() -> EditorAction:
+        val doc = me.session.active_document()
+        var buffer = me.session.active_buffer()
+        if doc == nil or buffer == nil or doc.language_id != "markdown":
+            me.status_msg = "not a markdown file"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val content = md_buffer_content(buffer)
+        val raw_target = md_vim_open_link_under_cursor(content, buffer.cursor_row, buffer.cursor_col)
+        if raw_target == "":
+            me.status_msg = "no link under cursor"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        me._open_markdown_link_target(raw_target)
+
+    me _open_markdown_link_target(raw_target: text) -> EditorAction:
+        val doc = me.session.active_document()
+        if doc == nil or doc.language_id != "markdown":
+            me.status_msg = "not a markdown file"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if raw_target.starts_with("http://") or raw_target.starts_with("https://"):
+            me.status_msg = _editor_open_external_url_status(raw_target)
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val path = _editor_resolve_markdown_link_path(raw_target, doc.path(), me.session)
+        if path == "":
+            me.status_msg = "unresolved link: " + raw_target
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val parsed_target = md_wiki_parse_link_target(raw_target.trim())
+        val title = parsed_target.0.trim()
+        val should_create = _editor_markdown_link_should_create_note(raw_target, path)
+        if should_create:
+            val heading = if title == "" then md_wiki_title_from_path(path) else: title
+            val note_content = "# " + heading + "\n\n"
+            val written = rt_file_write_text(path, note_content)
+            if not written:
+                me.status_msg = "failed to create note: " + path
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+            me.vault_search_index = md_vault_search_index_apply_file_change(me.vault_search_index, path, note_content, 1)
+        var session_link = me.session
+        session_link.open_file(path)
+        me._replace_session(session_link)
+        ctrl_focus_lsp_target_path(me, path)
+        me.status_msg = if should_create then "created note: " + path else: "opened link: " + path
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _focus_lsp_target_doc(doc_id: EditorDocumentId):
+        ctrl_focus_lsp_target_doc(me, doc_id)
+
+    me _focus_lsp_target_path(path: text):
+        ctrl_focus_lsp_target_path(me, path)
+
+    me _dispatch_lsp_result_key(key: text) -> EditorAction:
+        if key == "j":
+            me.lsp_result_panel = lsp_result_panel_select(me.lsp_result_panel, me.lsp_result_panel.selected + 1)
+            if me.lsp_result_panel.title == "Signature Help":
+                me._refresh_lsp_hover_popup("signature-help")
+            me.status_msg = "lsp result selected"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if key == "k":
+            me.lsp_result_panel = lsp_result_panel_select(me.lsp_result_panel, me.lsp_result_panel.selected - 1)
+            if me.lsp_result_panel.title == "Signature Help":
+                me._refresh_lsp_hover_popup("signature-help")
+            me.status_msg = "lsp result selected"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if key == "i":
+            return me._request_selected_call_hierarchy_direction("incoming")
+        if key == "o":
+            return me._request_selected_call_hierarchy_direction("outgoing")
+        if key == " " or key == "h" or key == "l":
+            if me.lsp_result_panel.rows.len() == 0:
+                return EditorAction(redraw: false, quit: false, status_msg: me.status_msg)
+            val before = me.lsp_result_panel.rows[me.lsp_result_panel.selected]
+            if key == " " and me.lsp_result_panel.title == "Call Hierarchy" and before.icon == "call" and not before.expanded:
+                return me._request_selected_call_hierarchy_direction("incoming")
+            me.lsp_result_panel = lsp_result_panel_toggle_expanded(me.lsp_result_panel)
+            me.lsp_call_hierarchy_state = lsp_result_panel_call_state(me.lsp_result_panel)
+            me.lsp_call_hierarchy_state_title = me.lsp_result_panel.title
+            val row = me.lsp_result_panel.rows[me.lsp_result_panel.selected]
+            me.status_msg = if row.expanded then "lsp result expanded" else: "lsp result collapsed"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if key == "\r" or key == "\n":
+            if me.lsp_result_panel.title == "Selection Ranges":
+                return ctrl_apply_selected_lsp_selection_range(me)
+            if me.lsp_result_panel.title == "Code Actions":
+                val row = me.lsp_result_panel.rows[me.lsp_result_panel.selected]
+                if row.command_name == "quickfix-apply":
+                    return me._apply_code_action_at(row.command_payload.to_i64())
+                me.status_msg = "no quick fix selected"
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+            return ctrl_lsp_jump_selected(me)
+        EditorAction(redraw: false, quit: false, status_msg: me.status_msg)
+
+    me _dispatch_wiki_panel_key(key: text) -> EditorAction:
+        if key == "j":
+            me.wiki_panel = wiki_panel_select(me.wiki_panel, me.wiki_panel.selected + 1)
+            me.status_msg = "wiki result selected"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if key == "k":
+            me.wiki_panel = wiki_panel_select(me.wiki_panel, me.wiki_panel.selected - 1)
+            me.status_msg = "wiki result selected"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if key == "\r" or key == "\n":
+            return me._wiki_jump_selected()
+        EditorAction(redraw: false, quit: false, status_msg: me.status_msg)
+
+    me _wiki_jump_selected() -> EditorAction:
+        if me.wiki_panel.title == "Debug Launch Configs":
+            return me._debug_start_selected_launch_config()
+        if me.wiki_panel.title == "Debug Sessions":
+            if me.wiki_panel.rows.len() == 0:
+                me.status_msg = "no debug session"
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+            var debug_index = me.wiki_panel.selected
+            if debug_index < 0:
+                debug_index = 0
+            if debug_index >= me.wiki_panel.rows.len():
+                debug_index = me.wiki_panel.rows.len() - 1
+            val debug_session_id = me.wiki_panel.rows[debug_index].line
+            me.debug_registry = editor_debug_registry_select(me.debug_registry, debug_session_id)
+            val selected_debug_session = editor_debug_first_session(me.debug_registry)
+            if editor_debug_session_id(selected_debug_session) != debug_session_id:
+                me.status_msg = "debug session not found: " + debug_session_id.to_text()
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+            val debug_client_index = debug_session_id - 1
+            if debug_client_index >= 0 and debug_client_index < me.debug_dap_clients.len():
+                me.debug_dap_client = me.debug_dap_clients[debug_client_index]
+            me.debug_status = editor_debug_session_status(selected_debug_session)
+            me._show_debug_panel_direct("debug session: " + editor_debug_session_id(selected_debug_session).to_text())
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if me.wiki_panel.title == "Templates":
+            if me.wiki_panel.rows.len() == 0:
+                me.status_msg = "no template target"
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+            val template_detail = me.wiki_panel.rows[me.wiki_panel.selected].detail
+            return me._execute_template_insert(template_detail)
+        if me.wiki_panel.title == "Daily Notes":
+            if me.wiki_panel.rows.len() == 0:
+                me.status_msg = "no daily note target"
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+            val daily_detail = me.wiki_panel.rows[me.wiki_panel.selected].detail
+            return me._execute_daily_note_create(daily_detail)
+        if me.wiki_panel.title == "Attachment Picker":
+            if me.wiki_panel.rows.len() == 0:
+                me.status_msg = "no attachment target"
+                return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+            val picked_payload = me.wiki_panel.rows[me.wiki_panel.selected].detail
+            if _editor_payload_part(picked_payload, 1) != "":
+                return me._wiki_attachment_insert(picked_payload)
+        val path = wiki_panel_target_path(me.wiki_panel)
+        if path == "":
+            me.status_msg = "no wiki result target"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val line = wiki_panel_target_line(me.wiki_panel)
+        var session_jump = me.session
+        session_jump.open_file(path)
+        me._replace_session(session_jump)
+        ctrl_focus_lsp_target_path(me, path)
+        var buffer = me.session.active_buffer()
+        if buffer != nil:
+            buffer.move_cursor(line, 0)
+            me.session.update_active_buffer(buffer)
+        me.status_msg = "wiki jump: " + path + ":" + (line + 1).to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _dispatch_diagnostics_panel_key(key: text) -> EditorAction:
+        if key == "j":
+            me.diagnostics_panel = diagnostics_panel_select(me.diagnostics_panel, me.diagnostics_panel.selected + 1)
+            me.status_msg = "problem selected"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if key == "k":
+            me.diagnostics_panel = diagnostics_panel_select(me.diagnostics_panel, me.diagnostics_panel.selected - 1)
+            me.status_msg = "problem selected"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if key == "\r" or key == "\n":
+            return me._diagnostics_jump_selected()
+        EditorAction(redraw: false, quit: false, status_msg: me.status_msg)
+
+    me _dispatch_md_outline_key(key: text) -> EditorAction:
+        val doc = me.session.active_document()
+        if doc == nil or not doc.has_markdown_state():
+            return EditorAction(redraw: false, quit: false, status_msg: me.status_msg)
+        var outline = doc.md_state.outline
+        if key == "j":
+            outline = outline_panel_navigate(outline, 1)
+            doc.set_markdown_outline_panel(outline)
+            me.session.update_active_document(doc)
+            me.status_msg = "outline selected"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if key == "k":
+            outline = outline_panel_navigate(outline, -1)
+            doc.set_markdown_outline_panel(outline)
+            me.session.update_active_document(doc)
+            me.status_msg = "outline selected"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        if key == "\r" or key == "\n":
+            val line = outline_panel_target_line(outline)
+            var outline_buffer = doc.buffer
+            outline_buffer.move_cursor(line, 0)
+            me.session.update_active_buffer(outline_buffer)
+            me.status_msg = "outline jump: " + (line + 1).to_text()
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        EditorAction(redraw: false, quit: false, status_msg: me.status_msg)
+
+    me _diagnostics_jump_selected() -> EditorAction:
+        val path = diagnostics_panel_target_path(me.diagnostics_panel)
+        if path == "":
+            me.status_msg = "no diagnostic target"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val line = diagnostics_panel_target_line(me.diagnostics_panel)
+        val col = diagnostics_panel_target_col(me.diagnostics_panel)
+        var session_jump = me.session
+        session_jump.open_file(path)
+        me._replace_session(session_jump)
+        var buffer = me.session.active_buffer()
+        if buffer != nil:
+            buffer.move_cursor(line, col)
+            me.session.update_active_buffer(buffer)
+        me.status_msg = "problem jump: " + path + ":" + (line + 1).to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _request_active_completion() -> LspResponse:
+        if me.session.active_index < 0 or me.session.active_index >= me.session.documents.len() or me.session.active_index >= me.session.buffers.len():
+            return LspResponse(id: 0, ok: false, result_json: "", error_text: "no file open")
+        val doc = me.session.documents[me.session.active_index]
+        val buffer = me.session.buffers[me.session.active_index]
+        val content = md_buffer_content(buffer)
+        if doc.language_id == "markdown" or md_lsp_is_markdown_file(doc.path()):
+            if not me.md_lsp_state.running:
+                me.md_lsp_state = md_lsp_ensure_open(me.md_lsp_state, doc.path(), content)
+            val result = md_lsp_request(me.md_lsp_state, "completion", "", doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.md_lsp_state = result.0
+            return result.1
+        elif doc.language_id == "simple" or doc.language_id == "shell":
+            if not me.simple_lsp_state.running:
+                me.simple_lsp_state = simple_lsp_ensure_open(me.simple_lsp_state, doc.path(), content)
+            val simple_result = simple_lsp_request(me.simple_lsp_state, "completion", "", doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.simple_lsp_state = simple_result.0
+            return simple_result.1
+        else:
+            return LspResponse(id: 0, ok: false, result_json: "", error_text: "no active language server")
+
+    me _request_active_hover() -> LspResponse:
+        if me.session.active_index < 0 or me.session.active_index >= me.session.documents.len() or me.session.active_index >= me.session.buffers.len():
+            return LspResponse(id: 0, ok: false, result_json: "", error_text: "no file open")
+        val doc = me.session.documents[me.session.active_index]
+        val buffer = me.session.buffers[me.session.active_index]
+        val content = md_buffer_content(buffer)
+        if doc.language_id == "markdown":
+            if not me.md_lsp_state.running:
+                me.md_lsp_state = md_lsp_ensure_open(me.md_lsp_state, doc.path(), content)
+            val result = md_lsp_request(me.md_lsp_state, "hover", "", doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.md_lsp_state = result.0
+            return result.1
+        elif doc.language_id == "simple" or doc.language_id == "shell":
+            if not me.simple_lsp_state.running:
+                me.simple_lsp_state = simple_lsp_ensure_open(me.simple_lsp_state, doc.path(), content)
+            val simple_result = simple_lsp_request(me.simple_lsp_state, "hover", "", doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.simple_lsp_state = simple_result.0
+            return simple_result.1
+        else:
+            return LspResponse(id: 0, ok: false, result_json: "", error_text: "no active language server")
+
+    me _request_active_definition() -> LspResponse:
+        if me.session.active_index < 0 or me.session.active_index >= me.session.documents.len() or me.session.active_index >= me.session.buffers.len():
+            return LspResponse(id: 0, ok: false, result_json: "", error_text: "no file open")
+        val doc = me.session.documents[me.session.active_index]
+        val buffer = me.session.buffers[me.session.active_index]
+        val content = md_buffer_content(buffer)
+        if doc.language_id == "markdown":
+            if not me.md_lsp_state.running:
+                me.md_lsp_state = md_lsp_ensure_open(me.md_lsp_state, doc.path(), content)
+            val result = md_lsp_request(me.md_lsp_state, "definition", "", doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.md_lsp_state = result.0
+            return result.1
+        elif doc.language_id == "simple" or doc.language_id == "shell":
+            if not me.simple_lsp_state.running:
+                me.simple_lsp_state = simple_lsp_ensure_open(me.simple_lsp_state, doc.path(), content)
+            val simple_result = simple_lsp_request(me.simple_lsp_state, "definition", "", doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.simple_lsp_state = simple_result.0
+            return simple_result.1
+        else:
+            return LspResponse(id: 0, ok: false, result_json: "", error_text: "no active language server")
+
+    me _request_active_code_action() -> LspResponse:
+        if me.session.active_index < 0 or me.session.active_index >= me.session.documents.len() or me.session.active_index >= me.session.buffers.len():
+            return LspResponse(id: 0, ok: false, result_json: "", error_text: "no file open")
+        val doc = me.session.documents[me.session.active_index]
+        val buffer = me.session.buffers[me.session.active_index]
+        val content = md_buffer_content(buffer)
+        if doc.language_id == "markdown":
+            if not me.md_lsp_state.running:
+                me.md_lsp_state = md_lsp_ensure_open(me.md_lsp_state, doc.path(), content)
+            val result = md_lsp_request(me.md_lsp_state, "code-action", "", doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.md_lsp_state = result.0
+            return result.1
+        elif doc.language_id == "simple" or doc.language_id == "shell":
+            if not me.simple_lsp_state.running:
+                me.simple_lsp_state = simple_lsp_ensure_open(me.simple_lsp_state, doc.path(), content)
+            val simple_result = simple_lsp_request(me.simple_lsp_state, "code-action", "", doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.simple_lsp_state = simple_result.0
+            return simple_result.1
+        else:
+            return LspResponse(id: 0, ok: false, result_json: "", error_text: "no active language server")
+
+    me _notify_lsp_file_changed(path: text, change_type: i64) -> EditorAction:
+        me.vault_search_index = md_vault_search_index_apply_file_change(me.vault_search_index, path, rt_file_read_text(path) ?? "", change_type)
+        var notified = false
+        if me.md_lsp_state.running:
+            me.md_lsp_state = md_lsp_notify_watched_file(me.md_lsp_state, path, change_type)
+            notified = true
+        if me.simple_lsp_state.running:
+            me.simple_lsp_state = simple_lsp_notify_watched_file(me.simple_lsp_state, path, change_type)
+            notified = true
+        if notified:
+            me.status_msg = "lsp file change notified"
+        else:
+            me.status_msg = "no active language server"
+        EditorAction(redraw: false, quit: false, status_msg: me.status_msg)
+
+    me _refresh_open_document_from_disk_batch(path: text, content: text):
+        var docs: [EditorDocument] = []
+        var i = 0
+        while i < me.session.documents.len():
+            var doc = me.session.documents[i]
+            if doc.path() == path:
+                var buffer = doc.buffer
+                buffer.replace_content(content)
+                buffer.dirty = false
+                doc.buffer = buffer
+                if doc.language_id == "markdown":
+                    md_update_preview(doc, buffer)
+            docs.push(doc)
+            i = i + 1
+        me.session.documents = docs
+        var buffers: [EditorBuffer] = []
+        var j = 0
+        while j < me.session.buffers.len():
+            var open_buffer = me.session.buffers[j]
+            if open_buffer.path == path:
+                open_buffer.replace_content(content)
+                open_buffer.dirty = false
+            buffers.push(open_buffer)
+            j = j + 1
+        me.session.buffers = buffers
+
+    me _notify_lsp_workspace_folder(path: text, name: text, added: bool) -> EditorAction:
+        var notified = false
+        if me.md_lsp_state.running:
+            me.md_lsp_state = md_lsp_notify_workspace_folder(me.md_lsp_state, path, name, added)
+            notified = true
+        if me.simple_lsp_state.running:
+            me.simple_lsp_state = simple_lsp_notify_workspace_folder(me.simple_lsp_state, path, name, added)
+            notified = true
+        if added:
+            me._rebuild_workspace_symbol_index(path)
+        if notified:
+            me.status_msg = "lsp workspace folder notified"
+        else:
+            me.status_msg = "no active language server"
+        EditorAction(redraw: false, quit: false, status_msg: me.status_msg)
+
+    me _request_active_rename(new_name: text) -> LspResponse:
+        val doc = me.session.active_document()
+        var buffer = me.session.active_buffer()
+        if doc == nil or buffer == nil:
+            return LspResponse(id: 0, ok: false, result_json: "", error_text: "no file open")
+        val content = md_buffer_content(buffer)
+        if doc.language_id == "markdown" or md_lsp_is_markdown_file(doc.path()):
+            if not me.md_lsp_state.running:
+                me.md_lsp_state = md_lsp_ensure_open(me.md_lsp_state, doc.path(), content)
+            val result = md_lsp_request(me.md_lsp_state, "rename", new_name, doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.md_lsp_state = result.0
+            return result.1
+        if doc.language_id == "simple" or doc.language_id == "shell" or simple_lsp_is_simple_file(doc.path()):
+            if not me.simple_lsp_state.running:
+                me.simple_lsp_state = simple_lsp_ensure_open(me.simple_lsp_state, doc.path(), content)
+            val simple_result = simple_lsp_request(me.simple_lsp_state, "rename", new_name, doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.simple_lsp_state = simple_result.0
+            return simple_result.1
+        LspResponse(id: 0, ok: false, result_json: "", error_text: "no active language server")
+
+    me _request_call_hierarchy_direction(direction: text, item_json: text) -> LspResponse:
+        val doc = me.session.active_document()
+        var buffer = me.session.active_buffer()
+        if doc == nil or buffer == nil:
+            return LspResponse(id: 0, ok: false, result_json: "", error_text: "no file open")
+        val content = md_buffer_content(buffer)
+        val request_kind = if direction == "outgoing" then "call-hierarchy-outgoing" else: "call-hierarchy-incoming"
+        if doc.language_id == "markdown":
+            if not me.md_lsp_state.running:
+                me.md_lsp_state = md_lsp_ensure_open(me.md_lsp_state, doc.path(), content)
+            val result = md_lsp_request(me.md_lsp_state, request_kind, item_json, doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.md_lsp_state = result.0
+            return result.1
+        if doc.language_id == "simple" or doc.language_id == "shell":
+            if not me.simple_lsp_state.running:
+                me.simple_lsp_state = simple_lsp_ensure_open(me.simple_lsp_state, doc.path(), content)
+            val simple_result = simple_lsp_request(me.simple_lsp_state, request_kind, item_json, doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.simple_lsp_state = simple_result.0
+            return simple_result.1
+        LspResponse(id: 0, ok: false, result_json: "", error_text: "no active language server")
+
+    me _request_code_lens_resolve(item_json: text) -> LspResponse:
+        val doc = me.session.active_document()
+        var buffer = me.session.active_buffer()
+        if doc == nil or buffer == nil:
+            return LspResponse(id: 0, ok: false, result_json: "", error_text: "no file open")
+        val content = md_buffer_content(buffer)
+        if doc.language_id == "markdown":
+            if not me.md_lsp_state.running:
+                me.md_lsp_state = md_lsp_ensure_open(me.md_lsp_state, doc.path(), content)
+            val result = md_lsp_request(me.md_lsp_state, "code-lens-resolve", item_json, doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.md_lsp_state = result.0
+            return result.1
+        if doc.language_id == "simple" or doc.language_id == "shell":
+            if not me.simple_lsp_state.running:
+                me.simple_lsp_state = simple_lsp_ensure_open(me.simple_lsp_state, doc.path(), content)
+            val simple_result = simple_lsp_request(me.simple_lsp_state, "code-lens-resolve", item_json, doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.simple_lsp_state = simple_result.0
+            return simple_result.1
+        LspResponse(id: 0, ok: false, result_json: "", error_text: "no active language server")
+
+    me _request_active_lsp(kind: text) -> LspResponse:
+        me._request_active_lsp_with_payload(kind, "")
+
+    me _request_active_lsp_with_payload(kind: text, payload: text) -> LspResponse:
+        if me.session.active_index < 0 or me.session.active_index >= me.session.documents.len() or me.session.active_index >= me.session.buffers.len():
+            return LspResponse(id: 0, ok: false, result_json: "", error_text: "no file open")
+        val doc = me.session.documents[me.session.active_index]
+        val buffer = me.session.buffers[me.session.active_index]
+        val content = md_buffer_content(buffer)
+        if doc.language_id == "markdown":
+            if not me.md_lsp_state.running:
+                me.md_lsp_state = md_lsp_ensure_open(me.md_lsp_state, doc.path(), content)
+            val result = md_lsp_request(me.md_lsp_state, kind, payload, doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.md_lsp_state = result.0
+            return result.1
+        if doc.language_id == "simple" or doc.language_id == "shell" or simple_lsp_is_simple_file(doc.path()):
+            if not me.simple_lsp_state.running:
+                me.simple_lsp_state = simple_lsp_ensure_open(me.simple_lsp_state, doc.path(), content)
+            val simple_result = simple_lsp_request(me.simple_lsp_state, kind, payload, doc.path(), buffer.cursor_row, buffer.cursor_col)
+            me.simple_lsp_state = simple_result.0
+            return simple_result.1
+        LspResponse(id: 0, ok: false, result_json: "", error_text: "no active language server")
+
+    me _execute_markdown_extension_command(command_name: text) -> EditorAction:
+        ctrl_execute_markdown_extension_command(me, command_name)
+
+    me _fold_all_active_document() -> EditorAction:
+        var buffer = me.session.active_buffer()
+        if buffer == nil:
+            me.status_msg = "no file open"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        buffer.clear_folds()
+        var folded_count = 0
+        var line = 0
+        while line < buffer.line_count():
+            val level = _editor_markdown_heading_level(buffer.line_at(line))
+            if level > 0:
+                var end_line = buffer.line_count() - 1
+                var scan = line + 1
+                while scan < buffer.line_count():
+                    val scan_level = _editor_markdown_heading_level(buffer.line_at(scan))
+                    if scan_level > 0 and scan_level <= level:
+                        end_line = scan - 1
+                        scan = buffer.line_count()
+                    else:
+                        scan = scan + 1
+                if end_line > line:
+                    buffer.fold_range(line, end_line)
+                    folded_count = folded_count + 1
+            line = line + 1
+        me.session.update_active_buffer(buffer)
+        me.status_msg = "folded " + folded_count.to_text() + " ranges"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _unfold_all_active_document() -> EditorAction:
+        var buffer = me.session.active_buffer()
+        if buffer == nil:
+            me.status_msg = "no file open"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        buffer.clear_folds()
+        me.session.update_active_buffer(buffer)
+        me.status_msg = "unfolded all"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _toggle_active_markdown_fold() -> EditorAction:
+        var buffer = me.session.active_buffer()
+        if buffer == nil:
+            me.status_msg = "no file open"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val content = md_buffer_content(buffer)
+        val range = md_vim_toggle_fold_heading(content, buffer.cursor_row)
+        val start_line = range.0
+        val end_line = range.1
+        if end_line <= start_line:
+            me.status_msg = "no foldable section"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        buffer.toggle_fold_range(start_line, end_line)
+        val folded = buffer.has_fold_range(start_line, end_line)
+        me.session.update_active_buffer(buffer)
+        me.status_msg = if folded then "folded section" else: "unfolded section"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _activate_active_language():
+        if me.session.active_index < 0 or me.session.active_index >= me.session.documents.len() or me.session.active_index >= me.session.buffers.len():
+            return
+        val doc = me.session.documents[me.session.active_index]
+        me.extension_host.activate_language(doc.language_id)
+        me.extension_host.emit_event("onDidOpenTextDocument", doc.path())
+        me.extension_host.emit_event("onLanguage:" + doc.language_id, doc.path())
+        val buffer = me.session.buffers[me.session.active_index]
+        val content = md_buffer_content(buffer)
+        if doc.language_id == "markdown":
+            me.md_lsp_state = md_lsp_ensure_open(me.md_lsp_state, doc.path(), content)
+        elif doc.language_id == "simple" or doc.language_id == "shell":
+            me.simple_lsp_state = simple_lsp_ensure_open(me.simple_lsp_state, doc.path(), content)
+        me.file_watcher.watch(doc.path())
+        me.file_watcher.watch_parent_directory(doc.path())
+        ctrl_poll_lsp_diagnostics(me)
+
+    me _configure_file_watcher_policy(poll_interval_ms: i64, ignore_globs: [text]) -> EditorAction:
+        ctrl_configure_file_watcher_policy(me, poll_interval_ms, ignore_globs)
+
+    me _poll_file_watcher() -> EditorAction:
+        val events = me.file_watcher.check_events()
+        me._apply_file_watch_events(events)
+
+    me _poll_file_watcher_after(elapsed_ms: i64) -> EditorAction:
+        val events = me.file_watcher.check_events_debounced(elapsed_ms)
+        me._apply_file_watch_events(events)
+
+    me _apply_file_watch_events(events: [FileWatchEvent]) -> EditorAction:
+        if events.len() == 0:
+            return EditorAction(redraw: false, quit: false, status_msg: me.status_msg)
+        var i = 0
+        while i < events.len():
+            val event = events[i]
+            val path = event.path
+            val content = rt_file_read_text(path) ?? ""
+            if event.change_type != 3:
+                me._refresh_open_document_from_disk_batch(path, content)
+            me._notify_lsp_file_changed(path, event.change_type)
+            i = i + 1
+        me.status_msg = "file changes notified: " + events.len().to_text()
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _notify_active_lsp_changed():
+        val doc = me.session.active_document()
+        var buffer = me.session.active_buffer()
+        if doc == nil or buffer == nil:
+            return
+        val should_refresh_inlay_hints = buffer.has_inlay_hints() or me.lsp_result_panel.title == "Inlay Hints"
+        val content = md_buffer_content(buffer)
+        buffer.clear_inlay_hints()
+        buffer.clear_semantic_tokens()
+        buffer.clear_code_lenses()
+        me.session.update_active_buffer(buffer)
+        me.diagnostic_store.clear_diagnostics(doc.path())
+        if me.session.dock_layout.active_right_panel() == "problems":
+            me._refresh_diagnostics_panel_view()
+        if doc.language_id == "markdown" and me.md_lsp_state.running:
+            me.md_lsp_state = md_lsp_change_active(me.md_lsp_state, doc.path(), content)
+        elif (doc.language_id == "simple" or doc.language_id == "shell") and me.simple_lsp_state.running:
+            me.simple_lsp_state = simple_lsp_change_active(me.simple_lsp_state, doc.path(), content)
+        if should_refresh_inlay_hints:
+            me._schedule_inlay_hint_refresh()
+        me._poll_lsp_diagnostics()
+
+    me _schedule_inlay_hint_refresh():
+        me.pending_inlay_hint_refresh = true
+        me.inlay_hint_refresh_elapsed_ms = 0
+        me.lsp_result_panel = lsp_result_panel_pending("inlay-hints", 0)
+
+    me _cancel_pending_inlay_hint_refresh():
+        me.pending_inlay_hint_refresh = false
+        me.inlay_hint_refresh_elapsed_ms = 0
+
+    me _poll_inlay_hint_refresh_after(elapsed_ms: i64) -> EditorAction:
+        if not me.pending_inlay_hint_refresh:
+            return EditorAction(redraw: false, quit: false, status_msg: me.status_msg)
+        me.inlay_hint_refresh_elapsed_ms = me.inlay_hint_refresh_elapsed_ms + elapsed_ms
+        if me.inlay_hint_refresh_elapsed_ms < me.inlay_hint_refresh_delay_ms:
+            return EditorAction(redraw: false, quit: false, status_msg: me.status_msg)
+        me._cancel_pending_inlay_hint_refresh()
+        me._refresh_active_inlay_hints_after_change()
+        me.status_msg = "inlay hints refreshed"
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _refresh_active_inlay_hints_after_change():
+        val response: LspResponse = me._request_active_lsp("inlay-hints")
+        if not response.ok:
+            return
+        me.lsp_result_panel = lsp_result_panel_from_response("inlay-hints", response)
+        if response.result_json != "":
+            me._apply_lsp_inlay_hints_result(response.result_json)
+
+    me _start_markdown_lsp_for_active(path: text, content: text):
+        ctrl_start_markdown_lsp_for_active(me, path, content)
+
+    me _start_simple_lsp_for_active(path: text, content: text):
+        ctrl_start_simple_lsp_for_active(me, path, content)
+
+    me _poll_lsp_diagnostics():
+        var changed = false
+        if me.md_lsp_state.running:
+            val md_result = md_lsp_poll_all_notifications(me.md_lsp_state)
+            me.md_lsp_state = md_result.0
+            val md_notifications: [LspNotification] = md_result.1
+            for n in md_notifications:
+                if n.method == "textDocument/publishDiagnostics":
+                    me.diagnostic_store = diagnostics_store_with_publish(me.diagnostic_store, n.params_json)
+                    changed = true
+        if me.simple_lsp_state.running:
+            val simple_result = simple_lsp_poll_all_notifications(me.simple_lsp_state)
+            me.simple_lsp_state = simple_result.0
+            val simple_notifications: [LspNotification] = simple_result.1
+            for sn in simple_notifications:
+                if sn.method == "textDocument/publishDiagnostics":
+                    me.diagnostic_store = diagnostics_store_with_publish(me.diagnostic_store, sn.params_json)
+                    changed = true
+        if changed:
+            me._refresh_diagnostics_panel_view()
+
+    me _poll_lsp_results() -> EditorAction:
+        ctrl_poll_lsp_results(me)
+
+    me _refresh_lsp_results() -> bool:
+        var updated = false
+        if me.md_lsp_state.running:
+            var md_client = me.md_lsp_state.client
+            val md_poll = ctrl_lsp_drain_completed_responses(md_client)
+            md_client = md_poll.0
+            val md_responses = md_poll.1
+            me.md_lsp_state = MdLspState(client: md_client, running: me.md_lsp_state.running, version: me.md_lsp_state.version)
+            for response in md_responses:
+                if me._hydrate_lsp_result_response(response):
+                    updated = true
+        if me.simple_lsp_state.running:
+            var simple_client = me.simple_lsp_state.client
+            val simple_poll = ctrl_lsp_drain_completed_responses(simple_client)
+            simple_client = simple_poll.0
+            val simple_responses = simple_poll.1
+            me.simple_lsp_state = SimpleLspState(client: simple_client, running: me.simple_lsp_state.running, version: me.simple_lsp_state.version)
+            for simple_response in simple_responses:
+                if me._hydrate_lsp_result_response(simple_response):
+                    updated = true
+        updated
+
+    me _hydrate_lsp_result_json(method: text, json: text) -> bool:
+        ctrl_hydrate_lsp_result_json(me, method, json)
+
+    me _hydrate_lsp_result_response(completed: LspCompletedResponse) -> bool:
+        var method = completed.method
+        if method == "":
+            method = ctrl_infer_lsp_completed_method(me, completed.id)
+        if method == "textDocument/rename":
+            var response = LspResponse(id: completed.id, ok: completed.ok, result_json: completed.result_json, error_text: completed.error_text)
+            if response.result_json == "" and completed.raw_json != "":
+                response = lsp_response_from_json(completed.raw_json)
+            if not response.ok:
+                me.status_msg = response.error_text
+                return true
+            if response.result_json == "":
+                return false
+            if me.lsp_result_panel.pending and me.lsp_result_panel.request_id == completed.id and me.lsp_result_panel.title == "Rename Preview":
+                me._show_workspace_edit_preview(response.result_json, "rename")
+                return true
+            me._apply_workspace_edit_result(response.result_json, "rename")
+            me.status_msg = "applied: rename"
+            me.pending_workspace_edit_title = ""
+            return true
+        if method == "textDocument/formatting" or method == "textDocument/rangeFormatting":
+            var response = LspResponse(id: completed.id, ok: completed.ok, result_json: completed.result_json, error_text: completed.error_text)
+            if response.result_json == "" and completed.raw_json != "":
+                response = lsp_response_from_json(completed.raw_json)
+            if not response.ok:
+                me.status_msg = response.error_text
+                return true
+            if response.result_json == "":
+                return false
+            val title = if method == "textDocument/rangeFormatting" then "range formatting" else: "formatting"
+            val preview_title = if method == "textDocument/rangeFormatting" then "Range Formatting Preview" else: "Formatting Preview"
+            if me.lsp_result_panel.pending and me.lsp_result_panel.request_id == completed.id and me.lsp_result_panel.title == preview_title:
+                me._show_workspace_edit_preview(response.result_json, title)
+                return true
+            if me.format_save_request_id == completed.id:
+                me._apply_workspace_edit_result(response.result_json, title)
+                me.format_save_request_id = 0
+                me.format_save_title = ""
+                val saved = me.session.save_active()
+                if saved:
+                    me.status_msg = "applied and saved: " + title
+                else:
+                    me.status_msg = "applied: " + title + " (save failed)"
+                return true
+            me._apply_workspace_edit_result(response.result_json, title)
+            me.status_msg = "applied: " + title
+            me.pending_workspace_edit_title = ""
+            return true
+        if me.lsp_result_panel.pending and completed.id == me.lsp_result_panel.request_id and me.lsp_result_panel.title == "Code Actions":
+            var response = LspResponse(id: completed.id, ok: completed.ok, result_json: completed.result_json, error_text: completed.error_text)
+            if response.result_json == "" and completed.raw_json != "":
+                response = lsp_response_from_json(completed.raw_json)
+            if response.ok and response.result_json != "":
+                me.code_actions = _editor_code_actions_from_response(response.result_json)
+                me.lsp_result_panel = ctrl_code_action_result_panel(me, response.id)
+                me._refresh_lsp_hover_popup("code-action")
+                return true
+        if not me.lsp_result_panel.pending:
+            return false
+        if completed.id != me.lsp_result_panel.request_id:
+            return false
+        var kind = _editor_lsp_method_to_kind(method)
+        if kind == "":
+            kind = _editor_lsp_kind_from_panel_title(me.lsp_result_panel.title)
+        if not _editor_lsp_kind_has_panel(kind):
+            return false
+        var response = LspResponse(id: completed.id, ok: completed.ok, result_json: completed.result_json, error_text: completed.error_text)
+        if response.result_json == "" and completed.raw_json != "":
+            response = lsp_response_from_json(completed.raw_json)
+        if kind == "code-action":
+            if response.ok and response.result_json != "":
+                me.code_actions = _editor_code_actions_from_response(response.result_json)
+                me.lsp_result_panel = ctrl_code_action_result_panel(me, response.id)
+                me._refresh_lsp_hover_popup(kind)
+                return true
+            if response.ok:
+                me.lsp_result_panel = lsp_result_panel_pending(kind, response.id)
+                me._refresh_lsp_hover_popup(kind)
+                return false
+        me._set_lsp_result_panel_from_response(kind, response)
+        if kind == "folding-ranges" and response.ok and response.result_json != "":
+            me._apply_lsp_folding_ranges_result(response.result_json)
+        if kind == "inlay-hints" and response.ok and response.result_json != "":
+            me._apply_lsp_inlay_hints_result(response.result_json)
+        if kind == "semantic-tokens" and response.ok and response.result_json != "":
+            me._apply_lsp_semantic_tokens_result(response.result_json)
+        if (kind == "code-lens" or kind == "code-lens-resolve") and response.ok and response.result_json != "":
+            me._apply_lsp_code_lens_panel()
+        if kind == "document-symbols" and response.ok and response.result_json != "":
+            me._apply_lsp_document_symbols_outline()
+        me._refresh_lsp_hover_popup(kind)
+        return true
+
+    me _apply_lsp_document_symbols_outline():
+        val active_id = me.session.active_doc_id()
+        var docs: [EditorDocument] = []
+        var changed = false
+        var i = 0
+        while i < me.session.documents.len():
+            var doc = me.session.documents[i]
+            if doc.doc_id().int_value() == active_id.int_value():
+                var items: [OutlineItem] = []
+                for row in me.lsp_result_panel.rows:
+                    if row.icon == "symbol":
+                        items.push(OutlineItem(kind: "symbol", label: row.label, line: row.line, depth: row.depth))
+                if items.len() > 0:
+                    doc.set_markdown_outline_panel(outline_panel_from_items(items))
+                    changed = true
+            docs.push(doc)
+            i = i + 1
+        if changed:
+            me.session.documents = docs
+            me._show_right_dock("md-outline")
+
+    me _apply_lsp_folding_ranges_result(result_json: text):
+        var buffer = me.session.active_buffer()
+        if buffer == nil:
+            return
+        buffer.clear_folds()
+        var cursor = 0
+        while cursor < result_json.len():
+            val slice = result_json.slice(cursor, result_json.len())
+            val relative = _editor_find_text(slice, "\"startLine\"")
+            if relative < 0:
+                me.session.update_active_buffer(buffer)
+                return
+            val range_json = result_json.slice(cursor + relative, result_json.len())
+            val start_line = _editor_json_number_field(range_json, "\"startLine\"")
+            val end_line = _editor_json_number_field(range_json, "\"endLine\"")
+            buffer.fold_range(start_line, end_line)
+            cursor = cursor + relative + 11
+        me.session.update_active_buffer(buffer)
+
+    me _apply_lsp_semantic_tokens_result(result_json: text):
+        ctrl_apply_lsp_semantic_tokens_result(me, result_json)
+
+    me _apply_lsp_inlay_hints_result(result_json: text):
+        var buffer = me.session.active_buffer()
+        if buffer == nil:
+            return
+        buffer.clear_inlay_hints()
+        var cursor = 0
+        while cursor < result_json.len():
+            val slice = result_json.slice(cursor, result_json.len())
+            val relative = _editor_find_text(slice, "\"position\"")
+            if relative < 0:
+                me.session.update_active_buffer(buffer)
+                return
+            val hint_json = result_json.slice(cursor + relative, result_json.len())
+            val line = _editor_json_number_field(hint_json, "\"line\"")
+            val col = _editor_json_number_field(hint_json, "\"character\"")
+            val label = _editor_json_string_field(hint_json, "\"label\"")
+            buffer.add_inlay_hint(line, col, label)
+            cursor = cursor + relative + 10
+        me.session.update_active_buffer(buffer)
+
+    me _apply_lsp_code_lens_panel():
+        var buffer = me.session.active_buffer()
+        if buffer == nil:
+            return
+        buffer.clear_code_lenses()
+        for row in me.lsp_result_panel.rows:
+            if row.icon == "lens":
+                buffer.add_code_lens(row.line, row.label, row.command_name, row.command_payload)
+        me.session.update_active_buffer(buffer)
+
+    me _apply_workspace_edit_result(edit_json: text, title: text) -> EditorAction:
+        var buffer = me.session.active_buffer()
+        if buffer == nil:
+            me.status_msg = "no file open"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val doc = me.session.active_document()
+        val doc_path = if doc == nil then "" else: doc.path()
+        val applied = _editor_apply_code_action_content(buffer, doc_path, edit_json)
+        if not applied.applied:
+            me.status_msg = title + " has no editable change"
+            return EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+        val extra_file_edits = if edit_json.contains("\"changes\"") then me._apply_workspace_edit_extra_paths(doc_path, edit_json) else: 0
+        buffer.push_undo_snapshot()
+        buffer.replace_content(applied.content)
+        buffer.dirty = true
+        buffer.move_cursor(applied.line, applied.col)
+        me.session.update_active_buffer(buffer)
+        me._replace_open_document_buffer(doc_path, buffer)
+        if doc != nil and doc.language_id == "markdown":
+            me._update_markdown_preview(doc, buffer)
+        if extra_file_edits > 0:
+            me.status_msg = "applied: " + title + " (" + extra_file_edits.to_text() + " file edits)"
+        else:
+            me.status_msg = "applied: " + title
+        EditorAction(redraw: true, quit: false, status_msg: me.status_msg)
+
+    me _apply_workspace_edit_extra_paths(active_path: text, edit_json: text) -> i64:
+        ctrl_apply_workspace_edit_extra_paths(me, active_path, edit_json)
+
+    me _replace_open_document_buffer(path: text, buffer: EditorBuffer):
+        ctrl_replace_open_document_buffer(me, path, buffer)
+
+    me _update_markdown_preview(doc: EditorDocument, buffer: EditorBuffer):
+        ctrl_update_markdown_preview(me, doc, buffer)
+
+    me _toggle_md_preview():
+        ctrl_toggle_md_preview(me)
+
+    me _toggle_md_outline():
+        val doc = me.session.active_document()
+        if doc == nil or doc.language_id != "markdown":
+            me.status_msg = "not a markdown file"
+            return
+        var buffer = me.session.active_buffer()
+        val content = if buffer == nil then "" else: md_buffer_content(buffer)
+        val visible = doc.toggle_markdown_outline(content)
+        if visible:
+            me._show_right_dock("md-outline")
+            me.status_msg = "outline on"
+        else:
+            if not doc.markdown_preview_visible():
+                var layout = me.session.dock_layout
+                layout.hide_right()
+                me.session.dock_layout = layout
+            me.status_msg = "outline off"
+        me.session.update_active_document(doc)

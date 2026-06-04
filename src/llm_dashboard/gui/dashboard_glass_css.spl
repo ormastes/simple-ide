@@ -1,0 +1,137 @@
+# Dashboard Glass CSS
+#
+# Stitch glassmorphism CSS for the LLM Agent Dashboard.
+# Applies SimpleOS Obsidian dark token palette plus dashboard class
+# bindings, replacing ad-hoc inline CSS in html_views.spl.
+#
+# Token source: doc/05_design/stitch_design_system.md (SimpleOS Obsidian dark)
+# Accent override: obsidian_dark uses #C6C6C8; this module overrides
+# --accent to #0A84FF (iOS/macOS blue) for dashboard vibrancy.
+
+use common.ui.glass_css.{generate_glass_css}
+
+fn generate_dashboard_glass_css() -> text:
+    """Return Stitch obsidian-dark CSS + LLM dashboard class overrides."""
+    val glass = generate_glass_css("glass_obsidian_dark")
+    val overrides = """
+
+/* === LLM Dashboard: Stitch Obsidian Dark overrides === */
+/* Override accent to iOS blue for dashboard vibrancy */
+:root {
+    --accent: #0A84FF;
+    --glass-accent: #0A84FF;
+    --glass-accent-hover: #409CFF;
+}
+
+/* Base */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: var(--glass-font-body, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
+    background: var(--surface-0, #12121F);
+    color: var(--text, rgba(255,255,255,0.92));
+    padding-bottom: 40px;
+    min-height: 100vh;
+}
+
+.dashboard-container { padding: 8px; }
+
+.dashboard-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border, rgba(255,255,255,0.10));
+    margin-bottom: 8px;
+    background: var(--glass-surface-primary, rgba(18,18,31,0.72));
+    backdrop-filter: blur(var(--glass-blur-nav, 16px));
+    -webkit-backdrop-filter: blur(var(--glass-blur-nav, 16px));
+}
+
+.dashboard-header h1 {
+    font-size: 18px;
+    color: var(--accent, #0A84FF);
+}
+
+.refresh-status {
+    font-size: 12px;
+    color: var(--muted, rgba(255,255,255,0.62));
+}
+
+.main-content {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+    align-items: flex-start;
+}
+
+.left-panel { flex: 2; }
+.right-panel { flex: 1; }
+.left-panel, .right-panel { min-width: 0; }
+
+.right-panel h3, .bottom-panel h3 {
+    font-size: 14px;
+    color: var(--muted, rgba(255,255,255,0.62));
+    margin-bottom: 4px;
+}
+
+.bottom-panel {
+    margin-bottom: 48px;
+    min-width: 0;
+}
+
+@media (max-width: 1100px) {
+    .main-content { flex-direction: column; }
+    .left-panel, .right-panel { width: 100%; }
+}
+
+@media (max-width: 720px) {
+    .dashboard-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 4px;
+        padding: 8px 12px;
+    }
+    .dashboard-header h1 { font-size: 16px; }
+}
+
+/* Tab Bar */
+.tab-bar { display: flex; gap: 4px; }
+.tab-btn {
+    background: transparent;
+    border: 1px solid var(--border, rgba(255,255,255,0.10));
+    color: var(--muted, rgba(255,255,255,0.62));
+    padding: 4px 14px;
+    border-radius: var(--glass-radius-sm, 12px);
+    font-size: 13px;
+    cursor: pointer;
+    transition: all var(--glass-duration-fast, 150ms) var(--glass-easing, ease);
+}
+.tab-btn:hover {
+    color: var(--text, rgba(255,255,255,0.92));
+    border-color: var(--accent, #0A84FF);
+}
+.tab-btn.active {
+    background: var(--accent, #0A84FF);
+    color: #fff;
+    border-color: var(--accent, #0A84FF);
+}
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+/* Terminal stub */
+.terminal-shell {
+    padding: 20px;
+    color: var(--text, rgba(255,255,255,0.92));
+}
+.terminal-shell h2 {
+    margin: 0 0 12px 0;
+    font-size: 1rem;
+    color: var(--accent, #0A84FF);
+}
+.terminal-note {
+    margin: 0 0 10px 0;
+    color: var(--muted, rgba(255,255,255,0.62));
+    line-height: 1.5;
+}
+"""
+    return glass + overrides

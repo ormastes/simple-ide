@@ -1,0 +1,277 @@
+# Execution Strategy Selection
+#
+# Determines execution mode based on test file path, profile, and configuration.
+# Supports hybrid execution: native, process, safe, container, container-sequential.
+
+use std.test_runner.test_runner_types.{TestOptions, TestLevel, TestExecutionMode, OutputFormat}
+use std.io.{env_get}
+
+# =========================================================================
+# Execution Mode Enum
+# =========================================================================
+
+enum ExecutionMode:
+    Native              # Direct process execution (no isolation)
+    Process             # Process with ulimit enforcement
+    Safe                # Process with timeout + ulimit (current safe mode)
+    Container           # Docker/Podman container isolation
+    ContainerSequential # Sequential container (max isolation)
+
+# =========================================================================
+# Execution Strategy
+# =========================================================================
+
+class ExecutionStrategy:
+    mode: text               # "native", "process", "safe", "container", "container_seq"
+    profile_name: text       # "fast", "standard", "slow", "intensive", "critical"
+    container_image: text
+    container_runtime: text  # "docker", "podman", or "auto"
+    memory_mb: i64
+    cpu_cores: f64
+    timeout_sec: i64
+
+impl ExecutionStrategy:
+    static fn create_native() -> ExecutionStrategy:
+        ExecutionStrategy(
+            mode: "native",
+            profile_name: "fast",
+            container_image: "",
+            container_runtime: "",
+            memory_mb: 256,
+            cpu_cores: 1.0,
+            timeout_sec: 60
+        )
+
+    static fn create_process() -> ExecutionStrategy:
+        ExecutionStrategy(
+            mode: "process",
+            profile_name: "standard",
+            container_image: "",
+            container_runtime: "",
+            memory_mb: 512,
+            cpu_cores: 1.0,
+            timeout_sec: 300
+        )
+
+    static fn create_safe() -> ExecutionStrategy:
+        ExecutionStrategy(
+            mode: "safe",
+            profile_name: "standard",
+            container_image: "",
+            container_runtime: "",
+            memory_mb: 512,
+            cpu_cores: 1.0,
+            timeout_sec: 300
+        )
+
+    static fn create_container() -> ExecutionStrategy:
+        ExecutionStrategy(
+            mode: "container",
+            profile_name: "slow",
+            container_image: "simple-test-isolation:latest",
+            container_runtime: "auto",
+            memory_mb: 512,
+            cpu_cores: 1.0,
+            timeout_sec: 600
+        )
+
+    static fn create_container_sequential() -> ExecutionStrategy:
+        ExecutionStrategy(
+            mode: "container_seq",
+            profile_name: "intensive",
+            container_image: "simple-test-isolation:latest",
+            container_runtime: "auto",
+            memory_mb: 512,
+            cpu_cores: 1.0,
+            timeout_sec: 1800
+        )
+
+# =========================================================================
+# Test File Categorization
+# =========================================================================
+
+fn categorize_test_file(test_file: text) -> text:
+    """
+    Categorize a test file based on its path.
+
+    Args:
+        test_file: Path to test file
+
+    Returns: Category string (qemu, baremetal, database, integration, unit, other)
+    """
+    if test_file.contains("/qemu/") or test_file.contains("/emulator/"):
+        return "qemu"
+    if test_file.contains("/baremetal/") or test_file.contains("/kernel/"):
+        return "baremetal"
+    val db_cond1 = test_file.contains("/database/")
+    val db_cond2 = test_file.contains("/lib/database/")
+    if db_cond1 or db_cond2:
+        return "database"
+    if test_file.contains("/integration/"):
+        return "integration"
+    if test_file.contains("/unit/"):
+        return "unit"
+    if test_file.contains("/system/"):
+        return "system"
+    if test_file.contains("/shared/"):
+        return "shared"
+    "other"
+
+# =========================================================================
+# Auto-Selection Logic
+# =========================================================================
+
+fn strategy_auto_select(test_file: text, options: TestOptions) -> ExecutionStrategy:
+    """
+    Automatically select execution strategy based on test file and options.
+
+    Args:
+        test_file: Path to test file
+        options: Test runner options
+
+    Returns: ExecutionStrategy with mode and profile
+    """
+    # CLI override takes precedence
+    val cli_mode = env_get("SIMPLE_TEST_EXECUTION_MODE") ?? ""
+    if cli_mode != "":
+        return strategy_from_mode(mode: cli_mode, test_file: test_file)
+
+    # Categorize test file
+    val category = categorize_test_file(test_file)
+
+    # Select strategy based on category
+    if category == "qemu":
+        return ExecutionStrategy(
+            mode: "process",
+            profile_name: "standard",
+            container_image: "",
+            container_runtime: "",
+            memory_mb: 512,
+            cpu_cores: 1.0,
+            timeout_sec: 120
+        )
+    elif category == "baremetal":
+        return ExecutionStrategy(
+            mode: "process",
+            profile_name: "standard",
+            container_image: "",
+            container_runtime: "",
+            memory_mb: 512,
+            cpu_cores: 1.0,
+            timeout_sec: 120
+        )
+    elif category == "database":
+        return ExecutionStrategy(
+            mode: "process",
+            profile_name: "slow",
+            container_image: "",
+            container_runtime: "",
+            memory_mb: 512,
+            cpu_cores: 1.0,
+            timeout_sec: 600
+        )
+    elif category == "integration":
+        return ExecutionStrategy(
+            mode: "safe",
+            profile_name: "standard",
+            container_image: "",
+            container_runtime: "",
+            memory_mb: 512,
+            cpu_cores: 1.0,
+            timeout_sec: 300
+        )
+    elif category == "unit":
+        return ExecutionStrategy(
+            mode: "native",
+            profile_name: "fast",
+            container_image: "",
+            container_runtime: "",
+            memory_mb: 256,
+            cpu_cores: 1.0,
+            timeout_sec: 60
+        )
+    elif category == "system":
+        return ExecutionStrategy(
+            mode: "safe",
+            profile_name: "standard",
+            container_image: "",
+            container_runtime: "",
+            memory_mb: 512,
+            cpu_cores: 1.0,
+            timeout_sec: 300
+        )
+    else:
+        return ExecutionStrategy(
+            mode: "process",
+            profile_name: "standard",
+            container_image: "",
+            container_runtime: "",
+            memory_mb: 512,
+            cpu_cores: 1.0,
+            timeout_sec: 300
+        )
+
+# =========================================================================
+# Mode String Conversion
+# =========================================================================
+
+fn strategy_from_mode(mode: text, test_file: text) -> ExecutionStrategy:
+    """
+    Create strategy from explicit mode string (CLI override).
+
+    Args:
+        mode: Execution mode string
+        test_file: Path to test file (unused, for signature compatibility)
+
+    Returns: ExecutionStrategy
+    """
+    if mode == "native" or mode == "compile":
+        return ExecutionStrategy.create_native()
+    elif mode == "process":
+        return ExecutionStrategy.create_process()
+    elif mode == "safe":
+        return ExecutionStrategy.create_safe()
+    elif mode == "container":
+        return ExecutionStrategy.create_container()
+    val container_seq1 = mode == "container-seq"
+    val container_seq2 = mode == "container_seq"
+    val container_seq3 = mode == "container-sequential"
+    if container_seq1 or container_seq2 or container_seq3:
+        return ExecutionStrategy.create_container_sequential()
+    else:
+        return strategy_auto_select(test_file, TestOptions(
+            path: "",
+            level: TestLevel.All,
+            tag: "",
+            fail_fast: false,
+            mode: TestExecutionMode.Interpreter,
+            timeout: 120,
+            list: false,
+            list_ignored: false,
+            only_slow: false,
+            only_skipped: false,
+            show_tags: false,
+            gc_log: false,
+            gc_off: false,
+            seed: 0,
+            seed_set: false,
+            safe_mode: false,
+            force_rebuild: false,
+            keep_artifacts: false,
+            run_all: false,
+            format: OutputFormat.Default,
+            list_skip_features: false,
+            planned_only: false,
+            no_limits: false,
+            sdoctest: false,
+            sdoctest_env: "",
+            sdoctest_force: false,
+            no_db: false,
+            verbose: false,
+            coverage: false,
+            assert_ran: false
+        ))
+
+# =========================================================================
+# Exports
+# =========================================================================

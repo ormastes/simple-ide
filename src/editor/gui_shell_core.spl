@@ -1,0 +1,981 @@
+# Editor GUI Shell — Core
+#
+# GUI shell core: initialization, event routing, drag/drop.
+# Rendering logic lives in gui_shell_render.spl.
+
+use std.editor.view.diagnostics_panel.*
+use std.editor.view.lsp_result_panel.*
+use std.editor.view.lsp_popup.*
+use std.editor.view.md_editing.*
+use std.editor.view.wiki_panel.*
+use std.editor.services.diagnostics.*
+use std.editor.services.md_lsp_config.*
+use std.editor.services.md_wiki_index.*
+use std.editor.services.md_search.*
+use std.editor.services.simple_lsp_config.*
+use std.editor.extensions.host.*
+use app.editor.editor_markdown_helpers.*
+use app.editor.editor_path_text_helpers.*
+use app.editor.editor_ctrl_debug.*
+use app.editor.editor_ctrl_lsp.*
+
+struct DragState:
+    active: bool
+    source_panel_id: text
+    source_zone: i64
+    mouse_x: i64
+    mouse_y: i64
+    drop_target_zone: i64
+
+struct GuiShellState:
+    ctrl: EditorController
+    config: GuiBackendConfig
+    platform_config: PlatformConfig
+    extension_host: ExtensionHost
+
+struct GuiShellEventResult:
+    state: GuiShellState
+    drag: DragState
+
+struct GuiTableCellPayload:
+    ok: bool
+    line: i64
+    col: i64
+    value: text
+
+struct GuiEvent:
+    kind: text
+    data: text
+
+struct MouseCoords:
+    x: i64
+    y: i64
+
+fn gui_shell_new(session: EditSession) -> GuiShellState:
+    val ctrl = EditorController.new(session)
+    GuiShellState(
+        ctrl: ctrl,
+        config: gui_backend_default_config(),
+        platform_config: platform_default_config(EditorPlatform.Desktop),
+        extension_host: ctrl.extension_host
+    )
+
+fn gui_shell_init(state: GuiShellState):
+    state.ctrl.extension_host.activate_event("*")
+    state.ctrl.extension_host.activate_language("simple")
+    state.ctrl.extension_host.activate_language("markdown")
+
+fn gui_shell_run(session: EditSession):
+    var state = gui_shell_new(session)
+    gui_shell_init(state)
+    state.ctrl.file_tree_visible = true
+    var drag = _drag_state_new()
+
+    while state.ctrl.is_running():
+        state.ctrl._refresh_lsp_results()
+        state.ctrl._poll_file_watcher()
+        state.ctrl._poll_inlay_hint_refresh_after(100)
+        state.ctrl._poll_debug_dap_client()
+        val frame = gui_shell_render_frame(state)
+        gui_shell_present_frame(frame)
+
+        val event = gui_shell_poll_event()
+        val handled = _gui_shell_handle_polled_event(state, drag, event)
+        state = handled.state
+        drag = handled.drag
+
+fn gui_shell_run_sdl(session: EditSession):
+    var state = gui_shell_new(session)
+    gui_shell_init(state)
+    state.ctrl.file_tree_visible = true
+    var drag = _drag_state_new()
+    val window = gui_sdl_init(state.config.window_title, state.config.initial_width, state.config.initial_height)
+    if window == 0:
+        state.ctrl.status_msg = "gui init failed"
+        return
+
+    while state.ctrl.is_running():
+        state.ctrl._refresh_lsp_results()
+        state.ctrl._poll_file_watcher()
+        state.ctrl._poll_inlay_hint_refresh_after(100)
+        state.ctrl._poll_debug_dap_client()
+        val frame = gui_shell_render_frame(state)
+        gui_shell_present_frame_sdl(window, frame)
+
+        val event = gui_shell_poll_event_sdl()
+        val handled = _gui_shell_handle_polled_event(state, drag, event)
+        state = handled.state
+        drag = handled.drag
+
+    gui_sdl_shutdown(window)
+
+fn _gui_shell_handle_polled_event(state: GuiShellState, drag: DragState, event: GuiEvent) -> GuiShellEventResult:
+    if event.kind == "":
+        return GuiShellEventResult(state: state, drag: drag)
+    if event.kind == "mouse-down":
+        val coords = _parse_mouse_coords(event.data)
+        return GuiShellEventResult(state: state, drag: gui_handle_mouse_down(state, drag, coords.x, coords.y))
+    if event.kind == "mouse-move":
+        val coords = _parse_mouse_coords(event.data)
+        return GuiShellEventResult(state: state, drag: gui_handle_mouse_move(state, drag, coords.x, coords.y))
+    if event.kind == "mouse-up":
+        return GuiShellEventResult(state: state, drag: gui_handle_mouse_up(state, drag))
+    val next_state = gui_shell_handle_event(state, event.kind, event.data)
+    GuiShellEventResult(state: next_state, drag: drag)
+
+fn gui_shell_handle_event(state: GuiShellState, event_kind: text, event_data: text) -> GuiShellState:
+    if event_kind == "key":
+        _gui_handle_key(state, event_data)
+    elif event_kind == "text":
+        _gui_handle_text(state, event_data)
+    elif event_kind == "resize":
+        _gui_handle_resize(state, event_data)
+    elif event_kind == "close":
+        state.ctrl.running = false
+    elif event_kind == "focus":
+        state.ctrl.status_msg = "focused"
+    elif event_kind == "blur":
+        state.ctrl.status_msg = "unfocused"
+    elif event_kind == "file-tree-select":
+        _gui_handle_file_tree_select(state, event_data)
+    elif event_kind == "tab-select":
+        _gui_handle_tab_select(state, event_data)
+    elif event_kind == "settings-change":
+        _gui_handle_settings_change(state, event_data)
+    elif event_kind == "link-click":
+        var ctrl_link = state.ctrl
+        val action_link = ctrl_link._open_markdown_link_target(event_data)
+        ctrl_link.status_msg = action_link.status_msg
+        state.ctrl = ctrl_link
+        val link_path = _gui_status_opened_or_created_path(action_link.status_msg)
+        if link_path != "":
+            state = _gui_open_path_in_state(state, link_path)
+    elif event_kind == "editor-ctrl-click":
+        val click_state = _gui_editor_ctrl_click_state(state, event_data)
+        state = click_state
+    elif event_kind == "editor-hover":
+        val hover_state = _gui_editor_hover_state(state, event_data)
+        state = hover_state
+    elif event_kind == "wiki-panel-click":
+        val wiki_state = _gui_wiki_panel_click_state(state, event_data)
+        state = wiki_state
+    elif event_kind == "wiki-property-submit":
+        val prop_state = _gui_wiki_property_submit_state(state, event_data)
+        state = prop_state
+    elif event_kind == "wiki-vault-property-submit":
+        val vault_prop_state = _gui_wiki_vault_property_submit_state(state, event_data)
+        state = vault_prop_state
+    elif event_kind == "wiki-vault-property-review":
+        val vault_prop_review_state = _gui_wiki_vault_property_review_state(state, event_data)
+        state = vault_prop_review_state
+    elif event_kind == "task-toggle":
+        val task_state = _gui_task_toggle_state(state, event_data)
+        state = task_state
+    elif event_kind == "task-filter":
+        val task_filter_state = _gui_task_filter_state(state, event_data)
+        state = task_filter_state
+    elif event_kind == "task-query":
+        val task_query_state = _gui_task_query_state(state, event_data)
+        state = task_query_state
+    elif event_kind == "task-batch":
+        val task_batch_state = _gui_task_batch_state(state, event_data)
+        state = task_batch_state
+    elif event_kind == "vault-search-filter":
+        val vault_filter_state = _gui_vault_search_filter_state(state, event_data)
+        state = vault_filter_state
+    elif event_kind == "vault-search-path-filter":
+        val vault_path_filter_state = _gui_vault_search_path_filter_state(state, event_data)
+        state = vault_path_filter_state
+    elif event_kind == "quick-switch-filter":
+        val quick_switch_state = _gui_quick_switch_filter_state(state, event_data)
+        state = quick_switch_state
+    elif event_kind == "quick-switch-insert":
+        val quick_switch_insert_state = _gui_quick_switch_insert_state(state, event_data)
+        state = quick_switch_insert_state
+    elif event_kind == "daily-note-create":
+        val daily_state = _gui_daily_note_create_state(state, event_data)
+        state = daily_state
+    elif event_kind == "template-picker-filter":
+        val template_filter_state = _gui_template_picker_filter_state(state, event_data)
+        state = template_filter_state
+    elif event_kind == "template-insert":
+        val template_insert_state = _gui_template_insert_state(state, event_data)
+        state = template_insert_state
+    elif event_kind == "attachment-picker-filter":
+        val attachment_filter_state = _gui_attachment_picker_filter_state(state, event_data)
+        state = attachment_filter_state
+    elif event_kind == "attachment-insert":
+        val attachment_insert_state = _gui_attachment_insert_state(state, event_data)
+        state = attachment_insert_state
+    elif event_kind == "diagnostics-filter":
+        val diag_filter_state = _gui_diagnostics_filter_state(state, event_data)
+        state = diag_filter_state
+    elif event_kind == "diagnostics-group":
+        val diag_group_state = _gui_diagnostics_group_state(state, event_data)
+        state = diag_group_state
+    elif event_kind == "diagnostics-sort":
+        val diag_sort_state = _gui_diagnostics_sort_state(state, event_data)
+        state = diag_sort_state
+    elif event_kind == "table-row-insert":
+        val table_row_state = _gui_table_edit_state(state, "markdown-table-row-insert")
+        state = table_row_state
+    elif event_kind == "table-column-insert":
+        val table_col_state = _gui_table_edit_state(state, "markdown-table-column-insert")
+        state = table_col_state
+    elif event_kind == "table-cell-commit":
+        val table_cell_state = _gui_table_cell_commit_state(state, event_data)
+        state = table_cell_state
+    elif event_kind == "callout-fold-toggle":
+        val callout_state = _gui_callout_fold_toggle_state(state)
+        state = callout_state
+    elif event_kind == "fold-toggle":
+        val fold_state = _gui_fold_toggle_state(state, event_data)
+        state = fold_state
+    elif event_kind == "lsp-hover-dismiss":
+        var ctrl_hover = state.ctrl
+        val action_hover = ctrl_hover._dismiss_lsp_hover_popup()
+        ctrl_hover.status_msg = action_hover.status_msg
+        state.ctrl = ctrl_hover
+    elif event_kind == "lsp-signature-dismiss":
+        var ctrl_sig = state.ctrl
+        val action_sig = ctrl_sig._dismiss_lsp_signature_popup()
+        ctrl_sig.status_msg = action_sig.status_msg
+        state.ctrl = ctrl_sig
+    elif event_kind == "lsp-signature-next":
+        var ctrl_sig_next = state.ctrl
+        val action_sig_next = ctrl_sig_next._select_signature_overload(1)
+        ctrl_sig_next.status_msg = action_sig_next.status_msg
+        state.ctrl = ctrl_sig_next
+    elif event_kind == "lsp-signature-prev":
+        var ctrl_sig_prev = state.ctrl
+        val action_sig_prev = ctrl_sig_prev._select_signature_overload(0 - 1)
+        ctrl_sig_prev.status_msg = action_sig_prev.status_msg
+        state.ctrl = ctrl_sig_prev
+    elif event_kind == "workspace-edit-confirm":
+        val workspace_confirm_state = _gui_workspace_edit_action_state(state, "rename-confirm")
+        state = workspace_confirm_state
+    elif event_kind == "workspace-edit-cancel":
+        val workspace_cancel_state = _gui_workspace_edit_action_state(state, "workspace-edit-cancel")
+        state = workspace_cancel_state
+    elif event_kind == "lsp-result-click":
+        val lsp_click_state = _gui_lsp_result_click_state(state, event_data)
+        state = lsp_click_state
+    elif event_kind == "lsp-back":
+        val lsp_back_state = _gui_lsp_back_state(state)
+        state = lsp_back_state
+    elif event_kind == "code-lens-run":
+        val lens_state = _gui_code_lens_run_state(state, event_data)
+        state = lens_state
+    elif event_kind == "inlay-hint-click":
+        val hint_state = _gui_inlay_hint_click_state(state, event_data)
+        state = hint_state
+    elif event_kind == "code-actions-filter":
+        val code_action_filter_state = _gui_code_actions_filter_state(state, event_data)
+        state = code_action_filter_state
+    elif event_kind == "code-actions-group":
+        val code_action_group_state = _gui_code_actions_group_state(state)
+        state = code_action_group_state
+    state
+
+fn _gui_callout_fold_toggle_state(state: GuiShellState) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._execute_palette_command("callout-fold-toggle", "")
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_fold_toggle_state(state: GuiShellState, data: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    var buffer = ctrl.session.active_buffer()
+    if buffer == nil:
+        ctrl.status_msg = "no file open"
+        state.ctrl = ctrl
+        return state
+    val line = data.to_i64()
+    val end_line = buffer.folded_end_line_for_header(line)
+    if end_line < 0:
+        buffer.move_cursor(line, 0)
+        ctrl.session.update_active_buffer(buffer)
+        val action = ctrl._execute_palette_command("fold-toggle", "")
+        ctrl.status_msg = action.status_msg
+        state.ctrl = ctrl
+        return state
+    buffer.unfold_range_start(line)
+    buffer.move_cursor(line, 0)
+    ctrl.session.update_active_buffer(buffer)
+    ctrl.status_msg = "unfolded section"
+    state.ctrl = ctrl
+    state
+
+fn _gui_lsp_back_state(state: GuiShellState) -> GuiShellState:
+    var ctrl = state.ctrl
+    if ctrl.lsp_location_stack.len() == 0:
+        ctrl.status_msg = "lsp location stack empty"
+        state.ctrl = ctrl
+        return state
+    val location = ctrl.lsp_location_stack[ctrl.lsp_location_stack.len() - 1]
+    var next_stack: [EditorLocation] = []
+    var i = 0
+    while i < ctrl.lsp_location_stack.len() - 1:
+        next_stack.push(ctrl.lsp_location_stack[i])
+        i = i + 1
+    ctrl.lsp_location_stack = next_stack
+    var session = ctrl.session
+    session.open_file(location.path)
+    var buffer = session.active_buffer()
+    buffer.move_cursor(location.line, location.col)
+    session.update_active_buffer(buffer)
+    ctrl.session = session
+    ctrl.status_msg = "lsp back: " + location.path + ":" + (location.line + 1).to_text()
+    state.ctrl = ctrl
+    state
+
+fn _gui_lsp_result_click_state(state: GuiShellState, row: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    ctrl.lsp_result_panel = lsp_result_panel_select(ctrl.lsp_result_panel, row.to_i64())
+    ctrl.status_msg = "lsp result selected"
+    state.ctrl = ctrl
+    state
+
+fn _gui_code_lens_run_state(state: GuiShellState, data: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val sep = data.index_of("|")
+    val command_name = if sep >= 0 then data.slice(0, sep) else: data
+    val payload = if sep >= 0 then data.slice(sep + 1, data.len()) else: ""
+    if command_name == "":
+        ctrl.status_msg = "missing code lens command"
+        state.ctrl = ctrl
+        return state
+    if command_name == "debug-start":
+        val debug_action = ctrl_start_debug_adapter(ctrl, payload)
+        ctrl.status_msg = debug_action.status_msg
+        ctrl.debug_status = "starting"
+        state.ctrl = ctrl
+        return state
+    val action = ctrl._execute_palette_command(command_name, payload)
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_code_actions_filter_state(state: GuiShellState, filter: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._filter_code_actions(filter)
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_code_actions_group_state(state: GuiShellState) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._group_code_actions_by_kind()
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_inlay_hint_click_state(state: GuiShellState, data: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val comma = data.index_of(",")
+    if comma < 0:
+        ctrl.status_msg = "invalid inlay hint"
+        state.ctrl = ctrl
+        return state
+    val line_text = data.slice(0, comma)
+    val col_text = data.slice(comma + 1, data.len())
+    val line = line_text.to_i64()
+    val col = col_text.to_i64()
+    var buffer = ctrl.session.active_buffer()
+    if buffer == nil:
+        ctrl.status_msg = "no file open"
+        state.ctrl = ctrl
+        return state
+    buffer.move_cursor(line, col)
+    ctrl.session.update_active_buffer(buffer)
+    ctrl.status_msg = "inlay hint selected"
+    state.ctrl = ctrl
+    state
+
+fn _gui_editor_hover_state(state: GuiShellState, data: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val comma = data.index_of(",")
+    if comma < 0:
+        ctrl.status_msg = "invalid hover target"
+        state.ctrl = ctrl
+        return state
+    val line_text = data.slice(0, comma)
+    val rest = data.slice(comma + 1, data.len())
+    val second_comma = rest.index_of(",")
+    val col_text = if second_comma >= 0 then rest.slice(0, second_comma) else: rest
+    val elapsed_text = if second_comma >= 0 then rest.slice(second_comma + 1, rest.len()) else: ""
+    val line = line_text.to_i64()
+    val col = col_text.to_i64()
+    if elapsed_text != "" and elapsed_text.to_i64() < ctrl.config.hover_delay_ms:
+        ctrl.status_msg = "hover delayed"
+        state.ctrl = ctrl
+        return state
+    if ctrl.lsp_hover_popup.visible and ctrl.lsp_hover_popup.line == line and ctrl.lsp_hover_popup.col == col:
+        ctrl.status_msg = "hover unchanged"
+        state.ctrl = ctrl
+        return state
+    var buffer = ctrl.session.active_buffer()
+    if buffer == nil:
+        ctrl.status_msg = "no file open"
+        state.ctrl = ctrl
+        return state
+    buffer.move_cursor(line, col)
+    ctrl.session.update_active_buffer(buffer)
+    val doc = ctrl.session.active_document()
+    val content = md_buffer_content(buffer)
+    if doc != nil and doc.language_id == "markdown":
+        ctrl.md_lsp_state = md_lsp_ensure_open(ctrl.md_lsp_state, doc.path(), content)
+        val hover_result = md_lsp_request(ctrl.md_lsp_state, "hover", "", doc.path(), buffer.cursor_row_value(), buffer.cursor_col_value())
+        ctrl.md_lsp_state = hover_result.0
+        if hover_result.1.ok:
+            ctrl.lsp_result_panel = lsp_result_panel_from_response("hover", hover_result.1)
+            if ctrl.lsp_result_panel.rows.len() > 0:
+                val hover_row = ctrl.lsp_result_panel.rows[ctrl.lsp_result_panel.selected]
+                ctrl.lsp_hover_popup = lsp_hover_popup_show(line, col, hover_row.label, hover_row.detail)
+            else:
+                ctrl.lsp_hover_popup = lsp_hover_popup_hidden()
+            ctrl.status_msg = "hover results"
+        else:
+            ctrl.status_msg = hover_result.1.error_text
+    elif doc != nil and (doc.language_id == "simple" or doc.language_id == "shell"):
+        ctrl.simple_lsp_state = simple_lsp_ensure_open(ctrl.simple_lsp_state, doc.path(), content)
+        val simple_hover_result = simple_lsp_request(ctrl.simple_lsp_state, "hover", "", doc.path(), buffer.cursor_row_value(), buffer.cursor_col_value())
+        ctrl.simple_lsp_state = simple_hover_result.0
+        if simple_hover_result.1.ok:
+            ctrl.lsp_result_panel = lsp_result_panel_from_response("hover", simple_hover_result.1)
+            if ctrl.lsp_result_panel.rows.len() > 0:
+                val simple_hover_row = ctrl.lsp_result_panel.rows[ctrl.lsp_result_panel.selected]
+                ctrl.lsp_hover_popup = lsp_hover_popup_show(line, col, simple_hover_row.label, simple_hover_row.detail)
+            else:
+                ctrl.lsp_hover_popup = lsp_hover_popup_hidden()
+            ctrl.status_msg = "hover results"
+        else:
+            ctrl.status_msg = simple_hover_result.1.error_text
+    else:
+        ctrl.status_msg = "no active language server"
+    state.ctrl = ctrl
+    state
+
+fn _gui_table_edit_state(state: GuiShellState, command_name: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    var session = ctrl.session
+    val doc = session.active_document()
+    var buffer = session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown table"
+        state.ctrl = ctrl
+        return state
+    val content = buffer.to_text()
+    val edit = if command_name == "markdown-table-row-insert" then md_table_insert_row_after(content, buffer.cursor_row_value()) else: md_table_insert_column_after(content, buffer.cursor_row_value(), buffer.cursor_col_value())
+    if not edit.changed:
+        ctrl.status_msg = edit.message
+        state.ctrl = ctrl
+        return state
+    buffer.push_undo_snapshot()
+    buffer.replace_content(edit.content)
+    buffer.dirty = true
+    buffer.move_cursor(edit.line, edit.col)
+    session.update_active_buffer(buffer)
+    ctrl.session = session
+    ctrl.status_msg = edit.message
+    state.ctrl = ctrl
+    state
+
+fn _gui_table_cell_commit_state(state: GuiShellState, data: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val payload = _gui_parse_table_cell_payload(data)
+    if not payload.ok:
+        ctrl.status_msg = "invalid table cell edit"
+        state.ctrl = ctrl
+        return state
+    var session = ctrl.session
+    val doc = session.active_document()
+    var buffer = session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown table"
+        state.ctrl = ctrl
+        return state
+    val edit = md_table_set_cell(buffer.to_text(), payload.line, payload.col, payload.value)
+    if not edit.changed:
+        ctrl.status_msg = edit.message
+        state.ctrl = ctrl
+        return state
+    buffer.push_undo_snapshot()
+    buffer.replace_content(edit.content)
+    buffer.dirty = true
+    buffer.move_cursor(edit.line, edit.col)
+    session.update_active_buffer(buffer)
+    ctrl.session = session
+    ctrl.status_msg = edit.message
+    state.ctrl = ctrl
+    state
+
+fn _gui_parse_table_cell_payload(data: text) -> GuiTableCellPayload:
+    var first = -1
+    var second = -1
+    var i = 0
+    while i < data.len():
+        if data.char_at(i) == "|":
+            if first < 0:
+                first = i
+            elif second < 0:
+                second = i
+                i = data.len()
+        i = i + 1
+    if first < 0 or second < 0:
+        return GuiTableCellPayload(ok: false, line: 0, col: 0, value: "")
+    val line_text = data.slice(0, first)
+    val col_text = data.slice(first + 1, second)
+    val line = line_text.to_i64()
+    val col = col_text.to_i64()
+    val value = data.slice(second + 1, data.len())
+    GuiTableCellPayload(ok: true, line: line, col: col, value: value)
+
+fn _gui_task_filter_state(state: GuiShellState, filter: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val mode = if filter == "" then ctrl.wiki_task_filter else: filter
+    ctrl = _gui_apply_task_panel(ctrl, mode, ctrl.wiki_task_query)
+    state.ctrl = ctrl
+    state
+
+fn _gui_task_query_state(state: GuiShellState, query: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    ctrl = _gui_apply_task_panel(ctrl, ctrl.wiki_task_filter, query)
+    state.ctrl = ctrl
+    state
+
+fn _gui_task_batch_state(state: GuiShellState, payload: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    var session = ctrl.session
+    val doc = session.active_document()
+    var buffer = session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown task"
+        state.ctrl = ctrl
+        return state
+    val normalized = payload.trim().to_lower()
+    val checked = normalized == "done" or normalized == "checked" or normalized == "complete" or normalized == "completed"
+    val next = md_tasks_set_checked(buffer.to_text(), checked)
+    if next == buffer.to_text():
+        ctrl.status_msg = "no tasks changed"
+        state.ctrl = ctrl
+        return state
+    buffer.push_undo_snapshot()
+    buffer.replace_content(next)
+    buffer.dirty = true
+    session.update_active_buffer(buffer)
+    ctrl.session = session
+    ctrl = _gui_apply_task_panel(ctrl, if checked then "done" else: "open", "")
+    ctrl.status_msg = if checked then "tasks marked done" else: "tasks marked open"
+    state.ctrl = ctrl
+    state
+
+fn _gui_apply_task_panel(ctrl: EditorController, mode: text, query: text) -> EditorController:
+    val normalized = if mode.trim() == "" then "open" else: mode.trim().to_lower()
+    val normalized_query = query.trim().to_lower()
+    ctrl.wiki_task_filter = normalized
+    ctrl.wiki_task_query = normalized_query
+    val index = _gui_wiki_index_open_documents(ctrl.session)
+    ctrl.wiki_panel = wiki_panel_from_tasks(_gui_tasks_matching(md_wiki_tasks_filtered(index, normalized), normalized_query))
+    var session = ctrl.session
+    var layout = session.dock_layout
+    layout.show_right("wiki-panel")
+    session.dock_layout = layout
+    ctrl.session = session
+    ctrl.status_msg = "wiki tasks: " + normalized
+    ctrl
+
+fn _gui_wiki_index_open_documents(session: EditSession) -> MdWikiIndex:
+    var docs: [MdWikiDocument] = []
+    var i = 0
+    while i < session.documents.len() and i < session.buffers.len():
+        val doc = session.documents[i]
+        if doc.language_id == "markdown":
+            docs.push(md_wiki_document(doc.path(), session.buffers[i].to_text()))
+        i = i + 1
+    md_wiki_index_documents(docs)
+
+fn _gui_tasks_matching(tasks: [MdWikiTask], query: text) -> [MdWikiTask]:
+    if query == "":
+        return tasks
+    var result: [MdWikiTask] = []
+    for task in tasks:
+        if task.text_content.to_lower().index_of(query) >= 0 or task.path.to_lower().index_of(query) >= 0:
+            result.push(task)
+    result
+
+fn _gui_vault_search_filter_state(state: GuiShellState, filter: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    if ctrl.wiki_vault_search_root == "" or ctrl.wiki_vault_search_query == "":
+        ctrl.status_msg = "missing vault search context"
+        state.ctrl = ctrl
+        return state
+    val query = md_vault_search_query_replace_kind_filter(ctrl.wiki_vault_search_query, filter)
+    ctrl = _gui_apply_vault_search(ctrl, ctrl.wiki_vault_search_root, query)
+    state.ctrl = ctrl
+    state
+
+fn _gui_vault_search_path_filter_state(state: GuiShellState, path: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    if ctrl.wiki_vault_search_root == "" or ctrl.wiki_vault_search_query == "":
+        ctrl.status_msg = "missing vault search context"
+        state.ctrl = ctrl
+        return state
+    val query = md_vault_search_query_replace_path_filter(ctrl.wiki_vault_search_query, path)
+    ctrl = _gui_apply_vault_search(ctrl, ctrl.wiki_vault_search_root, query)
+    state.ctrl = ctrl
+    state
+
+fn _gui_apply_vault_search(ctrl: EditorController, root: text, query: text) -> EditorController:
+    ctrl._execute_wiki_vault_search(root + "|" + query)
+    ctrl
+
+fn _gui_quick_switch_filter_state(state: GuiShellState, query: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._execute_wiki_quick_switch(query)
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_quick_switch_insert_state(state: GuiShellState, note_path: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    var session = ctrl.session
+    val doc = session.active_document()
+    var buffer = session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "missing target or embed path"
+        state.ctrl = ctrl
+        return state
+    val alias = _gui_shell_basename_without_markdown_ext(note_path)
+    buffer.insert_at_cursor("![[" + alias + "]]\n")
+    session.update_active_buffer(buffer)
+    ctrl.session = session
+    ctrl.status_msg = "inserted embed: " + alias
+    state.ctrl = ctrl
+    state
+
+fn _gui_daily_note_create_state(state: GuiShellState, payload: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._execute_palette_command("daily-note-create", payload)
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_template_picker_filter_state(state: GuiShellState, payload: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._execute_template_picker(payload)
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_template_insert_state(state: GuiShellState, payload: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._execute_palette_command("template-insert", payload)
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_attachment_picker_filter_state(state: GuiShellState, payload: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._execute_attachment_picker(payload)
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_attachment_insert_state(state: GuiShellState, payload: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._execute_palette_command("attachment-insert", payload)
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_diagnostics_filter_state(state: GuiShellState, payload: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._show_diagnostics_filter(payload)
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_diagnostics_group_state(state: GuiShellState, group_by: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._show_diagnostics_group(group_by)
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_diagnostics_sort_state(state: GuiShellState, sort_by: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._show_diagnostics_sort(sort_by)
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_workspace_edit_action_state(state: GuiShellState, command_name: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._execute_palette_command(command_name, "")
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_wiki_property_submit_state(state: GuiShellState, data: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    var session = ctrl.session
+    val doc = session.active_document()
+    var buffer = session.active_buffer()
+    val parsed = _editor_parse_property_payload(data)
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown note open"
+        state.ctrl = ctrl
+        return state
+    if parsed.key == "":
+        ctrl.status_msg = "missing property key"
+        state.ctrl = ctrl
+        return state
+    val current_content = buffer.to_text()
+    val next_content = _editor_markdown_property_content(current_content, parsed.key, parsed.value)
+    buffer.push_undo_snapshot()
+    buffer.replace_content(next_content)
+    buffer.dirty = true
+    buffer.move_cursor(0, 0)
+    session.update_active_buffer(buffer)
+    ctrl.session = session
+    val index = _gui_wiki_index_open_documents(session)
+    ctrl.wiki_panel = wiki_panel_from_properties(md_wiki_properties_for_path(index, doc.path()))
+    ctrl.status_msg = "property set: " + parsed.key
+    state.ctrl = ctrl
+    state
+
+fn _gui_wiki_vault_property_submit_state(state: GuiShellState, data: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._execute_palette_command("wiki-vault-property-set", data)
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_wiki_vault_property_review_state(state: GuiShellState, data: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    val action = ctrl._execute_palette_command("wiki-vault-property-review", data)
+    ctrl.status_msg = action.status_msg
+    state.ctrl = ctrl
+    state
+
+fn _gui_task_toggle_state(state: GuiShellState, data: text) -> GuiShellState:
+    var ctrl = state.ctrl
+    var session = ctrl.session
+    val doc = session.active_document()
+    var buffer = session.active_buffer()
+    if doc == nil or buffer == nil or doc.language_id != "markdown":
+        ctrl.status_msg = "no markdown task"
+        state.ctrl = ctrl
+        return state
+    val line = data.to_i64()
+    if line < 0 or line >= buffer.line_count():
+        ctrl.status_msg = "task line out of range"
+        state.ctrl = ctrl
+        return state
+    val current = buffer.line_at(line)
+    val toggled = md_assist_toggle_task(current)
+    if toggled == current:
+        ctrl.status_msg = "not a task"
+        state.ctrl = ctrl
+        return state
+    buffer.move_cursor(line, 0)
+    var i = 0
+    while i < current.len():
+        buffer.delete_at_cursor()
+        i = i + 1
+    buffer.insert_at_cursor(toggled)
+    session.update_active_buffer(buffer)
+    ctrl.session = session
+    ctrl.status_msg = "task toggled"
+    state.ctrl = ctrl
+    state
+
+fn _gui_handle_key(state: GuiShellState, key: text):
+    val gui_key = _gui_translate_key(key)
+    if gui_key == "":
+        return
+    if gui_key == "Ctrl+P":
+        state.ctrl._open_palette()
+        state.ctrl.status_msg = "command palette"
+        return
+    if gui_key == "Ctrl+Shift+V":
+        state.ctrl._toggle_md_preview()
+        return
+    if gui_key == "Ctrl+Shift+O":
+        state.ctrl._toggle_md_outline()
+        return
+    if gui_key == "Ctrl+Space":
+        val action_completion = state.ctrl._request_active_lsp_action("completion")
+        state.ctrl.status_msg = action_completion.status_msg
+        return
+    if gui_key == "F12":
+        val action_definition = state.ctrl._request_active_lsp_action("definition")
+        state.ctrl.status_msg = action_definition.status_msg
+        return
+    if gui_key == "Ctrl+.":
+        val action_quickfix = state.ctrl._request_quickfix()
+        state.ctrl.status_msg = action_quickfix.status_msg
+        return
+    if gui_key == "Shift+Alt+Right":
+        val action_expand = state.ctrl._expand_lsp_selection_range()
+        state.ctrl.status_msg = action_expand.status_msg
+        return
+    if gui_key == "Shift+Alt+Left":
+        val action_shrink = state.ctrl._shrink_lsp_selection_range()
+        state.ctrl.status_msg = action_shrink.status_msg
+        return
+    if gui_key == "F5":
+        val action_debug = state.ctrl._start_debug_adapter("simple")
+        state.ctrl.status_msg = action_debug.status_msg
+        return
+    if gui_key == "Ctrl+S":
+        state.ctrl.session.save_active()
+        val doc_gs = state.ctrl.session.active_document()
+        if doc_gs != nil and doc_gs.language_id == "markdown":
+            val buf_gs = state.ctrl.session.active_buffer()
+            if buf_gs != nil:
+                val gs_content = md_buffer_content(buf_gs)
+                doc_gs.cached_md_stats = md_compute_stats(gs_content)
+        state.ctrl.status_msg = "saved"
+        return
+    if gui_key == "Ctrl+O":
+        state.ctrl.status_msg = "open dialog"
+        return
+    if gui_key == "Ctrl+C":
+        val copy_result = editor_dispatch_session(state.ctrl.session, EditCommand(name: "clipboard-copy", count: 1, payload: ""))
+        state.ctrl.status_msg = copy_result.message
+        return
+    if gui_key == "Ctrl+V":
+        val paste_result = editor_dispatch_session(state.ctrl.session, EditCommand(name: "clipboard-paste", count: 1, payload: ""))
+        state.ctrl.status_msg = paste_result.message
+        return
+    val rects = editor_layout_compute_rects(state.ctrl.session.layout, state.config.initial_width, state.config.initial_height)
+    state.ctrl.handle_key(gui_key, rects)
+
+fn _gui_handle_text(state: GuiShellState, text_data: text):
+    if text_data == "":
+        return
+    val rects = editor_layout_compute_rects(state.ctrl.session.layout, state.config.initial_width, state.config.initial_height)
+    var idx = 0
+    while idx < text_data.len():
+        state.ctrl.handle_key(text_data.char_at(idx), rects)
+        idx = idx + 1
+
+fn _gui_translate_key(key: text) -> text:
+    if key == "Escape":
+        return "\x1b"
+    if key == "Enter":
+        return "\r"
+    if key == "Backspace":
+        return "\x7f"
+    if key == "Ctrl+B":
+        return "\x02"
+    if key == "Ctrl+W":
+        return "\x17"
+    if key == "Tab":
+        return "\t"
+    key
+
+fn _gui_handle_resize(state: GuiShellState, data: text):
+    val comma_idx = data.index_of(",")
+    if comma_idx < 0:
+        return
+    val w_str = data.slice(0, comma_idx)
+    val h_str = data.slice(comma_idx + 1, data.len())
+    state.config.initial_width = w_str.to_i64()
+    state.config.initial_height = h_str.to_i64()
+
+fn _gui_handle_file_tree_select(state: GuiShellState, path: text):
+    var session = state.ctrl.session
+    session.open_file(path)
+    _gui_replace_state_session(state, session)
+    _gui_activate_active_language(state)
+    state.ctrl.focus_panel = "editor"
+
+fn _gui_open_path_in_state(state: GuiShellState, path: text) -> GuiShellState:
+    var session = state.ctrl.session
+    session.open_file(path)
+    _gui_replace_state_session(state, session)
+
+fn _gui_replace_state_session(state: GuiShellState, session: EditSession) -> GuiShellState:
+    var ctrl = state.ctrl
+    ctrl.session = session
+    state.ctrl = ctrl
+    state
+
+fn _gui_status_opened_or_created_path(status: text) -> text:
+    val opened = "opened link: "
+    if status.starts_with(opened):
+        return status.slice(opened.len(), status.len())
+    val created = "created note: "
+    if status.starts_with(created):
+        return status.slice(created.len(), status.len())
+    ""
+
+fn _gui_handle_tab_select(state: GuiShellState, tab_index_str: text):
+    val tab_index = tab_index_str.to_i64()
+    val group_idx = state.ctrl.session.layout.active_group_index
+    if group_idx < 0 or group_idx >= state.ctrl.session.layout.groups.len():
+        return
+    var group = state.ctrl.session.layout.groups[group_idx]
+    group.select_tab(tab_index)
+    state.ctrl.session.layout.groups[group_idx] = group
+
+fn _gui_handle_settings_change(state: GuiShellState, data: text):
+    val eq_idx = data.index_of("=")
+    if eq_idx < 0:
+        return
+    val key = data.slice(0, eq_idx)
+    val value = data.slice(eq_idx + 1, data.len())
+    state.ctrl.config = editor_config_set_by_key(state.ctrl.config, key, value)
+
+fn _gui_editor_ctrl_click_state(state: GuiShellState, data: text) -> GuiShellState:
+    var next = state
+    val comma_idx = data.index_of(",")
+    if comma_idx < 0:
+        var ctrl_invalid = next.ctrl
+        ctrl_invalid.status_msg = "invalid editor click"
+        next.ctrl = ctrl_invalid
+        return next
+    val line_text = data.slice(0, comma_idx)
+    val col_text = data.slice(comma_idx + 1, data.len())
+    val line = line_text.to_i64()
+    val col = col_text.to_i64()
+    var ctrl = next.ctrl
+    var buffer = ctrl.session.active_buffer()
+    if buffer == nil:
+        ctrl.status_msg = "no active buffer"
+        next.ctrl = ctrl
+        return next
+    buffer.move_cursor(line, col)
+    ctrl.session.update_active_buffer(buffer)
+    val action = ctrl._open_markdown_link_under_cursor()
+    ctrl.status_msg = action.status_msg
+    next.ctrl = ctrl
+    val link_path = _gui_status_opened_or_created_path(action.status_msg)
+    if link_path != "":
+        next = _gui_open_path_in_state(next, link_path)
+    next
+
+fn _gui_wiki_panel_click_state(state: GuiShellState, data: text) -> GuiShellState:
+    var next = state
+    var ctrl = next.ctrl
+    val index = data.to_i64()
+    ctrl.wiki_panel = wiki_panel_select(ctrl.wiki_panel, index)
+    val action = ctrl._wiki_jump_selected()
+    ctrl.status_msg = action.status_msg
+    next.ctrl = ctrl
+    next
+
+fn _gui_activate_active_language(state: GuiShellState):
+    val doc = state.ctrl.session.active_document()
+    if doc == nil:
+        return
+    state.ctrl.extension_host.activate_language(doc.language_id)
+    state.ctrl.extension_host.emit_event("onDidOpenTextDocument", doc.path())
+    state.ctrl.extension_host.emit_event("onLanguage:" + doc.language_id, doc.path())
+
+# Drag/docking, polling, coord parsing, and basename helpers
+# live in gui_shell_render.spl alongside rendering code.

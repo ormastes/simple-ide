@@ -1,0 +1,215 @@
+# Breakpoint Management
+# Handles breakpoint storage and verification
+
+import dap.protocol as protocol
+
+# Breakpoint entry with metadata
+class BreakpointEntry:
+    id: Int
+    source_path: String
+    line: Int
+    condition: Option<String>
+    hit_condition: Option<String>
+    verified: Bool
+    hit_count: Int
+
+    fn new(id: Int, source_path: String, line: Int) -> BreakpointEntry:
+        BreakpointEntry(
+            id: id,
+            source_path: source_path,
+            line: line,
+            condition: nil,
+            hit_condition: nil,
+            verified: true,  # For now, always verify
+            hit_count: 0
+        )
+
+    fn with_condition(condition: String) -> BreakpointEntry:
+        BreakpointEntry(
+            id: self.id,
+            source_path: self.source_path,
+            line: self.line,
+            condition: Some(condition),
+            hit_condition: self.hit_condition,
+            verified: self.verified,
+            hit_count: self.hit_count
+        )
+
+    fn to_protocol_breakpoint() -> protocol.Breakpoint:
+        protocol.Breakpoint.new(self.id, self.verified, self.line)
+
+# Breakpoint manager
+class BreakpointManager:
+    breakpoints: Dict<String, [BreakpointEntry]>  # source_path -> breakpoints
+    next_id: Int
+
+    static fn new() -> BreakpointManager:
+        BreakpointManager(
+            breakpoints: {},
+            next_id: 1
+        )
+
+    # Set breakpoints for a source file
+    fn set_breakpoints(source_path: String, source_breakpoints: [protocol.SourceBreakpoint]) -> [BreakpointEntry]:
+        # Clear existing breakpoints for this file
+        self.breakpoints.remove(source_path)
+
+        # Create new breakpoint entries
+        var entries = []
+
+        for source_bp in source_breakpoints:
+            val id = self.next_id
+            self.next_id = self.next_id + 1
+
+            var entry = BreakpointEntry.new(id, source_path, source_bp.line)
+
+            # Add condition if present
+            match source_bp.condition:
+                case Some(cond):
+                    entry = entry.with_condition(cond)
+                case nil:
+                    pass
+
+            entries.push(entry)
+
+        # Store breakpoints
+        self.breakpoints[source_path] = entries
+
+        entries
+
+    # Clear all breakpoints for a source file
+    fn clear_breakpoints(source_path: String):
+        self.breakpoints.remove(source_path)
+
+    # Get breakpoints for a source file
+    fn get_breakpoints(source_path: String) -> [BreakpointEntry]:
+        match self.breakpoints.get(source_path):
+            case Some(bps):
+                bps
+            case nil:
+                []
+
+    # Check if execution should stop at a line
+    # Returns the breakpoint if we should stop, nil otherwise
+    fn should_stop_at_line(source_path: String, line: Int) -> Option<BreakpointEntry>:
+        val breakpoints = self.get_breakpoints(source_path)
+
+        for bp in breakpoints:
+            if bp.line == line:
+                # Check condition if present
+                if self.check_breakpoint_condition(bp):
+                    return Some(bp)
+
+        nil
+
+    # Check if a breakpoint's condition is satisfied
+    # Returns true if should stop (no condition, or condition evaluates to true)
+    fn check_breakpoint_condition(bp: BreakpointEntry) -> Bool:
+        # Check hit condition first (e.g., ">=5" means stop on 5th hit)
+        match bp.hit_condition:
+            Some(hit_cond):
+                val should_stop = self.evaluate_hit_condition(hit_cond, bp.hit_count + 1)
+                if not should_stop:
+                    return false
+            nil:
+                pass
+
+        # Check expression condition (e.g., "x > 10")
+        match bp.condition:
+            Some(cond):
+                # Evaluate condition expression
+                # NOTE: Full expression evaluation requires interpreter integration
+                # For now, support simple patterns
+                return self.evaluate_condition(cond)
+            nil:
+                # No condition, always stop
+                return true
+
+    # Evaluate a hit condition
+    # Supports: "N" (stop on Nth hit), ">=N", ">N", "<=N", "<N", "==N", "%N" (every Nth)
+    fn evaluate_hit_condition(hit_cond: String, current_hit: Int) -> Bool:
+        val trimmed = hit_cond.trim()
+
+        # Modulo condition: "%N" means every Nth hit
+        if trimmed.starts_with("%"):
+            match trimmed.slice(1, trimmed.len()).parse_int():
+                Some(n):
+                    if n > 0:
+                        return current_hit % n == 0
+                nil:
+                    pass
+            return true
+
+        # Comparison conditions
+        if trimmed.starts_with(">="):
+            match trimmed.slice(2, trimmed.len()).trim().parse_int():
+                Some(n):
+                    return current_hit >= n
+                nil:
+                    return true
+        elif trimmed.starts_with(">"):
+            match trimmed.slice(1, trimmed.len()).trim().parse_int():
+                Some(n):
+                    return current_hit > n
+                nil:
+                    return true
+        elif trimmed.starts_with("<="):
+            match trimmed.slice(2, trimmed.len()).trim().parse_int():
+                Some(n):
+                    return current_hit <= n
+                nil:
+                    return true
+        elif trimmed.starts_with("<"):
+            match trimmed.slice(1, trimmed.len()).trim().parse_int():
+                Some(n):
+                    return current_hit < n
+                nil:
+                    return true
+        elif trimmed.starts_with("=="):
+            match trimmed.slice(2, trimmed.len()).trim().parse_int():
+                Some(n):
+                    return current_hit == n
+                nil:
+                    return true
+        else:
+            # Plain number: stop on exactly Nth hit
+            match trimmed.parse_int():
+                Some(n):
+                    return current_hit == n
+                nil:
+                    return true
+
+        true
+
+    # Evaluate a condition expression
+    # NOTE: Full expression evaluation requires interpreter integration
+    # For now, support: "true", "false", simple comparisons
+    fn evaluate_condition(condition: String) -> Bool:
+        val trimmed = condition.trim().lower()
+
+        # Boolean literals
+        if trimmed == "true":
+            return true
+        if trimmed == "false":
+            return false
+
+        # NOTE: More complex conditions like "x > 10" require:
+        # 1. Access to current variable values from debug context
+        # 2. Expression parser and evaluator
+        # For now, treat unknown conditions as true (stop)
+        true
+
+    # Increment hit count for a breakpoint
+    fn increment_hit_count(breakpoint_id: Int):
+        for (source_path, bps) in self.breakpoints.items():
+            for bp in bps:
+                if bp.id == breakpoint_id:
+                    bp.hit_count = bp.hit_count + 1
+                    return
+
+    # Get total breakpoint count
+    fn count() -> Int:
+        var total = 0
+        for (_, bps) in self.breakpoints.items():
+            total = total + bps.len()
+        total

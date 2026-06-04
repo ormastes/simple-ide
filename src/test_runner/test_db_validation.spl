@@ -1,0 +1,305 @@
+# Test Database Validation
+#
+# Validates database integrity after loading: count consistency,
+# interner bounds, stale runs, unqualified ignores, run record integrity.
+
+use std.io.{time_now_unix_micros}
+use std.io.{is_dir}
+use std.test_runner.test_db_compat (parse_rfc3339_to_micros)
+use std.test_runner.test_db_types (RunRecord)
+use std.test_runner.test_db_core (TestDatabase)
+use std.test_runner.string_interner (StringInterner)
+
+# =========================================================================
+# Validation Issue
+# =========================================================================
+
+struct ValidationIssue:
+    violation_type: text
+    severity: text
+    message: text
+    auto_fixable: bool
+
+# =========================================================================
+# Validation Report
+# =========================================================================
+
+struct ValidationReport:
+    violations: List<ValidationIssue>
+    auto_fixable: bool
+
+impl ValidationReport:
+    fn has_violations() -> bool:
+        self.violations.len() > 0
+
+    fn max_severity() -> text:
+        var has_critical = false
+        var has_error = false
+        var has_warning = false
+
+        for v in self.violations:
+            if v.severity == "Critical":
+                has_critical = true
+            elif v.severity == "Error":
+                has_error = true
+            elif v.severity == "Warning":
+                has_warning = true
+
+        if has_critical:
+            "Critical"
+        elif has_error:
+            "Error"
+        elif has_warning:
+            "Warning"
+        else:
+            "Info"
+
+# =========================================================================
+# Process Existence Check
+# =========================================================================
+
+fn process_exists(pid: i64) -> bool:
+    # Check if process exists via /proc filesystem (Linux)
+    is_dir("/proc/{pid}")
+
+# =========================================================================
+# Main Validation
+# =========================================================================
+
+fn validate_database(db: TestDatabase) -> List<ValidationIssue>:
+    var issues: List<ValidationIssue> = []
+
+    # Check interner bounds
+    val interner_issues = validate_interner_bounds(db)
+    for issue in interner_issues:
+        issues.push(issue)
+
+    # Check count consistency
+    val count_issues = validate_count_consistency(db)
+    for issue in count_issues:
+        issues.push(issue)
+
+    # Check stale runs
+    val stale_issues = validate_stale_runs(db)
+    for issue in stale_issues:
+        issues.push(issue)
+
+    issues
+
+# =========================================================================
+# Interner Bounds
+# =========================================================================
+
+fn validate_interner_bounds(db: TestDatabase) -> List<ValidationIssue>:
+    var issues: List<ValidationIssue> = []
+    val max_id = db.interner.len()
+
+    for t in db.tests:
+        if t.name_str >= max_id or t.name_str < 0:
+            issues.push(ValidationIssue(
+                violation_type: "InternerBounds",
+                severity: "error",
+                message: "Test name_str {t.name_str} out of interner bounds (max {max_id})",
+                auto_fixable: false
+            ))
+        if t.category_str >= max_id or t.category_str < 0:
+            issues.push(ValidationIssue(
+                violation_type: "InternerBounds",
+                severity: "warning",
+                message: "Test category_str {t.category_str} out of interner bounds",
+                auto_fixable: false
+            ))
+        if t.status_str >= max_id or t.status_str < 0:
+            issues.push(ValidationIssue(
+                violation_type: "InternerBounds",
+                severity: "warning",
+                message: "Test status_str {t.status_str} out of interner bounds",
+                auto_fixable: false
+            ))
+
+    for s in db.suites:
+        if s.name_str >= max_id or s.name_str < 0:
+            issues.push(ValidationIssue(
+                violation_type: "InternerBounds",
+                severity: "error",
+                message: "Suite name_str {s.name_str} out of interner bounds",
+                auto_fixable: false
+            ))
+
+    issues
+
+# =========================================================================
+# Count Consistency
+# =========================================================================
+
+fn validate_count_consistency(db: TestDatabase) -> List<ValidationIssue>:
+    var issues: List<ValidationIssue> = []
+
+    for c in db.counters:
+        if c.passed + c.failed > c.total_runs:
+            issues.push(ValidationIssue(
+                violation_type: "CountInconsistent",
+                severity: "warning",
+                message: "Counter for test {c.test_id}: passed ({c.passed}) + failed ({c.failed}) > total_runs ({c.total_runs})",
+                auto_fixable: true
+            ))
+        if c.total_runs < 0 or c.passed < 0 or c.failed < 0:
+            issues.push(ValidationIssue(
+                violation_type: "CountInconsistent",
+                severity: "error",
+                message: "Counter for test {c.test_id}: negative count detected",
+                auto_fixable: true
+            ))
+
+    issues
+
+# =========================================================================
+# Stale Runs
+# =========================================================================
+
+fn validate_stale_runs(db: TestDatabase) -> List<ValidationIssue>:
+    var issues: List<ValidationIssue> = []
+
+    for r in db.test_runs:
+        if r.status == "running":
+            issues.push(ValidationIssue(
+                violation_type: "StaleRunning",
+                severity: "warning",
+                message: "Run {r.run_id} still marked as running (started {r.start_time})",
+                auto_fixable: true
+            ))
+
+    issues
+
+# =========================================================================
+# Qualification Check
+# =========================================================================
+
+fn needs_qualification(test: TestRecord, interner: StringInterner) -> bool:
+    val status = interner.get(test.status_str)
+    if status == "ignored" and test.qualified_by == "":
+        return true
+    false
+
+fn count_unqualified_ignores(db: TestDatabase) -> i64:
+    var count = 0
+    for t in db.tests:
+        if needs_qualification(t, db.interner):
+            count = count + 1
+    count
+
+# =========================================================================
+# Print Warnings
+# =========================================================================
+
+fn print_validation_warnings(issues: List<ValidationIssue>):
+    var errors = 0
+    var warnings = 0
+    for issue in issues:
+        if issue.severity == "error":
+            print "DB ERROR: {issue.message}"
+            errors = errors + 1
+        elif issue.severity == "warning":
+            warnings = warnings + 1
+
+    if errors > 0:
+        print "Database has {errors} error(s) and {warnings} warning(s)"
+    elif warnings > 0:
+        print "Database has {warnings} warning(s)"
+
+# =========================================================================
+# Run Record Validation
+# =========================================================================
+
+fn validate_run_record(run: RunRecord) -> ValidationReport:
+    var violations: List<ValidationIssue> = []
+    var any_auto_fixable = false
+
+    val now_micros = time_now_unix_micros()
+    val start_micros = parse_rfc3339_to_micros(run.start_time)
+    val end_micros = if run.end_time != "": parse_rfc3339_to_micros(run.end_time) else: 0
+
+    # Check stale running (>2 hours old)
+    if run.status == "Running":
+        val age_hours = (now_micros - start_micros) / (3600 * 1000000)
+        if age_hours > 2:
+            violations.push(ValidationIssue(
+                violation_type: "StaleRunning",
+                severity: "Warning",
+                message: "Run {run.run_id} has been running for {age_hours} hours (>2 hour threshold)",
+                auto_fixable: true
+            ))
+            any_auto_fixable = true
+
+    # Check dead process
+    if run.status == "Running":
+        if not process_exists(run.pid):
+            violations.push(ValidationIssue(
+                violation_type: "DeadProcess",
+                severity: "Error",
+                message: "Run {run.run_id} process {run.pid} no longer exists",
+                auto_fixable: true
+            ))
+            any_auto_fixable = true
+
+    # Check timestamp consistency
+    if run.end_time != "" and start_micros > 0 and end_micros > 0:
+        if end_micros < start_micros:
+            violations.push(ValidationIssue(
+                violation_type: "TimestampInconsistent",
+                severity: "Error",
+                message: "Run {run.run_id} end_time ({run.end_time}) before start_time ({run.start_time})",
+                auto_fixable: false
+            ))
+
+    # Check future timestamps
+    if start_micros > now_micros:
+        violations.push(ValidationIssue(
+            violation_type: "FutureTimestamp",
+            severity: "Critical",
+            message: "Run {run.run_id} has future start_time ({run.start_time})",
+            auto_fixable: false
+        ))
+
+    # Check count consistency
+    val sum_counts = run.passed + run.failed + run.crashed + run.timed_out
+    if sum_counts > run.test_count:
+        violations.push(ValidationIssue(
+            violation_type: "CountInconsistent",
+            severity: "Error",
+            message: "Run {run.run_id} count sum ({sum_counts}) > test_count ({run.test_count})",
+            auto_fixable: false
+        ))
+
+    # Check status consistency
+    if run.status == "Completed" or run.status == "Crashed":
+        if run.end_time == "":
+            violations.push(ValidationIssue(
+                violation_type: "StatusInconsistent",
+                severity: "Error",
+                message: "Run {run.run_id} has status {run.status} but no end_time",
+                auto_fixable: false
+            ))
+    elif run.status == "Running":
+        if run.end_time != "":
+            violations.push(ValidationIssue(
+                violation_type: "StatusInconsistent",
+                severity: "Warning",
+                message: "Run {run.run_id} has status Running but has end_time",
+                auto_fixable: false
+            ))
+
+    # Check invalid timestamp format (if parse returned 0 for non-empty string)
+    if run.start_time != "" and start_micros == 0:
+        violations.push(ValidationIssue(
+            violation_type: "InvalidValue",
+            severity: "Error",
+            message: "Run {run.run_id} has invalid start_time format: {run.start_time}",
+            auto_fixable: false
+        ))
+
+    ValidationReport(
+        violations: violations,
+        auto_fixable: any_auto_fixable
+    )
+

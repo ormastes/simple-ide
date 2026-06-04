@@ -1,0 +1,96 @@
+# Environment Panel — TUI View
+#
+# Renders Claude Code artifacts as text lines for the TUI dashboard.
+# Shows CLAUDE.md files, skills, agents, MCPs, hooks, memory.
+
+use std.nogc_async_mut.llm_diagnostics.env_scanner.{
+    EnvSummary, ClaudeMdFile, SkillDef, AgentDef,
+    McpServerDef, HookDef, MemoryFile, TemplateDef
+}
+use app.ui.render.ansi.{RESET, BOLD, DIM, FG_BLUE, FG_GREEN, FG_YELLOW, FG_MAGENTA, FG_CYAN}
+
+fn render_env_panel(env: EnvSummary, max_lines: i64) -> [text]:
+    """Render environment summary as TUI lines."""
+    var lines: [text] = []
+
+    # Summary header
+    lines.push(BOLD + "Claude Code Environment" + RESET)
+    var summary_parts: [text] = []
+    summary_parts.push(FG_BLUE + env.claude_md_files.len().to_text() + " CLAUDE.md" + RESET)
+    summary_parts.push(FG_YELLOW + env.skills.len().to_text() + " skills" + RESET)
+    summary_parts.push(FG_GREEN + env.agents.len().to_text() + " agents" + RESET)
+    summary_parts.push(FG_MAGENTA + env.mcp_servers.len().to_text() + " MCPs" + RESET)
+    summary_parts.push(FG_CYAN + env.hooks.len().to_text() + " hooks" + RESET)
+    lines.push(summary_parts.join(" · "))
+    lines.push(DIM + "~" + env.total_estimated_startup_tokens.to_text() + " estimated startup tokens" + RESET)
+    lines.push("")
+
+    # CLAUDE.md
+    if env.claude_md_files.len() > 0:
+        lines.push(FG_BLUE + BOLD + "CLAUDE.md Files" + RESET)
+        for md in env.claude_md_files:
+            lines.push("  [" + md.scope + "] " + short_path_tui(md.path) + DIM + " ~" + md.estimated_tokens.to_text() + "tok" + RESET)
+        lines.push("")
+
+    # Skills
+    if env.skills.len() > 0:
+        lines.push(FG_YELLOW + BOLD + "Skills" + RESET)
+        for skill in env.skills:
+            lines.push("  /" + skill.name + DIM + " ~" + skill.estimated_tokens.to_text() + "tok" + RESET)
+        lines.push("")
+
+    # Agents
+    if env.agents.len() > 0:
+        lines.push(FG_GREEN + BOLD + "Agents" + RESET)
+        for agent in env.agents:
+            lines.push("  " + agent.name + DIM + " ~" + agent.estimated_tokens.to_text() + "tok" + RESET)
+        lines.push("")
+
+    # MCPs
+    if env.mcp_servers.len() > 0:
+        lines.push(FG_MAGENTA + BOLD + "MCP Servers" + RESET)
+        for server in env.mcp_servers:
+            var line = "  " + server.name
+            if server.command.len() > 0:
+                line = line + DIM + " -> " + server.command + RESET
+            lines.push(line)
+        lines.push("")
+
+    # Hooks
+    if env.hooks.len() > 0:
+        lines.push(FG_CYAN + BOLD + "Hooks" + RESET)
+        for hook in env.hooks:
+            lines.push("  " + hook.event_type + DIM + " (" + hook.hook_type + ")" + RESET)
+        lines.push("")
+
+    # Memory
+    if env.memory_files.len() > 0:
+        lines.push(BOLD + "Memory Files" + RESET)
+        for mem in env.memory_files:
+            lines.push("  [" + mem.memory_type + "] " + mem.name)
+        lines.push("")
+
+    # Truncate to max_lines
+    if lines.len() > max_lines:
+        var truncated: [text] = []
+        var i = 0
+        while i < max_lines - 1:
+            truncated.push(lines[i])
+            i = i + 1
+        truncated.push(DIM + "... (" + (lines.len() - max_lines + 1).to_text() + " more lines)" + RESET)
+        return truncated
+
+    lines
+
+fn short_path_tui(path: text) -> text:
+    """Shorten path for TUI display."""
+    val parts = path.split("/")
+    if parts.len() <= 4:
+        return path
+    var result: [text] = []
+    result.push("...")
+    var i = parts.len() - 3
+    while i < parts.len():
+        result.push(parts[i])
+        i = i + 1
+    result.join("/")

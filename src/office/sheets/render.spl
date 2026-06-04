@@ -1,0 +1,162 @@
+# Sheets Rendering Helpers
+#
+# Cell formatting and display utilities for the canonical Office Sheets app.
+
+fn format_number(value: f64, decimals: i32) -> text:
+    """Format a number with the specified number of decimal places."""
+    if decimals <= 0:
+        val rounded = _round_to_int(value)
+        return "{rounded}"
+    val factor = _pow10(decimals)
+    val factor_i = _pow10_i64(decimals)
+    val shifted = value * factor
+    val rounded_i = _round_to_int(shifted)
+    val int_part = rounded_i / factor_i
+    var frac_abs = rounded_i - (int_part * factor_i)
+    if frac_abs < 0:
+        frac_abs = 0 - frac_abs
+    var frac_str = "{frac_abs}"
+    while frac_str.len() < decimals:
+        frac_str = "0{frac_str}"
+    "{int_part}.{frac_str}"
+
+fn format_currency(value: f64, symbol: text, decimals: i32) -> text:
+    """Format a number as currency with the given symbol and decimal places."""
+    if value < 0.0:
+        val abs_val = 0.0 - value
+        val formatted = _format_with_commas(abs_val, decimals)
+        return "-{symbol}{formatted}"
+    val formatted = _format_with_commas(value, decimals)
+    "{symbol}{formatted}"
+
+fn format_percent(value: f64, decimals: i32) -> text:
+    """Format a number as a percentage."""
+    val pct = value * 100.0
+    val formatted = format_number(pct, decimals)
+    "{formatted}%"
+
+fn apply_cell_format(value: f64, format: text) -> text:
+    """Parse a format string and apply it to the given numeric value."""
+    if format == "general":
+        return _format_general(value)
+    if format.starts_with("number:"):
+        val dec_str = format.substring(7)
+        return format_number(value, _parse_int(dec_str))
+    if format.starts_with("currency:"):
+        val rest = format.substring(9)
+        val parts = rest.split(":")
+        if parts.len() >= 2:
+            return format_currency(value, parts[0], _parse_int(parts[1]))
+        return format_currency(value, "$", 2)
+    if format.starts_with("percent:"):
+        val dec_str = format.substring(8)
+        return format_percent(value, _parse_int(dec_str))
+    if format == "date":
+        return _format_serial_date(value)
+    _format_general(value)
+
+fn _format_general(value: f64) -> text:
+    val int_val = _truncate_to_i64(value)
+    val diff = value - int_val.to_f64()
+    if diff == 0.0:
+        return "{int_val}"
+    "{value}"
+
+fn _format_with_commas(value: f64, decimals: i32) -> text:
+    val base = format_number(value, decimals)
+    if base.contains("."):
+        val parts = base.split(".")
+        return _insert_commas(parts[0]) + "." + parts[1]
+    _insert_commas(base)
+
+fn _insert_commas(int_str: text) -> text:
+    val len = int_str.len()
+    if len <= 3:
+        return int_str
+    var result = ""
+    var i = 0
+    while i < len:
+        val pos_from_right = len - i
+        if pos_from_right % 3 == 0 and i > 0:
+            result = result + ","
+        result = result + int_str.char_at(i)
+        i = i + 1
+    result
+
+fn _round_to_int(value: f64) -> i64:
+    if value < 0.0:
+        return 0 - _round_to_int(0.0 - value)
+    var remaining = value
+    var n: i64 = 0
+    while remaining >= 1.0 and n < 1000000:
+        remaining = remaining - 1.0
+        n = n + 1
+    n
+
+fn _pow10(exp: i32) -> f64:
+    var result = 1.0
+    var i = 0
+    while i < exp:
+        result = result * 10.0
+        i = i + 1
+    result
+
+fn _pow10_i64(exp: i32) -> i64:
+    var result = 1
+    var i = 0
+    while i < exp:
+        result = result * 10
+        i = i + 1
+    result
+
+fn _format_serial_date(value: f64) -> text:
+    """Format a non-negative serial day count as YYYY-MM-DD using a simple 365/30 calendar."""
+    if value < 0.0:
+        return _format_general(value)
+    var remaining = value + 0.5
+    var year = 1970
+    while remaining >= 365.0:
+        remaining = remaining - 365.0
+        year = year + 1
+    var month = 1
+    while remaining >= 30.0 and month < 12:
+        remaining = remaining - 30.0
+        month = month + 1
+    var day = _round_to_int(remaining) + 1
+    if month > 12:
+        month = 12
+    if day > 31:
+        day = 31
+    val month_text = if month < 10: "0{month}" else: "{month}"
+    val day_text = if day < 10: "0{day}" else: "{day}"
+    "{year}-{month_text}-{day_text}"
+
+fn _parse_int(s: text) -> i32:
+    if s.len() == 0:
+        return 0
+    var result = 0
+    var i = 0
+    while i < s.len():
+        val c = s.char_at(i)
+        if _is_digit(c):
+            result = result * 10 + _digit_value(c)
+        else:
+            return 0
+        i = i + 1
+    result
+
+fn _is_digit(c: text) -> bool:
+    c == "0" or c == "1" or c == "2" or c == "3" or c == "4" or c == "5" or c == "6" or c == "7" or c == "8" or c == "9"
+
+fn _digit_value(c: text) -> i32:
+    c.char_code_at(0) - 48
+
+fn _truncate_to_i64(value: f64) -> i64:
+    if value < 0.0:
+        return 0 - _truncate_to_i64(0.0 - value)
+    var remaining = value
+    var n: i64 = 0
+    while remaining >= 1.0 and n < 1000000:
+        remaining = remaining - 1.0
+        n = n + 1
+    n

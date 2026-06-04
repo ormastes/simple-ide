@@ -1,0 +1,345 @@
+# Debug Adapter Protocol - Adapter Layer
+# Provides a unified interface for different debug backends (GDB, Trace32, Local)
+# This allows test runners and debug tools to work transparently with any backend.
+
+use std.nogc_async_mut.debug.coordinator.{VarInfo, FrameInfo, LocationInfo}
+
+# Common debug adapter interface
+# All debug backends (GDB, Trace32, local interpreter) implement this trait
+trait DebugAdapter:
+    # --- Connection Management ---
+
+    # Get adapter name/type
+    fn name() -> text
+
+    # Check if connected/attached
+    fn is_attached() -> bool
+
+    # Attach to target (load symbols, connect to process)
+    fn attach(program: text, args: [text]) -> Result<text, text>
+
+    # Detach from target
+    fn detach() -> Result<text, text>
+
+    # --- Execution Control ---
+
+    # Halt execution (async break)
+    fn halt() -> Result<text, text>
+
+    # Resume execution
+    fn resume() -> Result<text, text>
+
+    # Single step (step into)
+    fn single_step() -> Result<text, text>
+
+    # Step over function calls
+    fn step_over() -> Result<text, text>
+
+    # Step out of current function
+    fn step_out() -> Result<text, text>
+
+    # Reverse step (step back one instruction/statement)
+    fn reverse_step() -> Result<text, text>
+
+    # Reverse continue (run backward to previous breakpoint)
+    fn reverse_continue() -> Result<text, text>
+
+    # Reset target (restart execution from beginning)
+    fn reset() -> Result<text, text>
+
+    # --- Breakpoints ---
+
+    # Set breakpoint at file:line
+    fn set_breakpoint(file: text, line: i32) -> Result<i32, text>
+
+    # Set breakpoint at address
+    fn set_breakpoint_at_addr(addr: i64) -> Result<i32, text>
+
+    # Delete breakpoint by ID
+    fn delete_breakpoint(id: i32) -> Result<text, text>
+
+    # Set watchpoint (memory access breakpoint)
+    fn set_watchpoint(expr: text, access: text) -> Result<i32, text>
+
+    # --- Variable Inspection ---
+
+    # Read local variables in current frame
+    fn read_locals() -> Result<[VarInfo], text>
+
+    # Read function arguments in current frame
+    fn read_arguments() -> Result<[VarInfo], text>
+
+    # Read global variables
+    fn read_globals() -> Result<[VarInfo], text>
+
+    # Evaluate expression in current context
+    fn evaluate(expr: text) -> Result<text, text>
+
+    # --- Stack Inspection ---
+
+    # Get full stack trace
+    fn stack_trace() -> Result<[FrameInfo], text>
+
+    # Get stack depth
+    fn stack_depth() -> Result<i32, text>
+
+    # Select frame for variable inspection
+    fn select_frame(level: i32) -> Result<text, text>
+
+    # Get current location (file, line, function)
+    fn current_location() -> Result<LocationInfo, text>
+
+    # --- Memory Access (bare-metal only) ---
+
+    # Read memory bytes
+    fn read_memory(addr: i64, size: i32) -> Result<[i32], text>
+
+    # Write memory bytes
+    fn write_memory(addr: i64, data: [i32]) -> Result<text, text>
+
+    # --- Register Access (bare-metal only) ---
+
+    # Read single register
+    fn read_register(name: text) -> Result<i64, text>
+
+    # Read all registers
+    fn read_all_registers() -> Result<Dict<text, i64>, text>
+
+    # Write register
+    fn write_register(name: text, value: i64) -> Result<text, text>
+
+    # --- Context Management ---
+
+    # Clear interpreter state (for test isolation)
+    # This is a no-op for hardware debuggers
+    fn clear_context() -> Result<text, text>
+
+    # Reload program (for test reruns)
+    fn reload_program(program: text) -> Result<text, text>
+
+    # Rich breakpoint with condition/hit_condition/log_message
+    fn set_breakpoint_rich(file: text, line: i32, condition: Option<text>,
+                           hit_condition: Option<text>, log_message: Option<text>) -> Result<i32, text>
+
+    # Nested variable expansion (for struct/array children)
+    fn list_children(var_ref: text) -> Result<[VarInfo], text>
+
+    # Get adapter capabilities
+    fn capabilities() -> AdapterCapabilities
+
+# Adapter capabilities
+# Reports what features this adapter supports
+class AdapterCapabilities:
+    can_reset: bool              # Can reset/restart target
+    can_reload: bool             # Can reload program
+    can_clear_context: bool      # Can clear interpreter state
+    supports_memory: bool        # Supports memory read/write
+    supports_registers: bool     # Supports register access
+    supports_watchpoints: bool   # Supports memory watchpoints
+    supports_threads: bool       # Supports multi-threaded debugging
+    supports_reverse: bool       # Supports reverse debugging (stepBack, reverseContinue)
+    max_watchpoints: i32         # Maximum number of watchpoints (0 = none)
+
+    static fn full() -> AdapterCapabilities:
+        AdapterCapabilities(
+            can_reset: true,
+            can_reload: true,
+            can_clear_context: true,
+            supports_memory: true,
+            supports_registers: true,
+            supports_watchpoints: true,
+            supports_threads: true,
+            supports_reverse: false,
+            max_watchpoints: 1024
+        )
+
+    static fn basic() -> AdapterCapabilities:
+        AdapterCapabilities(
+            can_reset: false,
+            can_reload: false,
+            can_clear_context: false,
+            supports_memory: false,
+            supports_registers: false,
+            supports_watchpoints: false,
+            supports_threads: false,
+            supports_reverse: false,
+            max_watchpoints: 0
+        )
+
+    static fn replay() -> AdapterCapabilities:
+        AdapterCapabilities(
+            can_reset: true,
+            can_reload: false,
+            can_clear_context: false,
+            supports_memory: true,
+            supports_registers: true,
+            supports_watchpoints: false,
+            supports_threads: false,
+            supports_reverse: true,
+            max_watchpoints: 0
+        )
+
+    fn with_reset() -> AdapterCapabilities:
+        AdapterCapabilities(
+            can_reset: true,
+            can_reload: self.can_reload,
+            can_clear_context: self.can_clear_context,
+            supports_memory: self.supports_memory,
+            supports_registers: self.supports_registers,
+            supports_watchpoints: self.supports_watchpoints,
+            supports_threads: self.supports_threads,
+            supports_reverse: self.supports_reverse,
+            max_watchpoints: self.max_watchpoints
+        )
+
+    fn with_memory() -> AdapterCapabilities:
+        AdapterCapabilities(
+            can_reset: self.can_reset,
+            can_reload: self.can_reload,
+            can_clear_context: self.can_clear_context,
+            supports_memory: true,
+            supports_registers: self.supports_registers,
+            supports_watchpoints: self.supports_watchpoints,
+            supports_threads: self.supports_threads,
+            supports_reverse: self.supports_reverse,
+            max_watchpoints: self.max_watchpoints
+        )
+
+    fn with_registers() -> AdapterCapabilities:
+        AdapterCapabilities(
+            can_reset: self.can_reset,
+            can_reload: self.can_reload,
+            can_clear_context: self.can_clear_context,
+            supports_memory: self.supports_memory,
+            supports_registers: true,
+            supports_watchpoints: self.supports_watchpoints,
+            supports_threads: self.supports_threads,
+            supports_reverse: self.supports_reverse,
+            max_watchpoints: self.max_watchpoints
+        )
+
+    fn with_reload() -> AdapterCapabilities:
+        AdapterCapabilities(
+            can_reset: self.can_reset,
+            can_reload: true,
+            can_clear_context: self.can_clear_context,
+            supports_memory: self.supports_memory,
+            supports_registers: self.supports_registers,
+            supports_watchpoints: self.supports_watchpoints,
+            supports_threads: self.supports_threads,
+            supports_reverse: self.supports_reverse,
+            max_watchpoints: self.max_watchpoints
+        )
+
+    fn with_clear_context() -> AdapterCapabilities:
+        AdapterCapabilities(
+            can_reset: self.can_reset,
+            can_reload: self.can_reload,
+            can_clear_context: true,
+            supports_memory: self.supports_memory,
+            supports_registers: self.supports_registers,
+            supports_watchpoints: self.supports_watchpoints,
+            supports_threads: self.supports_threads,
+            supports_reverse: self.supports_reverse,
+            max_watchpoints: self.max_watchpoints
+        )
+
+    fn with_watchpoints(cap: i32) -> AdapterCapabilities:
+        AdapterCapabilities(
+            can_reset: self.can_reset,
+            can_reload: self.can_reload,
+            can_clear_context: self.can_clear_context,
+            supports_memory: self.supports_memory,
+            supports_registers: self.supports_registers,
+            supports_watchpoints: true,
+            supports_threads: self.supports_threads,
+            supports_reverse: self.supports_reverse,
+            max_watchpoints: cap
+        )
+
+# Adapter configuration
+class AdapterConfig:
+    adapter_type: text           # "gdb", "trace32", "local"
+    host: text                   # Target host (for remote)
+    port: i32                    # Target port (for remote)
+    program: text                # Program to debug
+    args: [text]                 # Program arguments
+    timeout_ms: i64              # Operation timeout
+    architecture: text           # Target architecture ("x86_64", "riscv32", "arm", etc.)
+
+    static fn local(program: text) -> AdapterConfig:
+        AdapterConfig(
+            adapter_type: "local",
+            host: "",
+            port: 0,
+            program: program,
+            args: [],
+            timeout_ms: 30000,
+            architecture: "x86_64"
+        )
+
+    static fn gdb(host: text, port: i32, program: text) -> AdapterConfig:
+        AdapterConfig(
+            adapter_type: "gdb",
+            host: host,
+            port: port,
+            program: program,
+            args: [],
+            timeout_ms: 30000,
+            architecture: "riscv32"
+        )
+
+    static fn trace32(host: text, port: i32, program: text) -> AdapterConfig:
+        AdapterConfig(
+            adapter_type: "trace32",
+            host: host,
+            port: port,
+            program: program,
+            args: [],
+            timeout_ms: 30000,
+            architecture: "arm"
+        )
+
+    static fn openocd(cfg: text, gdb_port: i32, program: text) -> AdapterConfig:
+        AdapterConfig(
+            adapter_type: "openocd",
+            host: "localhost",
+            port: gdb_port,
+            program: program,
+            args: [],
+            timeout_ms: 30000,
+            architecture: cfg
+        )
+
+    static fn t32_gdb_bridge(host: text, t32_port: i32, gdb_port: i32, program: text) -> AdapterConfig:
+        AdapterConfig(
+            adapter_type: "t32-gdb",
+            host: host,
+            port: t32_port,
+            program: program,
+            args: ["{gdb_port}"],
+            timeout_ms: 30000,
+            architecture: "arm"
+        )
+
+    static fn stlink_tools(serial: text, program: text) -> AdapterConfig:
+        AdapterConfig(
+            adapter_type: "stlink-tools",
+            host: "",
+            port: 0,
+            program: program,
+            args: [],
+            timeout_ms: 30000,
+            architecture: serial
+        )
+
+    static fn qemu_arm(host: text, port: i32, program: text) -> AdapterConfig:
+        AdapterConfig(
+            adapter_type: "gdb",
+            host: host,
+            port: port,
+            program: program,
+            args: [],
+            timeout_ms: 30000,
+            architecture: "arm"
+        )

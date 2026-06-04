@@ -1,0 +1,350 @@
+# LLM Dashboard Web Login
+#
+# File-backed multi-user login/session support for the web dashboard.
+# Uses bcrypt password verification and persistent session files under
+# `.build/llm_dashboard/auth`.
+
+use std.nogc_sync_mut.io.file_ops.{file_exists, file_read, file_write, file_remove}
+use std.nogc_sync_mut.io.dir_ops.{dir_create_all, dir_list}
+use std.nogc_sync_mut.io.env_ops.{env_get}
+use std.nogc_sync_mut.io.time_ops.{current_time_ms}
+use std.bcrypt.hash.{bcrypt_hash}
+use std.bcrypt.verify.{bcrypt_verify}
+use std.nogc_sync_mut.io.crypto_sffi.{random_hex}
+use std.web_framework.form_parser.{parse_url_encoded}
+
+val DASHBOARD_AUTH_ROOT = ".build/llm_dashboard/auth"
+val DASHBOARD_USERS_DIR = DASHBOARD_AUTH_ROOT + "/users"
+val DASHBOARD_SESSIONS_DIR = DASHBOARD_AUTH_ROOT + "/sessions"
+val DASHBOARD_SESSION_COOKIE = "llm_dashboard_session"
+val DASHBOARD_SESSION_TTL_MS: i64 = 12 * 60 * 60 * 1000
+
+class DashboardAuthUser:
+    username: text
+    password_hash: text
+    role: text
+    capabilities: [text]
+    created_at_ms: i64
+    last_login_ms: i64
+
+class DashboardAuthSession:
+    session_id: text
+    username: text
+    role: text
+    capabilities: [text]
+    created_at_ms: i64
+    expires_at_ms: i64
+    last_seen_ms: i64
+
+fn auth_ensure_bootstrap():
+    _ensure_auth_dirs()
+    val entries = dir_list(DASHBOARD_USERS_DIR)
+    if entries.len() > 0:
+        return
+
+    val env_user = env_get("SIMPLE_LLM_DASHBOARD_ADMIN_USER") ?? ""
+    val env_password = env_get("SIMPLE_LLM_DASHBOARD_ADMIN_PASSWORD") ?? ""
+    val username = _first_non_empty([
+        env_user,
+        "admin"
+    ])
+    val password = _first_non_empty([
+        env_password,
+        "llm-dashboard"
+    ])
+    val now = current_time_ms()
+    val user = DashboardAuthUser(
+        username: username,
+        password_hash: bcrypt_hash(password, 12),
+        role: "admin",
+        capabilities: _default_admin_capabilities(),
+        created_at_ms: now,
+        last_login_ms: 0
+    )
+    val _ = _save_user(user)
+    print "LLM dashboard bootstrap user created: {username}"
+    print "LLM dashboard bootstrap password: {password}"
+    if env_password == "":
+        print "WARNING: using default bootstrap password for local development only."
+
+fn auth_authenticate_form(body: text) -> (DashboardAuthSession?, text, text):
+    auth_ensure_bootstrap()
+    val params = parse_url_encoded(body)
+    val username = params.get("username") ?? ""
+    val password = params.get("password") ?? ""
+
+    if username.trim() == "" or password.trim() == "":
+        return (nil, "Enter your username and password.", username)
+
+    if val user = _load_user(username.trim()):
+        if bcrypt_verify(password, user.password_hash):
+            val session = _issue_session(user)
+            return (session, "", user.username)
+    return (nil, "Invalid username or password.", username)
+
+fn auth_session_from_headers(headers: text) -> DashboardAuthSession?:
+    val session_id = _extract_cookie(headers, DASHBOARD_SESSION_COOKIE)
+    if session_id == "":
+        return nil
+    if val session = _load_session(session_id):
+        if session.expires_at_ms <= current_time_ms():
+            auth_delete_session(session.session_id)
+            return nil
+        var refreshed = session
+        refreshed.last_seen_ms = current_time_ms()
+        val _ = _save_session(refreshed)
+        return refreshed
+    nil
+
+fn auth_delete_session(session_id: text):
+    if session_id.trim() == "":
+        return
+    val _ = file_remove(_session_path(session_id))
+
+fn auth_has_capability(session: DashboardAuthSession, capability: text) -> bool:
+    if session == nil:
+        return false
+    if session.role == "admin":
+        return true
+    session.capabilities.contains(capability)
+
+fn auth_login_page(error_message: text, username: text) -> text:
+    var h: [text] = []
+    h.push("<!DOCTYPE html>")
+    h.push("<html lang=\"en\">")
+    h.push("<head>")
+    h.push("<meta charset=\"utf-8\">")
+    h.push("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
+    h.push("<title>LLM Dashboard Login</title>")
+    h.push("<style>")
+    h.push("body { margin: 0; min-height: 100vh; font-family: 'Segoe UI', Helvetica, Arial, sans-serif; background: radial-gradient(circle at top, #16324a 0%, #0d1117 42%, #090c10 100%); color: #e6edf3; display: flex; align-items: center; justify-content: center; }")
+    h.push(".shell { width: min(960px, calc(100vw - 32px)); display: grid; grid-template-columns: 1.15fr 0.85fr; background: rgba(14, 20, 27, 0.92); border: 1px solid rgba(122, 162, 201, 0.18); border-radius: 18px; overflow: hidden; box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45); }")
+    h.push(".hero { padding: 42px; background: linear-gradient(160deg, rgba(33, 82, 121, 0.9), rgba(10, 17, 23, 0.4)); }")
+    h.push(".hero h1 { margin: 0 0 14px; font-size: 34px; line-height: 1.08; }")
+    h.push(".hero p { margin: 0 0 22px; color: #d7e3ee; line-height: 1.6; }")
+    h.push(".hero ul { margin: 0; padding-left: 18px; color: #bdd0e0; line-height: 1.7; }")
+    h.push(".panel { padding: 42px 34px; background: rgba(9, 12, 16, 0.92); }")
+    h.push(".eyebrow { color: #7aa2c9; text-transform: uppercase; letter-spacing: 0.18em; font-size: 11px; margin-bottom: 10px; }")
+    h.push(".panel h2 { margin: 0 0 10px; font-size: 26px; }")
+    h.push(".panel p { margin: 0 0 18px; color: #96a7b7; line-height: 1.55; }")
+    h.push(".error { min-height: 22px; margin-bottom: 14px; color: #ff9f8f; font-size: 13px; }")
+    h.push("label { display: block; margin-bottom: 8px; color: #c6d4e1; font-size: 13px; }")
+    h.push("input { width: 100%; padding: 12px 13px; margin-bottom: 14px; border-radius: 10px; border: 1px solid #29445c; background: #0f1821; color: #e6edf3; font-size: 14px; }")
+    h.push("input:focus { outline: none; border-color: #7aa2c9; box-shadow: 0 0 0 3px rgba(122, 162, 201, 0.16); }")
+    h.push("button { width: 100%; padding: 12px 14px; border: none; border-radius: 10px; background: linear-gradient(135deg, #7aa2c9, #3f6d97); color: #071019; font-size: 14px; font-weight: 700; cursor: pointer; }")
+    h.push("button:hover { filter: brightness(1.05); }")
+    h.push(".foot { margin-top: 16px; color: #728396; font-size: 12px; line-height: 1.5; }")
+    h.push("@media (max-width: 820px) { .shell { grid-template-columns: 1fr; } .hero { padding: 28px; } .panel { padding: 28px; } }")
+    h.push("</style>")
+    h.push("</head>")
+    h.push("<body>")
+    h.push("<div class=\"shell\">")
+    h.push("<section class=\"hero\">")
+    h.push("<div class=\"eyebrow\">Peer Base Pack</div>")
+    h.push("<h1>LLM Dashboard Web Login</h1>")
+    h.push("<p>This dashboard now enters through a reusable login pack boundary: UI submits credentials, the auth service verifies identity, storage persists sessions, and authority checks gate sensitive surfaces.</p>")
+    h.push("<ul>")
+    h.push("<li>Persistent session cookies for the web dashboard</li>")
+    h.push("<li>Capability gates for tmux and terminal access</li>")
+    h.push("<li>File-backed local user/session store for bootstrap and restart durability</li>")
+    h.push("</ul>")
+    h.push("</section>")
+    h.push("<section class=\"panel\">")
+    h.push("<div class=\"eyebrow\">Secure Access</div>")
+    h.push("<h2>Sign in</h2>")
+    h.push("<p>Use the bootstrap account printed when the server starts, or configure `SIMPLE_LLM_DASHBOARD_ADMIN_USER` and `SIMPLE_LLM_DASHBOARD_ADMIN_PASSWORD`.</p>")
+    h.push("<div class=\"error\">{_html_escape(error_message)}</div>")
+    h.push("<form method=\"POST\" action=\"/login\">")
+    h.push("<label for=\"username\">Username</label>")
+    h.push("<input id=\"username\" name=\"username\" type=\"text\" value=\"{_html_escape(username)}\" autocomplete=\"username\">")
+    h.push("<label for=\"password\">Password</label>")
+    h.push("<input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\">")
+    h.push("<button type=\"submit\">Open Dashboard</button>")
+    h.push("</form>")
+    h.push("<div class=\"foot\">Default local bootstrap: <code>admin</code> / <code>llm-dashboard</code> if no admin env vars are set and no user store exists yet.</div>")
+    h.push("</section>")
+    h.push("</div>")
+    h.push("</body>")
+    h.push("</html>")
+    h.join("\n")
+
+fn auth_login_cookie_header(session: DashboardAuthSession) -> text:
+    val max_age = (session.expires_at_ms - current_time_ms()) / 1000
+    "Set-Cookie: {DASHBOARD_SESSION_COOKIE}={session.session_id}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax"
+
+fn auth_clear_cookie_header() -> text:
+    "Set-Cookie: {DASHBOARD_SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+
+fn auth_identity_html(session: DashboardAuthSession) -> text:
+    "<span>{_html_escape(session.username)}</span><a href=\"/logout\">Log out</a>"
+
+fn _issue_session(user: DashboardAuthUser) -> DashboardAuthSession:
+    var updated_user = user
+    updated_user.last_login_ms = current_time_ms()
+    val _ = _save_user(updated_user)
+
+    val now = current_time_ms()
+    val session = DashboardAuthSession(
+        session_id: random_hex(24),
+        username: user.username,
+        role: user.role,
+        capabilities: user.capabilities,
+        created_at_ms: now,
+        expires_at_ms: now + DASHBOARD_SESSION_TTL_MS,
+        last_seen_ms: now
+    )
+    val _ = _save_session(session)
+    session
+
+fn _load_user(username: text) -> DashboardAuthUser?:
+    val path = _user_path(username)
+    if not file_exists(path):
+        return nil
+    val record = _parse_record(file_read(path))
+    if record.get("username") == nil:
+        return nil
+    DashboardAuthUser(
+        username: record.get("username") ?? username,
+        password_hash: record.get("password_hash") ?? "",
+        role: record.get("role") ?? "viewer",
+        capabilities: _parse_csv(record.get("capabilities") ?? ""),
+        created_at_ms: (record.get("created_at_ms") ?? "0").to_i64() ?? 0,
+        last_login_ms: (record.get("last_login_ms") ?? "0").to_i64() ?? 0
+    )
+
+fn _save_user(user: DashboardAuthUser) -> bool:
+    _ensure_auth_dirs()
+    var content: [text] = []
+    content.push("username={user.username}")
+    content.push("password_hash={user.password_hash}")
+    content.push("role={user.role}")
+    content.push("capabilities={user.capabilities.join(\",\")}")
+    content.push("created_at_ms={user.created_at_ms}")
+    content.push("last_login_ms={user.last_login_ms}")
+    file_write(_user_path(user.username), content.join("\n") + "\n")
+
+fn _load_session(session_id: text) -> DashboardAuthSession?:
+    val path = _session_path(session_id)
+    if not file_exists(path):
+        return nil
+    val record = _parse_record(file_read(path))
+    if record.get("session_id") == nil:
+        return nil
+    DashboardAuthSession(
+        session_id: record.get("session_id") ?? session_id,
+        username: record.get("username") ?? "",
+        role: record.get("role") ?? "viewer",
+        capabilities: _parse_csv(record.get("capabilities") ?? ""),
+        created_at_ms: (record.get("created_at_ms") ?? "0").to_i64() ?? 0,
+        expires_at_ms: (record.get("expires_at_ms") ?? "0").to_i64() ?? 0,
+        last_seen_ms: (record.get("last_seen_ms") ?? "0").to_i64() ?? 0
+    )
+
+fn _save_session(session: DashboardAuthSession) -> bool:
+    _ensure_auth_dirs()
+    var content: [text] = []
+    content.push("session_id={session.session_id}")
+    content.push("username={session.username}")
+    content.push("role={session.role}")
+    content.push("capabilities={session.capabilities.join(\",\")}")
+    content.push("created_at_ms={session.created_at_ms}")
+    content.push("expires_at_ms={session.expires_at_ms}")
+    content.push("last_seen_ms={session.last_seen_ms}")
+    file_write(_session_path(session.session_id), content.join("\n") + "\n")
+
+fn _ensure_auth_dirs():
+    val _ = dir_create_all(DASHBOARD_USERS_DIR)
+    val _ = dir_create_all(DASHBOARD_SESSIONS_DIR)
+
+fn _user_path(username: text) -> text:
+    "{DASHBOARD_USERS_DIR}/{_safe_key(username)}.sdn"
+
+fn _session_path(session_id: text) -> text:
+    "{DASHBOARD_SESSIONS_DIR}/{_safe_key(session_id)}.sdn"
+
+fn _safe_key(input: text) -> text:
+    var out = ""
+    var i = 0
+    while i < input.len():
+        val ch = input[i]
+        if _is_safe_key_char(ch):
+            out = "{out}{ch}"
+        else:
+            out = "{out}_"
+        i = i + 1
+    if out == "":
+        return "empty"
+    out
+
+fn _is_safe_key_char(ch: text) -> bool:
+    if ch == "_" or ch == "-" or ch == ".":
+        return true
+    if ch >= "a" and ch <= "z":
+        return true
+    if ch >= "A" and ch <= "Z":
+        return true
+    if ch >= "0" and ch <= "9":
+        return true
+    false
+
+fn _parse_record(content: text) -> Dict<text, text>:
+    var result: Dict<text, text> = {}
+    for raw_line in content.split("\n"):
+        val line = raw_line.trim()
+        if line == "" or line.starts_with("#"):
+            pass_dn
+        else:
+            val pos = line.index_of("=")
+            if pos > 0:
+                val key = line[0:pos].trim()
+                val value = line[pos + 1:].trim()
+                result[key] = value
+    result
+
+fn _parse_csv(raw: text) -> [text]:
+    var out: [text] = []
+    if raw.trim() == "":
+        return out
+    for item in raw.split(","):
+        val trimmed = item.trim()
+        if trimmed != "":
+            out.push(trimmed)
+    out
+
+fn _extract_cookie(headers: text, name: text) -> text:
+    for raw_line in headers.split("\n"):
+        val line = raw_line.trim()
+        if line.lower().starts_with("cookie:"):
+            val cookie_blob = line[7:].trim()
+            for part in cookie_blob.split(";"):
+                val cookie = part.trim()
+                val pos = cookie.index_of("=")
+                if pos > 0:
+                    val key = cookie[0:pos].trim()
+                    val value = cookie[pos + 1:].trim()
+                    if key == name:
+                        return value
+    ""
+
+fn _default_admin_capabilities() -> [text]:
+    [
+        "dashboard.view",
+        "dashboard.agents.view",
+        "dashboard.tasks.view",
+        "dashboard.terminal.use",
+        "dashboard.tmux.use"
+    ]
+
+fn _first_non_empty(values: [text]) -> text:
+    for value in values:
+        if value.trim() != "":
+            return value.trim()
+    ""
+
+fn _html_escape(input: text) -> text:
+    var out = input
+    out = out.replace("&", "&amp;")
+    out = out.replace("<", "&lt;")
+    out = out.replace(">", "&gt;")
+    out = out.replace("\"", "&quot;")
+    out

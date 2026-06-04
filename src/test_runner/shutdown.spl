@@ -1,0 +1,93 @@
+# Graceful Shutdown Coordinator
+# Orchestrates checkpoint save, process cleanup, and exit
+# Part of self-protecting test runner
+
+use std.io_runtime.{exit}
+use std.test_runner.checkpoint.{checkpoint_save}
+use std.test_runner.process_tracker.{tracker_kill_all_children, tracker_stop_all_containers}
+
+# ============================================================================
+# Exit Codes
+# ============================================================================
+
+val EXIT_SUCCESS = 0
+val EXIT_FAILURE = 1
+val EXIT_RESOURCE_SHUTDOWN = 42
+val EXIT_RECOVERY_FAILED = 43
+
+# ============================================================================
+# Graceful Shutdown
+# ============================================================================
+
+fn shutdown_graceful(reason: text, completed: [text], passed: i64, failed: i64, skipped: i64):
+    """Execute graceful shutdown sequence
+
+    Sequence:
+    1. Save checkpoint (most important - do first)
+    2. Kill child processes (SIGTERM + SIGKILL escalation)
+    3. Stop containers
+    4. Exit with code 42 (resource shutdown)
+
+    Args:
+        reason: Shutdown reason ('cpu' or 'memory')
+        completed: List of completed test file paths
+        passed: Total tests passed so far
+        failed: Total tests failed so far
+        skipped: Total tests skipped so far
+    """
+    print ""
+    print "========================================="
+    print "GRACEFUL SHUTDOWN INITIATED"
+    print "========================================="
+    print "Reason: {reason}"
+    print "Completed tests: {completed.len()}"
+    print "Passed: {passed}, Failed: {failed}, Skipped: {skipped}"
+    print ""
+
+    # Step 1: Save checkpoint FIRST (most critical)
+    print "[SHUTDOWN] Step 1/4: Saving checkpoint..."
+    checkpoint_save(completed, passed, failed, skipped, reason)
+    print "[SHUTDOWN] Checkpoint saved successfully"
+    print ""
+
+    # Step 2: Kill child processes
+    print "[SHUTDOWN] Step 2/4: Killing child processes..."
+    val killed = tracker_kill_all_children()
+    print "[SHUTDOWN] Killed {killed} processes"
+    print ""
+
+    # Step 3: Stop containers
+    print "[SHUTDOWN] Step 3/4: Stopping containers..."
+    val stopped = tracker_stop_all_containers()
+    print "[SHUTDOWN] Stopped {stopped} containers"
+    print ""
+
+    # Step 4: Exit with special code
+    print "[SHUTDOWN] Step 4/4: Exiting with code {EXIT_RESOURCE_SHUTDOWN}"
+    print ""
+    print "========================================="
+    print "GRACEFUL SHUTDOWN COMPLETE"
+    print "========================================="
+    print ""
+    print "To resume tests, run:"
+    print "  simple test --resume"
+    print ""
+
+    exit(EXIT_RESOURCE_SHUTDOWN)
+
+fn shutdown_format_summary(reason: text, completed: [text], passed: i64, failed: i64, skipped: i64) -> text:
+    """Format shutdown summary message"""
+    var summary = ""
+
+    summary = summary + "Shutdown Reason: {reason}\n"
+    summary = summary + "Tests Completed: {completed.len()}\n"
+    summary = summary + "  Passed:  {passed}\n"
+    summary = summary + "  Failed:  {failed}\n"
+    summary = summary + "  Skipped: {skipped}\n"
+
+    summary
+
+# ============================================================================
+# Exports
+# ============================================================================
+

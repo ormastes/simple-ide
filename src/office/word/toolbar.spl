@@ -1,0 +1,55 @@
+# Word Formatting Toolbar
+#
+# Builds the formatting toolbar for the document editor.
+
+use common.ui.widget.{WidgetNode}
+use common.ui.builder.{row, button}
+use common.ui.ios_icons.{ios_icon}
+
+# =========================================================================
+# Toolbar Builder
+# =========================================================================
+
+fn build_word_toolbar(id: text) -> WidgetNode:
+    """Return a row with formatting buttons for the Word editor.
+
+    Layout: Bold, Italic, Underline | H1, H2, H3 | Bullet List, Quote | Undo, Redo
+    Each button emits a named action for the event handler."""
+
+    var buttons: [WidgetNode] = []
+
+    # Text style buttons
+    val btn_bold = button("{id}_bold", ios_icon("bold"), "format_bold")
+    buttons = buttons.push(btn_bold)
+
+    val btn_italic = button("{id}_italic", ios_icon("italic"), "format_italic")
+    buttons = buttons.push(btn_italic)
+
+    val btn_underline = button("{id}_underline", ios_icon("underline"), "format_underline")
+    buttons = buttons.push(btn_underline)
+
+    # Heading buttons
+    val btn_h1 = button("{id}_h1", "H1", "format_h1")
+    buttons = buttons.push(btn_h1)
+
+    val btn_h2 = button("{id}_h2", "H2", "format_h2")
+    buttons = buttons.push(btn_h2)
+
+    val btn_h3 = button("{id}_h3", "H3", "format_h3")
+    buttons = buttons.push(btn_h3)
+
+    # Block format buttons
+    val btn_list = button("{id}_list", ios_icon("list.bullet"), "format_bullet_list")
+    buttons = buttons.push(btn_list)
+
+    val btn_quote = button("{id}_quote", ">", "format_quote")
+    buttons = buttons.push(btn_quote)
+
+    # Undo / Redo buttons
+    val btn_undo = button("{id}_undo", ios_icon("arrow.uturn.left"), "undo")
+    buttons = buttons.push(btn_undo)
+
+    val btn_redo = button("{id}_redo", ios_icon("arrow.right"), "redo")
+    buttons = buttons.push(btn_redo)
+
+    return row(id, buttons)

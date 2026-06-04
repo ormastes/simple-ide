@@ -1,0 +1,290 @@
+# Test Configuration
+#
+# Load test runner configuration from config/simple.test.sdn.
+# Provides thresholds for CPU, memory, timeouts, and test behavior.
+
+use std.io.{file_exists, file_read}
+use std.io.{env_get}
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn to_int_or(s: text, default: i64) -> i64:
+    val trimmed = s.trim()
+    if trimmed.len() == 0:
+        return default
+    var start_idx = 0
+    if trimmed[0:1] == "-":
+        start_idx = 1
+        if trimmed.len() == 1:
+            return default
+    var i = start_idx
+    while i < trimmed.len():
+        val c = trimmed[i:i+1]
+        if c < "0" or c > "9":
+            return default
+        i = i + 1
+    trimmed.to_int()
+
+fn parse_f64(s: text) -> f64:
+    val trimmed = s.trim()
+    if trimmed.len() == 0:
+        return 0.0
+    trimmed.to_float()
+
+# =========================================================================
+# Config Paths
+# =========================================================================
+
+val CONFIG_FILENAME = "config/simple.test.sdn"
+
+# =========================================================================
+# Test Config
+# =========================================================================
+
+struct TestConfig:
+    timeout_seconds: i64
+    memory_limit_mb: i64
+    cpu_limit_seconds: i64
+    max_fds: i64
+    max_procs: i64
+    parallel: bool
+    fail_fast: bool
+    slow_threshold_ms: i64
+    cpu_threshold: f64
+    memory_threshold: f64
+    throttle_enabled: bool
+    run_spec_tests: bool
+    run_sdoctests: bool
+    run_slow_tests: bool
+    run_spl_doctests: bool
+    ci_mode: bool
+    # Session sharing settings
+    session_share: bool
+    session_daemon: bool
+    session_idle_timeout_ms: i64
+    session_startup_timeout_ms: i64
+    session_debug: bool
+    session_max_qemu_vm: i64
+    session_max_container: i64
+    session_max_service: i64
+    session_max_openocd: i64
+    session_max_trace32: i64
+    session_max_simulator: i64
+
+fn parse_config_key_value(trimmed: text) -> (text, text):
+    val sep_idx = trimmed.index_of(":") ?? -1
+    if sep_idx < 0:
+        return ("", "")
+
+    val key = trimmed[0:sep_idx].trim()
+    var value = trimmed[sep_idx + 1:].trim()
+    val comment_idx = value.index_of("#") ?? -1
+    if comment_idx >= 0:
+        value = value[0:comment_idx].trim()
+    (key, value)
+
+fn apply_test_config_value(config: TestConfig, key: text, value: text):
+    match key:
+        case "timeout_seconds":
+            config.timeout_seconds = value.to_int_or(config.timeout_seconds)
+        case "timeout":
+            config.timeout_seconds = value.to_int_or(config.timeout_seconds)
+        case "memory_limit_mb":
+            config.memory_limit_mb = value.to_int_or(config.memory_limit_mb)
+        case "cpu_limit_seconds":
+            config.cpu_limit_seconds = value.to_int_or(config.cpu_limit_seconds)
+        case "max_fds":
+            config.max_fds = value.to_int_or(config.max_fds)
+        case "max_procs":
+            config.max_procs = value.to_int_or(config.max_procs)
+        case "parallel":
+            config.parallel = value == "true"
+        case "fail_fast":
+            config.fail_fast = value == "true"
+        case "slow_threshold_ms":
+            config.slow_threshold_ms = value.to_int_or(config.slow_threshold_ms)
+        case "cpu_threshold":
+            config.cpu_threshold = parse_f64(value)
+        case "memory_threshold":
+            config.memory_threshold = parse_f64(value)
+        case "throttle_enabled":
+            config.throttle_enabled = value == "true"
+        case "run_spec_tests":
+            config.run_spec_tests = value == "true"
+        case "run_sdoctests":
+            config.run_sdoctests = value == "true"
+        case "run_slow_tests":
+            config.run_slow_tests = value == "true"
+        case "run_spl_doctests":
+            config.run_spl_doctests = value == "true"
+        case "session_share":
+            config.session_share = value == "true"
+        case "session_daemon":
+            config.session_daemon = value == "true"
+        case "session_idle_timeout_ms":
+            config.session_idle_timeout_ms = value.to_int_or(config.session_idle_timeout_ms)
+        case "session_startup_timeout_ms":
+            config.session_startup_timeout_ms = value.to_int_or(config.session_startup_timeout_ms)
+        case "session_debug":
+            config.session_debug = value == "true"
+        case _:
+            ()
+
+fn parse_test_config_content(config: TestConfig, content: text) -> TestConfig:
+    val lines = content.split("\n")
+
+    var in_test_section = false
+    var in_cpu_throttle = false
+    var in_session_max = false
+    var in_session_defaults = false
+
+    for line in lines:
+        val trimmed = line.trim()
+        if trimmed == "" or trimmed.starts_with("#"):
+            continue
+        if trimmed == "test:":
+            in_test_section = true
+            in_cpu_throttle = false
+            in_session_max = false
+            in_session_defaults = false
+            continue
+        if not line.starts_with("  ") and trimmed.ends_with(":"):
+            in_test_section = false
+            in_cpu_throttle = false
+            in_session_max = false
+            in_session_defaults = false
+            continue
+        if not in_test_section:
+            val (top_key, top_value) = parse_config_key_value(trimmed)
+            if top_key != "":
+                apply_test_config_value(config, top_key, top_value)
+            continue
+
+        if trimmed == "cpu_throttle:":
+            in_cpu_throttle = true
+            in_session_max = false
+            in_session_defaults = false
+            continue
+        if trimmed == "session_max_sessions:":
+            in_session_max = true
+            in_cpu_throttle = false
+            in_session_defaults = false
+            continue
+        if trimmed == "session_defaults:":
+            in_session_defaults = true
+            in_cpu_throttle = false
+            in_session_max = false
+            continue
+        if line.starts_with("  ") and not line.starts_with("    ") and trimmed.ends_with(":"):
+            in_cpu_throttle = false
+            in_session_max = false
+            in_session_defaults = false
+            continue
+
+        val (key, value) = parse_config_key_value(trimmed)
+        if key == "":
+            continue
+        if in_cpu_throttle:
+            if key == "enabled":
+                apply_test_config_value(config, "throttle_enabled", value)
+            elif key == "threshold":
+                apply_test_config_value(config, "cpu_threshold", value)
+            elif key == "memory_threshold":
+                apply_test_config_value(config, "memory_threshold", value)
+        elif in_session_max:
+            _apply_session_max(config, key, value)
+        elif in_session_defaults:
+            # session_defaults sub-keys are kind-specific; skip for now (future use)
+            ()
+        else:
+            apply_test_config_value(config, key, value)
+
+    val ci_env = env_get("CI")
+    if ci_env == "true" or ci_env == "1":
+        config.ci_mode = true
+        config.run_slow_tests = true
+        config.fail_fast = false
+
+    config
+
+fn load_test_config_from_path(config_path: text) -> TestConfig:
+    val config = TestConfig.defaults()
+    if config_path == "":
+        return config
+
+    val content = file_read(config_path) ?? ""
+    if content == "":
+        return config
+
+    parse_test_config_content(config, content)
+
+impl TestConfig:
+    static fn load() -> TestConfig:
+        load_test_config_from_path(find_config_file())
+
+    static fn defaults() -> TestConfig:
+        TestConfig(
+            timeout_seconds: 60,
+            memory_limit_mb: 512,
+            cpu_limit_seconds: 30,
+            max_fds: 256,
+            max_procs: 64,
+            parallel: true,
+            fail_fast: false,
+            slow_threshold_ms: 5000,
+            cpu_threshold: 80.0,
+            memory_threshold: 80.0,
+            throttle_enabled: false,
+            run_spec_tests: true,
+            run_sdoctests: true,
+            run_slow_tests: false,
+            run_spl_doctests: false,
+            ci_mode: false,
+            session_share: false,
+            session_daemon: false,
+            session_idle_timeout_ms: 300000,
+            session_startup_timeout_ms: 60000,
+            session_debug: false,
+            session_max_qemu_vm: 4,
+            session_max_container: 2,
+            session_max_service: 8,
+            session_max_openocd: 1,
+            session_max_trace32: 1,
+            session_max_simulator: 2
+        )
+
+fn _apply_session_max(config: TestConfig, key: text, value: text):
+    """Apply session_max_sessions sub-keys."""
+    if key == "qemu_vm":
+        config.session_max_qemu_vm = value.to_int_or(config.session_max_qemu_vm)
+    elif key == "container_instance":
+        config.session_max_container = value.to_int_or(config.session_max_container)
+    elif key == "service_process":
+        config.session_max_service = value.to_int_or(config.session_max_service)
+    elif key == "openocd_board":
+        config.session_max_openocd = value.to_int_or(config.session_max_openocd)
+    elif key == "trace32_board":
+        config.session_max_trace32 = value.to_int_or(config.session_max_trace32)
+    elif key == "simulator_process":
+        config.session_max_simulator = value.to_int_or(config.session_max_simulator)
+
+fn load_test_config() -> TestConfig:
+    load_test_config_from_path(find_config_file())
+
+# =========================================================================
+# H1: Multi-level config file search
+# =========================================================================
+
+fn find_config_file() -> text:
+    # Search current, parent, grandparent directories
+    val candidates = [
+        CONFIG_FILENAME,
+        "../{CONFIG_FILENAME}",
+        "../../{CONFIG_FILENAME}"
+    ]
+    for candidate in candidates:
+        if file_exists(candidate):
+            return candidate
+    ""

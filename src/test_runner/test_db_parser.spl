@@ -1,0 +1,265 @@
+# Test Database V3 SDN Parser
+#
+# Parses the V3 SDN table format for test_db.sdn and test_db_runs.sdn.
+
+use std.string_builder.StringBuilder
+use std.test_runner.string_interner.{StringInterner, unescape_sdn_string}
+use std.test_runner.test_db_types.{ChangeEvent, CounterRecord, FileRecord, RunRecord, SuiteRecord, TestRecord, TimingRun, TimingSummary}
+
+# =========================================================================
+# Parsed Database
+# =========================================================================
+
+struct ParsedStableDb:
+    interner: StringInterner
+    files: List<FileRecord>
+    suites: List<SuiteRecord>
+    tests: List<TestRecord>
+
+struct ParsedVolatileDb:
+    counters: List<CounterRecord>
+    timing: List<TimingSummary>
+    timing_runs: List<TimingRun>
+    changes: List<ChangeEvent>
+    test_runs: List<RunRecord>
+
+# =========================================================================
+# Table Detection
+# =========================================================================
+
+fn detect_table(line: text) -> text:
+    val trimmed = line.trim()
+    if trimmed.starts_with("strings |"):
+        return "strings"
+    if trimmed.starts_with("files |"):
+        return "files"
+    if trimmed.starts_with("suites |"):
+        return "suites"
+    if trimmed.starts_with("tests |"):
+        return "tests"
+    if trimmed.starts_with("counters |"):
+        return "counters"
+    if trimmed.starts_with("timing_runs |"):
+        return "timing_runs"
+    if trimmed.starts_with("timing |"):
+        return "timing"
+    if trimmed.starts_with("changes |"):
+        return "changes"
+    if trimmed.starts_with("test_runs |"):
+        return "test_runs"
+    ""
+
+# =========================================================================
+# CSV-like Field Parsing (handles quoted strings)
+# =========================================================================
+
+fn parse_fields(line: text) -> List<text>:
+    var fields: List<text> = []
+    val trimmed = line.trim()
+    var i = 0
+    var current = StringBuilder.new()
+    var in_quote = false
+
+    while i < trimmed.len():
+        val ch = trimmed[i]
+        if in_quote:
+            if ch == "\\" and i + 1 < trimmed.len():
+                current.push_char(trimmed[i + 1])
+                i = i + 2
+                continue
+            if ch == "\"":
+                in_quote = false
+                i = i + 1
+                continue
+            current.push_char(ch)
+        else:
+            if ch == "\"":
+                in_quote = true
+                i = i + 1
+                continue
+            if ch == ",":
+                fields.push(current.to_text().trim())
+                current.clear()
+                i = i + 1
+                continue
+            current.push_char(ch)
+        i = i + 1
+
+    fields.push(current.to_text().trim())
+    fields
+
+# =========================================================================
+# Parse Stable DB (test_db.sdn)
+# =========================================================================
+
+fn parse_stable_db(content: text) -> ParsedStableDb:
+    var interner = StringInterner.empty()
+    var files: List<FileRecord> = []
+    var suites: List<SuiteRecord> = []
+    var tests: List<TestRecord> = []
+
+    var current_table = ""
+    var string_lines: List<text> = []
+
+    val lines = content.split("\n")
+    for line in lines:
+        val table = detect_table(line)
+        if table != "":
+            # Flush string lines if switching from strings table
+            if current_table == "strings" and string_lines.len() > 0:
+                # Already parsed inline
+                pass
+            current_table = table
+            continue
+
+        val trimmed = line.trim()
+        if trimmed == "" or trimmed.starts_with("#"):
+            continue
+
+        if current_table == "strings":
+            # Parse: id, value
+            val fields = parse_fields(trimmed)
+            if fields.len() >= 2:
+                interner.intern(fields[1])
+
+        elif current_table == "files":
+            val fields = parse_fields(trimmed)
+            if fields.len() >= 2:
+                files.push(FileRecord(
+                    file_id: fields[0].to_int_or(0),
+                    path_str: fields[1].to_int_or(0)
+                ))
+
+        elif current_table == "suites":
+            val fields = parse_fields(trimmed)
+            if fields.len() >= 3:
+                suites.push(SuiteRecord(
+                    suite_id: fields[0].to_int_or(0),
+                    file_id: fields[1].to_int_or(0),
+                    name_str: fields[2].to_int_or(0)
+                ))
+
+        elif current_table == "tests":
+            val fields = parse_fields(trimmed)
+            if fields.len() >= 11:
+                tests.push(TestRecord(
+                    suite_id: fields[1].to_int_or(0),
+                    name_str: fields[2].to_int_or(0),
+                    category_str: fields[3].to_int_or(0),
+                    status_str: fields[4].to_int_or(0),
+                    tags_str: fields[5],
+                    description_str: fields[6],
+                    valid: fields[7] != "false",
+                    qualified_by: fields[8],
+                    qualified_at: fields[9],
+                    qualified_reason: fields[10]
+                ))
+
+    ParsedStableDb(
+        interner: interner,
+        files: files,
+        suites: suites,
+        tests: tests
+    )
+
+# =========================================================================
+# Parse Volatile DB (test_db_runs.sdn)
+# =========================================================================
+
+fn parse_volatile_db(content: text) -> ParsedVolatileDb:
+    var counters: List<CounterRecord> = []
+    var timing: List<TimingSummary> = []
+    var timing_runs: List<TimingRun> = []
+    var changes: List<ChangeEvent> = []
+    var test_runs: List<RunRecord> = []
+
+    var current_table = ""
+
+    val lines = content.split("\n")
+    for line in lines:
+        val table = detect_table(line)
+        if table != "":
+            current_table = table
+            continue
+
+        val trimmed = line.trim()
+        if trimmed == "" or trimmed.starts_with("#"):
+            continue
+
+        val fields = parse_fields(trimmed)
+
+        if current_table == "counters" and fields.len() >= 6:
+            val last_10 = if fields.len() >= 7: fields[6] else: ""
+            val fail_rate = if fields.len() >= 8: fields[7].to_float_or(0.0) else: 0.0
+            counters.push(CounterRecord(
+                test_id: fields[0].to_int_or(0),
+                total_runs: fields[1].to_int_or(0),
+                passed: fields[2].to_int_or(0),
+                failed: fields[3].to_int_or(0),
+                flaky_count: fields[4].to_int_or(0),
+                last_change: fields[5],
+                last_10_runs: last_10,
+                failure_rate_pct: fail_rate
+            ))
+
+        elif current_table == "timing" and fields.len() >= 6:
+            timing.push(TimingSummary(
+                test_id: fields[0].to_int_or(0),
+                last_ms: fields[1].to_float_or(0.0),
+                p50: fields[2].to_float_or(0.0),
+                p90: fields[3].to_float_or(0.0),
+                p95: fields[4].to_float_or(0.0),
+                baseline_median: fields[5].to_float_or(0.0),
+                p99: if fields.len() >= 7: fields[6].to_float_or(0.0) else: 0.0,
+                min_time: if fields.len() >= 8: fields[7].to_float_or(0.0) else: 0.0,
+                max_time: if fields.len() >= 9: fields[8].to_float_or(0.0) else: 0.0,
+                iqr: if fields.len() >= 10: fields[9].to_float_or(0.0) else: 0.0,
+                mean: if fields.len() >= 11: fields[10].to_float_or(0.0) else: 0.0,
+                std_dev: if fields.len() >= 12: fields[11].to_float_or(0.0) else: 0.0,
+                cv_pct: if fields.len() >= 13: fields[12].to_float_or(0.0) else: 0.0,
+                baseline_mean: if fields.len() >= 14: fields[13].to_float_or(0.0) else: 0.0,
+                baseline_std_dev: if fields.len() >= 15: fields[14].to_float_or(0.0) else: 0.0,
+                baseline_cv_pct: if fields.len() >= 16: fields[15].to_float_or(0.0) else: 0.0,
+                baseline_last_updated: if fields.len() >= 17: fields[16] else: "",
+                baseline_run_count: if fields.len() >= 18: fields[17].to_int_or(0) else: 0,
+                baseline_update_reason: if fields.len() >= 19: fields[18] else: ""
+            ))
+
+        elif current_table == "timing_runs" and fields.len() >= 4:
+            timing_runs.push(TimingRun(
+                test_id: fields[0].to_int_or(0),
+                timestamp: fields[1],
+                duration_ms: fields[2].to_float_or(0.0),
+                outlier: fields[3] == "true"
+            ))
+
+        elif current_table == "changes" and fields.len() >= 3:
+            changes.push(ChangeEvent(
+                test_id: fields[0].to_int_or(0),
+                change_type: fields[1],
+                run_id: fields[2]
+            ))
+
+        elif current_table == "test_runs" and fields.len() >= 11:
+            test_runs.push(RunRecord(
+                run_id: fields[0],
+                start_time: fields[1],
+                end_time: fields[2],
+                pid: fields[3].to_int_or(0),
+                hostname: fields[4],
+                status: fields[5],
+                test_count: fields[6].to_int_or(0),
+                passed: fields[7].to_int_or(0),
+                failed: fields[8].to_int_or(0),
+                crashed: fields[9].to_int_or(0),
+                timed_out: fields[10].to_int_or(0)
+            ))
+
+    ParsedVolatileDb(
+        counters: counters,
+        timing: timing,
+        timing_runs: timing_runs,
+        changes: changes,
+        test_runs: test_runs
+    )
+

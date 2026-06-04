@@ -1,0 +1,176 @@
+# Dashboard Scheduler
+#
+# Simple-native recurring task runner for the LLM dashboard.
+# Stores tasks as files in .build/llm_dashboard/schedules/.
+# Each tick checks which tasks are due and spawns them via rt_process_spawn_async.
+#
+# Builds on the daemon_sdk pattern: file-based IPC, lock file for singleton.
+
+use app.llm_dashboard.data.types.{ManagedTask, TaskKind, TaskState, task_kind_name}
+use app.llm_dashboard.scheduler.cron.{cron_matches, cron_next_time, interval_next_time}
+
+extern fn rt_file_exists(path: text) -> bool
+extern fn rt_file_read_text(path: text) -> text
+extern fn rt_file_write_text(path: text, content: text) -> bool
+extern fn rt_dir_create(path: text, recursive: bool) -> bool
+extern fn rt_dir_list(path: text) -> [text]
+extern fn rt_process_spawn_async(cmd: text, args: [text]) -> i64
+extern fn rt_process_is_running(pid: i64) -> bool
+extern fn rt_time_now_unix_micros() -> i64
+extern fn rt_getpid() -> i64
+
+val SCHED_DIR = ".build/llm_dashboard/schedules"
+val RESULTS_DIR = ".build/llm_dashboard/results"
+
+# =========================================================================
+# Scheduler API
+# =========================================================================
+
+fn scheduler_create_loop(prompt: text, interval_sec: i64) -> ManagedTask:
+    """Create a new loop task that runs a prompt on a fixed interval."""
+    val now_ms = rt_time_now_unix_micros() / 1000
+    val id = "loop_{now_ms}"
+    var task = ManagedTask.new(id, TaskKind.Loop, "loop: {prompt.slice(0, 40)}", prompt)
+    task.interval_seconds = interval_sec
+    task.state = TaskState.Active
+    task.created_at = now_ms
+    task.next_run_time = now_ms + (interval_sec * 1000)
+    _save_task(task)
+    return task
+
+fn scheduler_create_schedule(prompt: text, cron_expr: text) -> ManagedTask:
+    """Create a new cron-scheduled task."""
+    val now_ms = rt_time_now_unix_micros() / 1000
+    val id = "sched_{now_ms}"
+    var task = ManagedTask.new(id, TaskKind.Schedule, "sched: {prompt.slice(0, 40)}", prompt)
+    task.cron_expr = cron_expr
+    task.state = TaskState.Active
+    task.created_at = now_ms
+    task.next_run_time = cron_next_time(cron_expr, now_ms)
+    _save_task(task)
+    return task
+
+fn scheduler_cancel(task_id: text):
+    """Cancel a task by ID."""
+    val tasks = scheduler_list_tasks()
+    for task in tasks:
+        if task.id == task_id:
+            var t = task
+            t.state = TaskState.Cancelled
+            _save_task(t)
+            return
+
+fn scheduler_list_tasks() -> [ManagedTask]:
+    """List all persisted tasks."""
+    val tasks: [ManagedTask] = []
+    if not rt_file_exists(SCHED_DIR):
+        return tasks
+    val files = rt_dir_list(SCHED_DIR)
+    var result: [ManagedTask] = []
+    for fname in files:
+        if fname.ends_with(".task"):
+            val path = "{SCHED_DIR}/{fname}"
+            val content = rt_file_read_text(path)
+            val task = _load_task(content)
+            if task.id != "":
+                result.push(task)
+    return result
+
+fn scheduler_tick():
+    """Check all active tasks and run any that are due. Call from main loop."""
+    val now_ms = rt_time_now_unix_micros() / 1000
+    val tasks = scheduler_list_tasks()
+    for task in tasks:
+        if task.state != TaskState.Active:
+            continue
+        val due = _is_due(task, now_ms)
+        if due:
+            _run_task(task, now_ms)
+
+# =========================================================================
+# Internal
+# =========================================================================
+
+fn _is_due(task: ManagedTask, now_ms: i64) -> bool:
+    if task.interval_seconds > 0:
+        return now_ms >= task.next_run_time
+    if task.cron_expr != "":
+        return cron_matches(task.cron_expr, now_ms)
+    return false
+
+fn _run_task(task: ManagedTask, now_ms: i64):
+    """Execute a task and update its state."""
+    rt_dir_create(RESULTS_DIR, true)
+    val result_file = "{RESULTS_DIR}/{task.id}.out"
+    val cmd = "claude --print \"{task.command}\" > {result_file} 2>&1"
+    val pid = rt_process_spawn_async("/bin/sh", ["-c", cmd])
+
+    var updated = task
+    updated.last_run_time = now_ms
+    updated.run_count = task.run_count + 1
+    updated.agent_id = "{pid}"
+    if task.interval_seconds > 0:
+        updated.next_run_time = interval_next_time(task.interval_seconds, now_ms)
+    elif task.cron_expr != "":
+        updated.next_run_time = cron_next_time(task.cron_expr, now_ms)
+    _save_task(updated)
+
+fn _save_task(task: ManagedTask):
+    """Persist a task to disk."""
+    rt_dir_create(SCHED_DIR, true)
+    val path = "{SCHED_DIR}/{task.id}.task"
+    val content = _serialize_task(task)
+    rt_file_write_text(path, content)
+
+fn _serialize_task(task: ManagedTask) -> text:
+    """Serialize task to key=value format."""
+    val kind = task_kind_name(task.kind)
+    val state_val = match task.state:
+        TaskState.Active: "active"
+        TaskState.Paused: "paused"
+        TaskState.Completed: "done"
+        TaskState.Failed: "failed"
+        TaskState.Cancelled: "cancelled"
+    return "id={task.id}\nkind={kind}\nname={task.name}\ncommand={task.command}\ninterval_seconds={task.interval_seconds}\ncron_expr={task.cron_expr}\nstate={state_val}\nlast_run_time={task.last_run_time}\nnext_run_time={task.next_run_time}\nrun_count={task.run_count}\ntotal_tokens={task.total_tokens}\ncreated_at={task.created_at}\nagent_id={task.agent_id}\n"
+
+fn _load_task(content: text) -> ManagedTask:
+    """Deserialize a task from key=value format."""
+    val id = _kv_get(content, "id")
+    if id == "":
+        return ManagedTask.new("", TaskKind.Loop, "", "")
+    val kind_str = _kv_get(content, "kind")
+    val kind = match kind_str:
+        "schedule" => TaskKind.Schedule
+        "remote" => TaskKind.RemoteControl
+        "daemon" => TaskKind.Daemon
+        _ => TaskKind.Loop
+    val name = _kv_get(content, "name")
+    val command = _kv_get(content, "command")
+    var task = ManagedTask.new(id, kind, name, command)
+    task.interval_seconds = _kv_get(content, "interval_seconds").to_i64() ?? 0
+    task.cron_expr = _kv_get(content, "cron_expr")
+    val state_str = _kv_get(content, "state")
+    task.state = match state_str:
+        "paused" => TaskState.Paused
+        "done" => TaskState.Completed
+        "failed" => TaskState.Failed
+        "cancelled" => TaskState.Cancelled
+        _ => TaskState.Active
+    task.last_run_time = _kv_get(content, "last_run_time").to_i64() ?? 0
+    task.next_run_time = _kv_get(content, "next_run_time").to_i64() ?? 0
+    task.run_count = _kv_get(content, "run_count").to_i64() ?? 0
+    task.total_tokens = _kv_get(content, "total_tokens").to_i64() ?? 0
+    task.created_at = _kv_get(content, "created_at").to_i64() ?? 0
+    task.agent_id = _kv_get(content, "agent_id")
+    return task
+
+fn _kv_get(content: text, key: text) -> text:
+    val needle = "{key}="
+    val idx = content.index_of(needle)
+    if idx < 0:
+        return ""
+    val after = content.slice(idx + needle.len())
+    val end = after.index_of("\n")
+    if end < 0:
+        return after.trim()
+    return after.slice(0, end).trim()

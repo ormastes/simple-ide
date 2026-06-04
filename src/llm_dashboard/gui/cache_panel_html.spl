@@ -1,0 +1,110 @@
+# Cache Panel HTML
+#
+# Cache hit/miss visualization for the Observability tab.
+# Shows session-wide cache efficiency, per-provider breakdown, and cost savings.
+
+use app.llm_dashboard.data.store.{AgentDashboardStore}
+use app.llm_dashboard.data.types.{AgentNode, format_tokens, provider_name, total_tokens, cache_efficiency_pct}
+
+# =========================================================================
+# Cache Panel CSS
+# =========================================================================
+
+fn generate_cache_panel_css() -> text:
+    return """
+.cache-panel { padding: 16px; }
+.cache-gauge-row { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+.cache-gauge { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; min-width: 160px; text-align: center; }
+.gauge-value { font-size: 2.5rem; font-weight: 700; }
+.gauge-green { color: #3fb950; }
+.gauge-yellow { color: #d29922; }
+.gauge-red { color: #f85149; }
+.gauge-label { font-size: 0.8rem; color: #8b949e; margin-top: 4px; }
+.cache-bar-row { display: flex; height: 20px; border-radius: 4px; overflow: hidden; margin: 8px 0; background: #21262d; }
+.bar-cached { background: #3fb950; }
+.bar-created { background: #d29922; }
+.bar-uncached { background: #21262d; }
+.cache-legend { display: flex; gap: 16px; font-size: 0.78rem; color: #8b949e; }
+.legend-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; }
+.cache-agent-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.cache-agent-table th { text-align: left; color: #8b949e; border-bottom: 1px solid #30363d; padding: 6px 8px; }
+.cache-agent-table td { padding: 5px 8px; border-bottom: 1px solid #21262d; }
+.eff-bar { display: inline-block; height: 8px; border-radius: 4px; }
+"""
+
+# =========================================================================
+# Cache Panel HTML
+# =========================================================================
+
+fn generate_cache_panel_html(store: AgentDashboardStore) -> text:
+    val cache_pct = store.session_cache_efficiency_pct()
+    val gauge_class = if cache_pct >= 70: "gauge-green" elif cache_pct >= 30: "gauge-yellow" else: "gauge-red"
+
+    val total_read = store.total_cache_reads
+    val total_create = store.total_cache_creates
+    var total_uncached: i64 = 0
+    for s in store.llm_statuses:
+        val all_tokens = s.tokens_used
+        val cached = s.cache_read_tokens + s.cache_create_tokens
+        val uncached = all_tokens - cached
+        if uncached > 0:
+            total_uncached = total_uncached + uncached
+
+    val grand_total = total_read + total_create + total_uncached
+    val read_pct = if grand_total > 0: (total_read * 100) / grand_total else: 0
+    val create_pct = if grand_total > 0: (total_create * 100) / grand_total else: 0
+    val uncached_pct = 100 - read_pct - create_pct
+
+    val savings_est = (total_read * 90) / 100  # cache reads ~90% cheaper
+
+    val gauges = """
+    <div class="cache-gauge-row">
+      <div class="cache-gauge">
+        <div class="gauge-value {gauge_class}">{cache_pct}%</div>
+        <div class="gauge-label">Cache Efficiency</div>
+      </div>
+      <div class="cache-gauge">
+        <div class="gauge-value" style="color:#58a6ff">{format_tokens(total_read)}</div>
+        <div class="gauge-label">Cache Reads</div>
+      </div>
+      <div class="cache-gauge">
+        <div class="gauge-value" style="color:#d29922">{format_tokens(total_create)}</div>
+        <div class="gauge-label">Cache Writes</div>
+      </div>
+      <div class="cache-gauge">
+        <div class="gauge-value" style="color:#3fb950">~{format_tokens(savings_est)}</div>
+        <div class="gauge-label">Tokens Saved</div>
+      </div>
+    </div>"""
+
+    val bar = """
+    <h4 style="color:#8b949e;font-size:0.85rem;margin:0 0 6px">Token Budget Distribution</h4>
+    <div class="cache-bar-row">
+      <div class="bar-cached" style="width:{read_pct}%" title="Cached: {read_pct}%"></div>
+      <div class="bar-created" style="width:{create_pct}%" title="Written: {create_pct}%"></div>
+      <div class="bar-uncached" style="width:{uncached_pct}%" title="Uncached: {uncached_pct}%"></div>
+    </div>
+    <div class="cache-legend">
+      <span><span class="legend-dot" style="background:#3fb950"></span>Cached ({read_pct}%)</span>
+      <span><span class="legend-dot" style="background:#d29922"></span>Written ({create_pct}%)</span>
+      <span><span class="legend-dot" style="background:#30363d"></span>Uncached ({uncached_pct}%)</span>
+    </div>"""
+
+    val agents: [AgentNode] = store.tree.all_agents()
+    var agent_rows = ""
+    for agent in agents:
+        val eff = cache_efficiency_pct(agent)
+        val bar_color = if eff >= 70: "#3fb950" elif eff >= 30: "#d29922" else: "#f85149"
+        val tok = format_tokens(total_tokens(agent))
+        agent_rows = "{agent_rows}<tr><td>{agent.id.slice(0, 12)}</td><td>{format_tokens(agent.input_tokens)}</td><td>{format_tokens(agent.output_tokens)}</td><td>{format_tokens(agent.cache_read_tokens)}</td><td><span class=\"eff-bar\" style=\"width:{eff}px;background:{bar_color}\"></span> {eff}%</td></tr>"
+
+    val agent_table = if agent_rows != "":
+        """<h4 style="color:#8b949e;font-size:0.85rem;margin:16px 0 6px">Per-Agent Token Breakdown</h4>
+        <table class="cache-agent-table">
+          <tr><th>Agent</th><th>Input</th><th>Output</th><th>Cached</th><th>Efficiency</th></tr>
+          {agent_rows}
+        </table>"""
+    else:
+        "<p style=\"color:#8b949e;font-size:0.85rem\">No agent token data yet.</p>"
+
+    return """<div class="cache-panel">{gauges}{bar}{agent_table}</div>"""

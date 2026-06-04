@@ -1,0 +1,96 @@
+# SDoctest Glob Pattern Matching
+#
+# Supports *, **, and ? wildcards for path matching.
+
+
+# =========================================================================
+# Public API
+# =========================================================================
+
+fn glob_match_path(path: text, pattern: text) -> bool:
+    # Split both by /
+    val path_parts = path.split("/")
+    val pattern_parts = pattern.split("/")
+    glob_match_parts(path_parts: path_parts, pi: 0, pattern_parts: pattern_parts, qi: 0)
+
+# =========================================================================
+# Recursive Matching
+# =========================================================================
+
+fn glob_match_parts(path_parts: [text], pi: i64, pattern_parts: [text], qi: i64) -> bool:
+    # Both exhausted = match
+    if pi >= path_parts.len() and qi >= pattern_parts.len():
+        return true
+
+    # Pattern exhausted but path remains = no match
+    if qi >= pattern_parts.len():
+        return false
+
+    val pat = pattern_parts[qi]
+
+    # ** matches zero or more path segments
+    if pat == "**":
+        # Try matching ** against zero segments (skip **)
+        if glob_match_parts(path_parts: path_parts, pi: pi, pattern_parts: pattern_parts, qi: qi + 1):
+            return true
+        # Try matching ** against one segment (consume one path part, keep **)
+        if pi < path_parts.len():
+            return glob_match_parts(path_parts: path_parts, pi: pi + 1, pattern_parts: pattern_parts, qi: qi)
+        return false
+
+    # Path exhausted but pattern remains = no match (unless remaining is all **)
+    if pi >= path_parts.len():
+        return false
+
+    # Single segment match with wildcards
+    if glob_match_segment(s: path_parts[pi], pattern: pat):
+        return glob_match_parts(path_parts: path_parts, pi: pi + 1, pattern_parts: pattern_parts, qi: qi + 1)
+
+    false
+
+# =========================================================================
+# Single Segment Matching (* and ?)
+# =========================================================================
+
+fn glob_match_segment(s: text, pattern: text) -> bool:
+    glob_match_chars(s: s, si: 0, pattern: pattern, pi: 0)
+
+fn glob_match_chars(s: text, si: i64, pattern: text, pi: i64) -> bool:
+    # Both exhausted
+    if si >= s.len() and pi >= pattern.len():
+        return true
+
+    # Pattern exhausted but string remains
+    if pi >= pattern.len():
+        return false
+
+    val pc = pattern[pi:pi + 1]
+
+    # * matches zero or more characters in segment
+    if pc == "*":
+        # Try matching zero chars (skip *)
+        if glob_match_chars(s: s, si: si, pattern: pattern, pi: pi + 1):
+            return true
+        # Try matching one char (consume one, keep *)
+        if si < s.len():
+            return glob_match_chars(s: s, si: si + 1, pattern: pattern, pi: pi)
+        return false
+
+    # String exhausted but pattern remains
+    if si >= s.len():
+        return false
+
+    # ? matches exactly one character
+    if pc == "?":
+        return glob_match_chars(s: s, si: si + 1, pattern: pattern, pi: pi + 1)
+
+    # Literal character match
+    val sc = s[si:si + 1]
+    if sc == pc:
+        return glob_match_chars(s: s, si: si + 1, pattern: pattern, pi: pi + 1)
+
+    false
+
+# =========================================================================
+# Exports
+# =========================================================================

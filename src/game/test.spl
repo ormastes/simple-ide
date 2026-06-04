@@ -1,0 +1,35 @@
+# `simple game test [--headless]` — run game2d system specs (AC-7).
+#
+# When `--headless` is passed, sets `SIMPLE_GAME_HEADLESS=1` and runs
+# the AC-5 replay/golden specs without window/GPU. Otherwise runs all
+# `test/03_system/game2d_*_spec.spl` against the default backend.
+
+extern fn rt_env_set(key: text, value: text) -> bool
+extern fn rt_process_run(argv: [text]) -> i64
+extern fn rt_dir_exists(path: text) -> bool
+
+
+fn _spec_dir() -> text:
+    if rt_dir_exists("test"):
+        "test"
+    else:
+        "test/system"
+
+
+fn cmd_test(headless: bool) -> i64:
+    if headless:
+        rt_env_set("SIMPLE_GAME_HEADLESS", "1")
+    val argv: [text] = [
+        "bin/simple",
+        "test",
+        "test/03_system/game2d_hello_demo_spec.spl",
+        "test/03_system/game2d_canvas_api_spec.spl",
+        "test/03_system/game2d_input_snapshot_spec.spl",
+        "test/03_system/game2d_deterministic_loop_spec.spl",
+        "test/03_system/game2d_replay_spec.spl",
+        "test/03_system/game2d_golden_spec.spl",
+        "test/03_system/game2d_sdn_assets_spec.spl",
+        "test/03_system/game2d_archtest_spec.spl",
+        "test/03_system/game2d_cli_spec.spl"
+    ]
+    rt_process_run(argv)

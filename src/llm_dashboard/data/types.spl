@@ -1,0 +1,458 @@
+# LLM Dashboard Types
+#
+# Core type definitions for agent monitoring: activities, providers,
+# agent nodes, status, rooms, and activity tracking.
+
+# =========================================================================
+# Agent Activity States
+# =========================================================================
+
+enum AgentActivity:
+    Idle
+    Thinking
+    Reading(path: text)
+    Writing(path: text)
+    Searching(query: text)
+    WebFetch(url: text)
+    ToolUse(tool: text)
+    SubAgentSpawn(child_id: text)
+    Error(msg: text)
+    Finished
+
+fn activity_label(activity: AgentActivity) -> text:
+    """Short label for display."""
+    match activity:
+        AgentActivity.Idle: "idle"
+        AgentActivity.Thinking: "thinking"
+        AgentActivity.Reading(p): "reading {p}"
+        AgentActivity.Writing(p): "writing {p}"
+        AgentActivity.Searching(q): "searching"
+        AgentActivity.WebFetch(u): "web_fetch"
+        AgentActivity.ToolUse(t): "tool: {t}"
+        AgentActivity.SubAgentSpawn(c): "spawning"
+        AgentActivity.Error(m): "error"
+        AgentActivity.Finished: "done"
+
+fn activity_short(activity: AgentActivity) -> text:
+    """Minimal label for status bar."""
+    match activity:
+        AgentActivity.Idle: "."
+        AgentActivity.Thinking: "*"
+        AgentActivity.Reading(_): "R"
+        AgentActivity.Writing(_): "W"
+        AgentActivity.Searching(_): "S"
+        AgentActivity.WebFetch(_): "F"
+        AgentActivity.ToolUse(_): "T"
+        AgentActivity.SubAgentSpawn(_): "+"
+        AgentActivity.Error(_): "!"
+        AgentActivity.Finished: "D"
+
+# =========================================================================
+# LLM Providers
+# =========================================================================
+
+enum LLMProvider:
+    Claude
+    Codex
+    Gemini
+    Unknown(name: text)
+
+fn provider_name(provider: LLMProvider) -> text:
+    match provider:
+        LLMProvider.Claude: "Claude"
+        LLMProvider.Codex: "Codex"
+        LLMProvider.Gemini: "Gemini"
+        LLMProvider.Unknown(n): n
+
+fn provider_from_text(name: text) -> LLMProvider:
+    val lower = name.lower()
+    if lower.contains("claude") or lower.contains("anthropic"):
+        return LLMProvider.Claude
+    if lower.contains("codex") or lower.contains("openai") or lower.contains("gpt"):
+        return LLMProvider.Codex
+    if lower.contains("gemini") or lower.contains("google"):
+        return LLMProvider.Gemini
+    return LLMProvider.Unknown(name: name)
+
+# =========================================================================
+# Agent Node
+# =========================================================================
+
+class AgentNode:
+    id: text
+    provider: LLMProvider
+    model: text
+    activity: AgentActivity
+    parent_id: text?
+    children: [text]
+    files_read: [text]
+    files_written: [text]
+    urls_fetched: [text]
+    tools_used: [text]
+    input_tokens: i64
+    output_tokens: i64
+    cache_read_tokens: i64
+    cache_create_tokens: i64
+    start_time: i64
+    last_active: i64
+
+    static fn new(id: text, provider: LLMProvider, model: text) -> AgentNode:
+        return AgentNode(
+            id: id,
+            provider: provider,
+            model: model,
+            activity: AgentActivity.Idle,
+            parent_id: nil,
+            children: [],
+            files_read: [],
+            files_written: [],
+            urls_fetched: [],
+            tools_used: [],
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_create_tokens: 0,
+            start_time: 0,
+            last_active: 0
+        )
+
+fn total_tokens(node: AgentNode) -> i64:
+    """Total tokens used by this agent (input + output + cache)."""
+    node.input_tokens + node.output_tokens + node.cache_read_tokens + node.cache_create_tokens
+
+fn cache_efficiency_pct(node: AgentNode) -> i64:
+    """Cache read efficiency as integer percentage 0-100."""
+    val total_input = node.input_tokens + node.cache_read_tokens + node.cache_create_tokens
+    if total_input <= 0:
+        return 0
+    return (node.cache_read_tokens * 100) / total_input
+
+# =========================================================================
+# LLM Status
+# =========================================================================
+
+class LLMStatus:
+    provider: LLMProvider
+    connected: bool
+    model: text
+    tokens_used: i64
+    cache_read_tokens: i64
+    cache_create_tokens: i64
+    estimated_cost_cents: i64
+    active_agents: i64
+    last_heartbeat: i64
+
+    static fn disconnected(provider: LLMProvider) -> LLMStatus:
+        return LLMStatus(
+            provider: provider,
+            connected: false,
+            model: "",
+            tokens_used: 0,
+            cache_read_tokens: 0,
+            cache_create_tokens: 0,
+            estimated_cost_cents: 0,
+            active_agents: 0,
+            last_heartbeat: 0
+        )
+
+# =========================================================================
+# Rooms
+# =========================================================================
+
+enum RoomKind:
+    Research
+    Code
+    Skills
+    Server
+    Chat
+    TestLab
+    Tasks
+
+fn room_name(room: RoomKind) -> text:
+    match room:
+        RoomKind.Research: "Research"
+        RoomKind.Code: "Code"
+        RoomKind.Skills: "Skills"
+        RoomKind.Server: "Servers"
+        RoomKind.Chat: "Chat"
+        RoomKind.TestLab: "TestLab"
+        RoomKind.Tasks: "Tasks"
+
+fn tool_to_room(tool_name: text) -> RoomKind:
+    """Map a tool name to the room it belongs in."""
+    match tool_name:
+        "Read" => RoomKind.Code
+        "Write" => RoomKind.Code
+        "Edit" => RoomKind.Code
+        "Glob" => RoomKind.Code
+        "Grep" => RoomKind.Code
+        "WebFetch" => RoomKind.Research
+        "WebSearch" => RoomKind.Research
+        "Bash" => RoomKind.Code
+        "Agent" => RoomKind.Chat
+        "Skill" => RoomKind.Skills
+        "LSP" => RoomKind.Server
+        "NotebookEdit" => RoomKind.Code
+        "TaskCreate" => RoomKind.Skills
+        "TaskUpdate" => RoomKind.Skills
+        _ =>
+            if tool_name.starts_with("mcp__"):
+                RoomKind.Server
+            elif tool_name.contains("test") or tool_name.contains("Test"):
+                RoomKind.TestLab
+            else:
+                RoomKind.Code
+
+# =========================================================================
+# Activity Tracking
+# =========================================================================
+
+class FileActivity:
+    agent_id: text
+    path: text
+    operation: text
+    timestamp: i64
+
+    static fn new(agent_id: text, path: text, operation: text, timestamp: i64) -> FileActivity:
+        return FileActivity(
+            agent_id: agent_id,
+            path: path,
+            operation: operation,
+            timestamp: timestamp
+        )
+
+class URLActivity:
+    agent_id: text
+    url: text
+    domain: text
+    page_name: text
+    timestamp: i64
+
+    static fn new(agent_id: text, url: text, timestamp: i64) -> URLActivity:
+        val parts = extract_domain_and_page(url)
+        return URLActivity(
+            agent_id: agent_id,
+            url: url,
+            domain: parts.0,
+            page_name: parts.1,
+            timestamp: timestamp
+        )
+
+class ActivityEntry:
+    agent_id: text
+    room: RoomKind
+    tool_name: text
+    summary: text
+    timestamp: i64
+    duration_ms: i64
+
+    static fn new(agent_id: text, room: RoomKind, tool_name: text, summary: text, timestamp: i64) -> ActivityEntry:
+        return ActivityEntry(
+            agent_id: agent_id,
+            room: room,
+            tool_name: tool_name,
+            summary: summary,
+            timestamp: timestamp,
+            duration_ms: 0
+        )
+
+# =========================================================================
+# Helpers
+# =========================================================================
+
+fn unique_texts(items: [text]) -> [text]:
+    """Deduplicate a list of texts, preserving order."""
+    var seen: [text] = []
+    for item in items:
+        var found = false
+        for s in seen:
+            if s == item:
+                found = true
+        if not found:
+            seen.push(item)
+    return seen
+
+fn truncate_text(s: text, max_len: i32) -> text:
+    """Truncate text with '...' suffix if exceeding max_len."""
+    if s.len() <= max_len:
+        return s
+    return "{s.slice(0, max_len - 3)}..."
+
+fn shorten_path(path: text, max_len: i32) -> text:
+    """Shorten a file path for display, preserving filename."""
+    if path.len() <= max_len:
+        return path
+    val parts = path.split("/")
+    if parts.len() <= 1:
+        return truncate_text(path, max_len)
+    val filename = parts[parts.len() - 1]
+    val dir = parts[parts.len() - 2]
+    val short = "{dir}/{filename}"
+    if short.len() <= max_len:
+        return short
+    if filename.len() <= max_len - 4:
+        return ".../{filename}"
+    return truncate_text(path, max_len)
+
+fn extract_domain_and_page(url: text) -> (text, text):
+    """Extract domain and page name from a URL."""
+    var work = url
+    # Strip protocol
+    if work.starts_with("https://"):
+        work = work.slice(8)
+    elif work.starts_with("http://"):
+        work = work.slice(7)
+    # Split at first /
+    val slash_idx = work.index_of("/")
+    if slash_idx < 0:
+        return (work, "/")
+    val domain = work.slice(0, slash_idx)
+    var page = work.slice(slash_idx)
+    # Truncate long pages
+    page = truncate_text(page, 40)
+    return (domain, page)
+
+fn format_timestamp(ts: i64) -> text:
+    """Format a unix timestamp as HH:MM:SS."""
+    val seconds = ts % 60
+    val minutes = (ts / 60) % 60
+    val hours = (ts / 3600) % 24
+    val hh = if hours < 10: "0{hours}" else: "{hours}"
+    val mm = if minutes < 10: "0{minutes}" else: "{minutes}"
+    val ss = if seconds < 10: "0{seconds}" else: "{seconds}"
+    return "{hh}:{mm}:{ss}"
+
+fn format_tokens(count: i64) -> text:
+    """Format token count with K/M suffix."""
+    if count >= 1000000:
+        val m = count / 100000
+        return "{m / 10}.{m % 10}M"
+    if count >= 1000:
+        val k = count / 100
+        return "{k / 10}.{k % 10}K"
+    return "{count}"
+
+# =========================================================================
+# Agent Messages
+# =========================================================================
+
+class AgentMessage:
+    parent_id: text
+    child_id: text
+    direction: text
+    content: text
+    timestamp: i64
+
+    static fn new(parent_id: text, child_id: text, direction: text, content: text, timestamp: i64) -> AgentMessage:
+        return AgentMessage(
+            parent_id: parent_id,
+            child_id: child_id,
+            direction: direction,
+            content: content,
+            timestamp: timestamp
+        )
+
+# =========================================================================
+# MCP Stats
+# =========================================================================
+
+class McpStats:
+    server_name: text
+    call_count: i64
+    total_latency_ms: i64
+    estimated_tokens: i64
+    last_tool: text
+    last_call_time: i64
+
+    static fn new(server_name: text) -> McpStats:
+        return McpStats(
+            server_name: server_name,
+            call_count: 0,
+            total_latency_ms: 0,
+            estimated_tokens: 0,
+            last_tool: "",
+            last_call_time: 0
+        )
+
+fn mcp_avg_latency(stats: McpStats) -> i64:
+    if stats.call_count > 0:
+        return stats.total_latency_ms / stats.call_count
+    return 0
+
+fn mcp_server_name(tool_name: text) -> text:
+    """Extract server name from mcp__<server>__<tool> format."""
+    if not tool_name.starts_with("mcp__"):
+        return ""
+    val after_prefix = tool_name.slice(5)
+    val sep_idx = after_prefix.index_of("__")
+    if sep_idx < 0:
+        return after_prefix
+    return after_prefix.slice(0, sep_idx)
+
+# =========================================================================
+# Managed Tasks (Schedule/Loop/Remote/Daemon)
+# =========================================================================
+
+enum TaskKind:
+    Loop
+    Schedule
+    RemoteControl
+    Daemon
+    Job
+
+enum TaskState:
+    Active
+    Paused
+    Completed
+    Failed
+    Cancelled
+
+class ManagedTask:
+    id: text
+    kind: TaskKind
+    name: text
+    command: text
+    interval_seconds: i64
+    cron_expr: text
+    state: TaskState
+    last_run_time: i64
+    next_run_time: i64
+    run_count: i64
+    total_tokens: i64
+    last_result: text
+    created_at: i64
+    agent_id: text
+
+    static fn new(id: text, kind: TaskKind, name: text, command: text) -> ManagedTask:
+        return ManagedTask(
+            id: id,
+            kind: kind,
+            name: name,
+            command: command,
+            interval_seconds: 0,
+            cron_expr: "",
+            state: TaskState.Active,
+            last_run_time: 0,
+            next_run_time: 0,
+            run_count: 0,
+            total_tokens: 0,
+            last_result: "",
+            created_at: 0,
+            agent_id: ""
+        )
+
+fn task_kind_name(kind: TaskKind) -> text:
+    match kind:
+        TaskKind.Loop: "loop"
+        TaskKind.Schedule: "schedule"
+        TaskKind.RemoteControl: "remote"
+        TaskKind.Daemon: "daemon"
+        TaskKind.Job: "job"
+
+fn task_state_name(state: TaskState) -> text:
+    match state:
+        TaskState.Active: "active"
+        TaskState.Paused: "paused"
+        TaskState.Completed: "done"
+        TaskState.Failed: "failed"
+        TaskState.Cancelled: "cancelled"

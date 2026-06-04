@@ -1,0 +1,92 @@
+# LLM Status Collector
+#
+# Unified collector for all LLM providers (Claude, Codex, Gemini).
+# Derives status from the agent tree and estimates cost per provider.
+
+use app.llm_dashboard.data.types.{LLMStatus, LLMProvider, AgentNode, AgentActivity, provider_name, total_tokens}
+use app.llm_dashboard.data.agent_tree.{AgentTree}
+
+# =========================================================================
+# Unified Status Collection
+# =========================================================================
+
+fn collect_provider_status(tree: AgentTree, provider: LLMProvider) -> LLMStatus:
+    """Derive status for any LLM provider from the agent tree."""
+    val target_name = provider_name(provider)
+    var connected = false
+    var model = ""
+    var provider_tokens: i64 = 0
+    var cache_read: i64 = 0
+    var cache_create: i64 = 0
+    var active_count: i64 = 0
+    var last_heartbeat: i64 = 0
+
+    for agent in tree.all_agents():
+        if provider_name(agent.provider) == target_name:
+            connected = true
+            if agent.model != "" and model == "":
+                model = agent.model
+            provider_tokens = provider_tokens + total_tokens(agent)
+            cache_read = cache_read + agent.cache_read_tokens
+            cache_create = cache_create + agent.cache_create_tokens
+            match agent.activity:
+                AgentActivity.Finished: pass_dn
+                AgentActivity.Idle: pass_dn
+                _: active_count = active_count + 1
+            if agent.last_active > last_heartbeat:
+                last_heartbeat = agent.last_active
+
+    val cost_cents = estimate_cost(provider, provider_tokens, model)
+
+    return LLMStatus(
+        provider: provider,
+        connected: connected,
+        model: model,
+        tokens_used: provider_tokens,
+        cache_read_tokens: cache_read,
+        cache_create_tokens: cache_create,
+        estimated_cost_cents: cost_cents,
+        active_agents: active_count,
+        last_heartbeat: last_heartbeat
+    )
+
+# Convenience wrappers for backward compatibility
+fn collect_claude_status(tree: AgentTree) -> LLMStatus:
+    return collect_provider_status(tree, LLMProvider.Claude)
+
+fn collect_codex_status(tree: AgentTree) -> LLMStatus:
+    return collect_provider_status(tree, LLMProvider.Codex)
+
+fn collect_gemini_status(tree: AgentTree) -> LLMStatus:
+    return collect_provider_status(tree, LLMProvider.Gemini)
+
+# =========================================================================
+# Cost Estimation (provider-specific rate tables)
+# =========================================================================
+
+fn estimate_cost(provider: LLMProvider, tokens: i64, model: text) -> i64:
+    """Estimate cost in cents based on provider, token count, and model."""
+    val cents_per_1k = model_rate(provider, model)
+    return (tokens * cents_per_1k) / 1000
+
+fn model_rate(provider: LLMProvider, model: text) -> i64:
+    """Get blended cents-per-1K-tokens rate for a model."""
+    val lower = model.lower()
+    match provider:
+        LLMProvider.Claude:
+            if lower.contains("opus"):      return 5
+            if lower.contains("sonnet"):    return 2
+            if lower.contains("haiku"):     return 1
+            return 2
+        LLMProvider.Codex:
+            if lower.contains("gpt-4"):     return 3
+            if lower.contains("o1") or lower.contains("o3") or lower.contains("o4"):
+                return 4
+            if lower.contains("codex"):     return 1
+            return 2
+        LLMProvider.Gemini:
+            if lower.contains("2.5-pro") or lower.contains("ultra"):  return 3
+            if lower.contains("2.5-flash") or lower.contains("flash"): return 1
+            if lower.contains("pro"):       return 2
+            return 1
+        _: return 2

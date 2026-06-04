@@ -1,0 +1,72 @@
+# Simple Office Suite
+#
+# Canonical entry point for the office suite CLI command.
+
+use std.sffi.cli (cli_get_args)
+use app.office.launcher.{build_launcher_ui}
+use app.office.word.word_app.{WordApp}
+use app.office.sheets.sheets_app.{SheetsApp}
+use app.office.slides.slides_app.{SlidesApp}
+use app.office.slides.slide.{slide_count}
+use app.office.mail.mail_app.{MailApp}
+use app.office.planner.planner_app.{PlannerApp}
+use common.office.file_ops.{RecentFileStore}
+use app.office.sheets.cell.{cell_ref_to_string}
+
+fn main() -> i64:
+    val args = _get_office_cli_args()
+    run_office(args).to_i64()
+
+fn _get_office_cli_args() -> [text]:
+    val all_args = cli_get_args()
+    var args: [text] = []
+    var start_idx = 1
+    if all_args.len() > 1 and (all_args[1].ends_with("main.spl") or all_args[1].ends_with("mod.spl")):
+        start_idx = 2
+    var i = start_idx
+    while i < all_args.len():
+        args.push(all_args[i])
+        i = i + 1
+    if args.len() > 0 and args[0] == "office":
+        return args[1:]
+    args
+
+fn run_office(args: [text]) -> i32:
+    """Dispatch to the requested office app or show the launcher."""
+    val cmd = if args.len() > 0: args[0] else: "launcher"
+    match cmd:
+        "launcher" =>
+            val store = RecentFileStore.new(20)
+            val recent = store.get_recent(10)
+            val ui = build_launcher_ui(recent)
+            print "Simple Office Launcher loaded (root={ui.root_id}, recent={recent.len()})"
+            return 0
+        "word" =>
+            val app = WordApp.new()
+            val ui = app.build_ui()
+            print "Simple Word loaded (root={ui.root_id}, words={app.word_count()}, modified={app.modified})"
+            return 0
+        "sheets" =>
+            val app = SheetsApp.new()
+            val ui = app.build_ui()
+            val active_ref = cell_ref_to_string(app.active_cell)
+            print "Simple Sheets loaded (root={ui.root_id}, sheets={app.workbook.sheets.len()}, active={active_ref})"
+            return 0
+        "slides" =>
+            val app = SlidesApp.new()
+            val ui = app.build_ui()
+            print "Simple Slides loaded (root={ui.root_id}, slides={slide_count(app.presentation)}, modified={app.modified})"
+            return 0
+        "mail" =>
+            val app = MailApp.new()
+            val ui = app.build_ui()
+            print "Simple Mail loaded (root={ui.root_id}, emails={app.emails.len()}, unread={app.unread_count()})"
+            return 0
+        "planner" =>
+            val app = PlannerApp.new()
+            val ui = app.build_ui()
+            print "Simple Planner loaded (root={ui.root_id}, tasks={app.project.tasks.len()}, view={app.active_view})"
+            return 0
+        case _("unsupported office app names show usage"):
+            print "Usage: simple office [launcher|word|sheets|slides|mail|planner]"
+            return 1

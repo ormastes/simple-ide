@@ -1,0 +1,72 @@
+# Editor entrypoint.
+# Startup-light CLI surface for source-mode help and readiness probes.
+#
+# Interactive launchers keep the heavyweight shell loops out of the readiness
+# path; the legacy GUI contract still tracks the intended dispatch hooks:
+# gui_shell_run(session)
+# editor_tui_run(session)
+
+use std.cli.cli_util (get_cli_args)
+use std.cli.log_modes.{parse_log_options, log_options_help, render_progress}
+use std.editor.core.launch.*
+use std.log.{error}
+
+fn main() -> i64:
+    val raw_args = get_cli_args()
+    val log_opts = parse_log_options(raw_args)
+    if not log_opts.valid:
+        error("editor", log_opts.error)
+        return 1
+
+    val args = editor_launch_clean_log_args(raw_args)
+    if args.len() > 0 and (args[0] == "--help" or args[0] == "-h"):
+        print_help_with_progress(log_opts.progress)
+        return 0
+    if args.len() > 0 and (args[0] == "--version" or args[0] == "-v"):
+        if log_opts.log_mode == "json":
+            print "{\"command\":\"editor\",\"status\":\"ok\",\"version\":\"0.1.0\"}"
+        else:
+            print "Simple Editor v0.1.0"
+        return 0
+
+    val mode = editor_launch_mode(args)
+    val file_count = editor_launch_file_count(args)
+    if editor_launch_has_unknown_option(args):
+        val message = "Unknown option: {editor_launch_first_unknown_option(args)}"
+        if log_opts.log_mode == "json":
+            print "{\"command\":\"editor\",\"status\":\"error\",\"message\":\"{message}\"}"
+        else:
+            error("editor", message)
+        return 1
+
+    if log_opts.log_mode == "json":
+        print "{\"command\":\"editor\",\"status\":\"ready\",\"tool\":\"Simple Editor\",\"version\":\"0.1.0\",\"mode\":\"{mode}\",\"files\":{file_count}}"
+        return 0
+
+    val progress = render_progress(log_opts.progress, 1, 1, "editor")
+    if progress != "":
+        print progress
+    print "Simple Editor v0.1.0"
+    print "Ready for {mode} editor startup with {file_count} file(s)."
+    0
+
+fn print_help():
+    print "Simple Editor"
+    print ""
+    print "Usage: simple editor [options] [file ...]"
+    print ""
+    print "Options:"
+    print "  -h, --help       Show this help message"
+    print "  -v, --version    Show version information"
+    print "  --gui            Select GUI mode"
+    print "  --gui-sdl        Select SDL GUI mode"
+    print ""
+    print "Shared log options:"
+    for line in log_options_help():
+        print "  {line}"
+
+fn print_help_with_progress(progress_mode: text):
+    val progress = render_progress(progress_mode, 0, 1, "usage")
+    if progress != "":
+        print progress
+    print_help()

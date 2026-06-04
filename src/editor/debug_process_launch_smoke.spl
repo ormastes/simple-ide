@@ -1,0 +1,53 @@
+# Editor DAP process launch transport smoke
+#
+# Native-only smoke entry for initialize + launch over DAP stdio.
+
+extern fn rt_process_spawn_piped(cmd: text, args: [text]) -> i64
+extern fn rt_process_write_stdin(pid: i64, data: text) -> bool
+extern fn rt_process_read_stdout(pid: i64) -> text
+extern fn rt_process_is_alive(pid: i64) -> bool
+extern fn rt_process_kill(pid: i64) -> bool
+extern fn rt_file_exists(path: text) -> bool
+
+fn _frame(json: text) -> text:
+    "Content-Length: " + str(json.len()) + "\r\n\r\n" + json
+
+fn main() -> i64:
+    val program = "src/app/dap/simple_dap_main.spl"
+    if not rt_file_exists(program):
+        print "STATUS: FAIL editor_dap_process_launch_smoke missing_program"
+        return 1
+    val simple_runner = if rt_file_exists("bin/simple") then "bin/simple" else: "bin/release/linux-x86_64/simple"
+    val pid = rt_process_spawn_piped(simple_runner, ["run", "src/app/dap/simple_dap_main.spl"])
+    if pid <= 0:
+        print "STATUS: FAIL editor_dap_process_launch_smoke start"
+        return 1
+    val init_json = "{\"seq\":1,\"type\":\"request\",\"command\":\"initialize\",\"arguments\":{\"adapterID\":\"simple\"}}"
+    val launch_json = "{\"seq\":2,\"type\":\"request\",\"command\":\"launch\",\"arguments\":{\"program\":\"" + program + "\",\"cwd\":\".\"}}"
+    if not rt_process_write_stdin(pid, _frame(init_json)):
+        rt_process_kill(pid)
+        print "STATUS: FAIL editor_dap_process_launch_smoke write_init"
+        return 1
+    if not rt_process_write_stdin(pid, _frame(launch_json)):
+        rt_process_kill(pid)
+        print "STATUS: FAIL editor_dap_process_launch_smoke write_launch"
+        return 1
+
+    var attempts = 0
+    var saw_stopped = false
+    var raw = ""
+    while attempts < 100000 and not saw_stopped and rt_process_is_alive(pid):
+        val chunk = rt_process_read_stdout(pid)
+        if chunk != "":
+            raw = raw + chunk
+        if raw.contains("\"type\":\"event\"") and raw.contains("\"event\":\"stopped\""):
+            saw_stopped = true
+        attempts = attempts + 1
+    rt_process_kill(pid)
+
+    if not saw_stopped:
+        print "STATUS: FAIL editor_dap_process_launch_smoke no_stopped_event"
+        return 1
+
+    print "STATUS: PASS editor_dap_process_launch_smoke"
+    0

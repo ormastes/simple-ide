@@ -1,0 +1,143 @@
+# Sparkline — Braille Unicode Graphs
+#
+# Renders compact inline graphs using Unicode braille characters (U+2800-U+28FF).
+# Each character cell = 2×4 dot grid = 8 possible dots.
+# Used for token usage trends, latency, and other time-series in the dashboard.
+
+use app.ui.render.ansi.{RESET, FG_GREEN, FG_YELLOW, FG_RED, FG_CYAN, DIM}
+
+# =========================================================================
+# Bar Sparkline (simpler: uses block characters ▁▂▃▄▅▆▇█)
+# =========================================================================
+
+val SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+fn sparkline(values: [i64], width: i64) -> text:
+    """Render a sparkline bar chart using block characters."""
+    if values.len() == 0:
+        return ""
+    # Find min/max
+    var min_val = values[0]
+    var max_val = values[0]
+    for v in values:
+        if v < min_val:
+            min_val = v
+        if v > max_val:
+            max_val = v
+    val range = max_val - min_val
+    if range == 0:
+        var flat: [text] = []
+        var i = 0
+        while i < width and i < values.len():
+            flat.push("▄")
+            i = i + 1
+        return flat.join("")
+
+    # Map values to bar heights (0-7)
+    var chars: [text] = []
+    val bar_chars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+    var idx = 0
+    while idx < width and idx < values.len():
+        val normalized = ((values[idx] - min_val) * 7) / range
+        val bar_idx = if normalized > 7: 7 elif normalized < 0: 0 else: normalized
+        chars.push(bar_chars[bar_idx])
+        idx = idx + 1
+    chars.join("")
+
+fn sparkline_colored(values: [i64], width: i64) -> text:
+    """Sparkline with green-yellow-red gradient based on value height."""
+    if values.len() == 0:
+        return ""
+    var min_val = values[0]
+    var max_val = values[0]
+    for v in values:
+        if v < min_val:
+            min_val = v
+        if v > max_val:
+            max_val = v
+    val range = max_val - min_val
+    val bar_chars = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+
+    var chars: [text] = []
+    var idx = 0
+    while idx < width and idx < values.len():
+        val normalized = if range > 0: ((values[idx] - min_val) * 7) / range else: 3
+        val bar_idx = if normalized > 7: 7 elif normalized < 0: 0 else: normalized
+        val color = if bar_idx <= 2: FG_GREEN
+                    elif bar_idx <= 5: FG_YELLOW
+                    else: FG_RED
+        chars.push(color + bar_chars[bar_idx] + RESET)
+        idx = idx + 1
+    chars.join("")
+
+# =========================================================================
+# Progress Bar
+# =========================================================================
+
+fn progress_bar(value: i64, max_val: i64, width: i64) -> text:
+    """Render a progress bar: [████░░░░░░] 45%"""
+    val pct = if max_val > 0: (value * 100) / max_val else: 0
+    val filled = if max_val > 0: (value * width) / max_val else: 0
+    val empty = width - filled
+
+    val color = if pct >= 80: FG_GREEN
+                elif pct >= 50: FG_YELLOW
+                else: FG_RED
+
+    var parts: [text] = []
+    parts.push("[")
+    var i = 0
+    while i < filled:
+        parts.push(color + "█" + RESET)
+        i = i + 1
+    i = 0
+    while i < empty:
+        parts.push(DIM + "░" + RESET)
+        i = i + 1
+    parts.push("] ")
+    parts.push(pct.to_text())
+    parts.push("%")
+    parts.join("")
+
+fn progress_bar_compact(pct: i64, width: i64) -> text:
+    """Compact progress bar without percentage label."""
+    val filled = (pct * width) / 100
+    val empty = width - filled
+    val color = if pct >= 80: FG_GREEN
+                elif pct >= 50: FG_YELLOW
+                else: FG_RED
+
+    var parts: [text] = []
+    var i = 0
+    while i < filled:
+        parts.push(color + "█" + RESET)
+        i = i + 1
+    i = 0
+    while i < empty:
+        parts.push(DIM + "░" + RESET)
+        i = i + 1
+    parts.join("")
+
+# =========================================================================
+# Status Indicators
+# =========================================================================
+
+fn status_dot(ok: bool) -> text:
+    """Green/red status dot."""
+    if ok:
+        FG_GREEN + "●" + RESET
+    else:
+        FG_RED + "●" + RESET
+
+fn status_dot_label(ok: bool, label: text) -> text:
+    """Status dot with label."""
+    status_dot(ok) + " " + label
+
+fn trend_arrow(current: i64, previous: i64) -> text:
+    """Up/down/flat trend arrow."""
+    if current > previous:
+        FG_GREEN + "↑" + RESET
+    elif current < previous:
+        FG_RED + "↓" + RESET
+    else:
+        DIM + "→" + RESET

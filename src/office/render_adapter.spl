@@ -1,0 +1,17 @@
+# Office Render Adapter
+# Unified render adapter for the office suite. Routes render requests to the
+# appropriate sub-app (word, sheets, slides, mail, planner) and converts
+# each sub-app's UI tree into a shared RenderResult with text and HTML output.
+
+use app.ui.render.types.{RenderConfig, RenderResult}
+use app.office.theme.{office_theme}
+
+fn office_render(config: RenderConfig) -> RenderResult:
+    val theme = office_theme(config.adapter_name, false)
+    RenderResult(
+        format: "text",
+        text_output: "Office: {config.adapter_name}",
+        html_output: "",
+        metadata: {},
+        warnings: []
+    )

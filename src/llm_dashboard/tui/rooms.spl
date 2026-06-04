@@ -1,0 +1,195 @@
+# Room Definitions
+#
+# Defines room types, tool-to-room routing, and room content rendering.
+# Each room displays contextually relevant agent activity.
+
+use app.llm_dashboard.data.types.{RoomKind, room_name, tool_to_room, ActivityEntry,
+    AgentMessage, McpStats, format_timestamp, truncate_text, mcp_avg_latency, format_tokens,
+    ManagedTask, TaskKind, TaskState}
+use app.llm_dashboard.tui.colors.{room_color}
+use app.ui.render.ansi.{RESET, DIM, BOLD}
+
+# =========================================================================
+# Room State
+# =========================================================================
+
+class RoomState:
+    kind: RoomKind
+    title: text
+    content_lines: [text]
+    agent_count: i32
+    active: bool
+
+    static fn new(kind: RoomKind) -> RoomState:
+        return RoomState(
+            kind: kind,
+            title: room_name(kind),
+            content_lines: [],
+            agent_count: 0,
+            active: false
+        )
+
+# =========================================================================
+# Room Rendering
+# =========================================================================
+
+fn render_room_content(room: RoomState, max_lines: i32) -> [text]:
+    """Get room content limited to max_lines."""
+    if room.content_lines.len() <= max_lines:
+        return room.content_lines
+    return room.content_lines.slice(room.content_lines.len() - max_lines)
+
+fn render_room_header(room: RoomState) -> text:
+    """Render room title with color and agent count."""
+    val color = room_color(room.kind)
+    val count_str = if room.agent_count > 0: " ({room.agent_count})" else: ""
+    return "{color}{BOLD}{room.title}{RESET}{DIM}{count_str}{RESET}"
+
+# =========================================================================
+# Room Content Builders
+# =========================================================================
+
+fn build_room_content(kind: RoomKind, entries: [ActivityEntry], max_lines: i32) -> [text]:
+    """Build content lines for any room, filtering entries and formatting per room type."""
+    val target = room_name(kind)
+    var lines: [text] = []
+    var count = 0
+    var i = entries.len() - 1
+    while i >= 0 and count < max_lines:
+        val e = entries[i]
+        if room_name(e.room) == target:
+            lines.push(format_room_entry(kind, e))
+            count = count + 1
+        i = i - 1
+    return lines
+
+fn format_room_entry(kind: RoomKind, e: ActivityEntry) -> text:
+    """Format an activity entry for display in its room."""
+    match kind:
+        RoomKind.Research:
+            val time = format_timestamp(e.timestamp)
+            val s = truncate_text(e.summary, 40)
+            return "{DIM}{time}{RESET} {s}"
+        RoomKind.Code:
+            val icon = match e.tool_name:
+                "Read" => "R"
+                "Write" => "W"
+                "Edit" => "E"
+                "Grep" => "?"
+                "Glob" => "G"
+                _ => ">"
+            return " {icon} {truncate_text(e.summary, 38)}"
+        RoomKind.Skills:
+            return " /{e.summary}"
+        _:
+            return " {truncate_text(e.summary, 38)}"
+
+# truncate_text imported from data.types
+
+# Backward-compatible wrappers (used by tui/app.spl)
+fn build_research_content(entries: [ActivityEntry], max_lines: i32) -> [text]:
+    return build_room_content(RoomKind.Research, entries, max_lines)
+
+fn build_code_content(entries: [ActivityEntry], max_lines: i32) -> [text]:
+    return build_room_content(RoomKind.Code, entries, max_lines)
+
+fn build_skills_content(entries: [ActivityEntry], max_lines: i32) -> [text]:
+    return build_room_content(RoomKind.Skills, entries, max_lines)
+
+fn build_server_content(entries: [ActivityEntry], max_lines: i32) -> [text]:
+    return build_room_content(RoomKind.Server, entries, max_lines)
+
+# =========================================================================
+# Agent Messages (Chat Room)
+# =========================================================================
+
+fn build_chat_content(entries: [ActivityEntry], messages: [AgentMessage], max_lines: i32) -> [text]:
+    """Build Chat room content: agent messages + spawn events."""
+    var lines: [text] = []
+
+    # Recent agent messages
+    var msg_start = messages.len() - max_lines
+    if msg_start < 0:
+        msg_start = 0
+    var i = msg_start
+    while i < messages.len() and lines.len() < max_lines:
+        val msg = messages[i]
+        val time = format_timestamp(msg.timestamp)
+        val arrow = if msg.direction == "send": "->" else: "<-"
+        val who = if msg.direction == "send": truncate_text(msg.parent_id, 8) else: "agent"
+        val content = truncate_text(msg.content, 36)
+        lines.push("{DIM}{time}{RESET} {who} {arrow} \"{content}\"")
+        i = i + 1
+
+    # If no messages, show activity entries
+    if lines.len() == 0:
+        return build_room_content(RoomKind.Chat, entries, max_lines)
+
+    return lines
+
+# =========================================================================
+# MCP Stats (Server Room)
+# =========================================================================
+
+fn build_server_content_with_mcp(entries: [ActivityEntry], mcp_stats: [McpStats], max_lines: i32) -> [text]:
+    """Build Server room content: MCP server stats + activity."""
+    var lines: [text] = []
+
+    # MCP server stats header
+    if mcp_stats.len() > 0:
+        lines.push("{BOLD}MCP Servers:{RESET}")
+        for stats in mcp_stats:
+            if lines.len() >= max_lines - 1:
+                break
+            val avg_ms = mcp_avg_latency(stats)
+            val lat_str = if avg_ms > 0: " avg {avg_ms}ms" else: ""
+            lines.push("  {stats.server_name}: {stats.call_count} calls{lat_str}")
+
+    # Activity entries if room for them
+    val remaining = max_lines - lines.len()
+    if remaining > 0:
+        val activity_lines = build_room_content(RoomKind.Server, entries, remaining)
+        for line in activity_lines:
+            lines.push(line)
+
+    return lines
+
+# =========================================================================
+# Room Set
+# =========================================================================
+
+fn build_tasks_content(tasks: [ManagedTask], max_lines: i32) -> [text]:
+    """Format managed tasks for the Tasks room."""
+    var lines: [text] = []
+    if tasks.len() == 0:
+        lines.push("  No active tasks")
+        return lines
+    for task in tasks:
+        if lines.len() >= max_lines:
+            break
+        val state_label = match task.state:
+            TaskState.Active => "ACTIVE"
+            TaskState.Paused => "PAUSED"
+            TaskState.Completed => "DONE"
+            TaskState.Failed => "FAIL"
+            TaskState.Cancelled => "CANC"
+        val kind_label = match task.kind:
+            TaskKind.Loop => "loop"
+            TaskKind.Schedule => "cron"
+            TaskKind.RemoteControl => "remote"
+            TaskKind.Daemon => "daemon"
+        val cmd_preview = truncate_text(task.command, 40)
+        lines.push("  [{state_label}] {kind_label}:{task.name}  {cmd_preview}")
+    return lines
+
+fn create_room_set() -> [RoomState]:
+    """Create the default set of rooms."""
+    var rooms: [RoomState] = []
+    rooms.push(RoomState.new(RoomKind.Research))
+    rooms.push(RoomState.new(RoomKind.Code))
+    rooms.push(RoomState.new(RoomKind.Skills))
+    rooms.push(RoomState.new(RoomKind.Server))
+    rooms.push(RoomState.new(RoomKind.Chat))
+    rooms.push(RoomState.new(RoomKind.TestLab))
+    rooms.push(RoomState.new(RoomKind.Tasks))
+    return rooms

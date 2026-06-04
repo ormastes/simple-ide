@@ -1,0 +1,102 @@
+# Editor Path and Text Helpers
+#
+# Path manipulation, text search, payload parsing, and number parsing utilities.
+
+use app.editor.editor_controller_types.*
+use std.editor.core.path_text.*
+
+extern fn rt_env_get(key: text) -> text
+extern fn rt_process_run(cmd: text, args: [text]) -> (text, text, i64)
+
+fn _editor_split_path_list(value: text) -> [text]:
+    editor_split_path_list(value)
+
+fn _editor_dirname(path: text) -> text:
+    editor_dirname(path)
+
+fn _editor_path_basename(path: text) -> text:
+    editor_path_basename(path)
+
+fn _editor_join_path(folder: text, name: text) -> text:
+    editor_join_path(folder, name)
+
+fn _editor_find_text(haystack: text, needle: text) -> i64:
+    editor_find_text(haystack, needle)
+
+fn _editor_text_list_contains(items: [text], value: text) -> bool:
+    editor_text_list_contains(items, value)
+
+fn _editor_text_list_without_first(values: [text]) -> [text]:
+    editor_text_list_without_first(values)
+
+fn _editor_payload_part(payload: text, index: i64) -> text:
+    editor_payload_part(payload, index)
+
+fn _editor_payload_csv(payload: text) -> [text]:
+    editor_payload_csv(payload)
+
+fn _editor_parse_i64(value: text, fallback: i64) -> i64:
+    editor_parse_i64(value, fallback)
+
+fn _editor_digit_value(ch: text) -> i64:
+    editor_digit_value(ch)
+
+fn _editor_parse_property_payload(payload: text) -> EditorPropertyPayload:
+    val pipe = _editor_find_text(payload, "|")
+    if pipe >= 0:
+        return EditorPropertyPayload(
+            key: payload.slice(0, pipe).trim(),
+            value: payload.slice(pipe + 1, payload.len()).trim()
+        )
+    val eq = _editor_find_text(payload, "=")
+    if eq >= 0:
+        return EditorPropertyPayload(
+            key: payload.slice(0, eq).trim(),
+            value: payload.slice(eq + 1, payload.len()).trim()
+        )
+    EditorPropertyPayload(key: payload.trim(), value: "")
+
+fn _editor_parse_vault_property_payload(payload: text) -> EditorVaultPropertyPayload:
+    EditorVaultPropertyPayload(
+        root: _editor_payload_part(payload, 0).trim(),
+        key: _editor_payload_part(payload, 1).trim(),
+        value: _editor_payload_part(payload, 2).trim(),
+        selected_paths: _editor_payload_csv(_editor_payload_part(payload, 3))
+    )
+
+fn _editor_vault_property_path_selected(path: text, selected_paths: [text]) -> bool:
+    if selected_paths.len() == 0:
+        return true
+    val basename = _editor_path_basename(path)
+    var i = 0
+    while i < selected_paths.len():
+        val selected = selected_paths[i]
+        if selected == path or selected == basename or path.ends_with("/" + selected):
+            return true
+        i = i + 1
+    false
+
+fn _editor_open_external_url(url: text) -> bool:
+    _editor_open_external_url_status(url).starts_with("opened external link:")
+
+fn _editor_open_external_url_status(url: text) -> text:
+    val configured = rt_env_get("SIMPLE_EDITOR_BROWSER_COMMAND") ?? ""
+    val browser = if configured.trim() != "" then configured.trim() else: rt_env_get("BROWSER") ?? ""
+    val command = if browser.trim() != "" then browser.trim() else: "xdg-open"
+    val (_out, _err, code) = rt_process_run(command, [url])
+    if code == 0:
+        return "opened external link: " + url
+    "failed external link: " + url + " via " + command + " (exit " + code.to_text() + ")"
+
+fn _editor_apply_template_text(template_body: text, title: text, date: text) -> text:
+    val with_title = template_body.replace("{{title}}", title)
+    with_title.replace("{{date}}", date)
+
+fn _editor_last_dot(name: text) -> i64:
+    editor_last_dot(name)
+
+fn _editor_clean_relative_dir(path: text) -> text:
+    editor_clean_relative_dir(path)
+
+fn _editor_is_markdown_path(path: text) -> bool:
+    editor_is_markdown_path(path)

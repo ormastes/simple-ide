@@ -1,0 +1,345 @@
+# Simple Mail Application
+#
+# Three-column email client with folder sidebar, message list, and detail view.
+
+use common.ui.widget.{WidgetNode, UITree, UIEvent}
+use common.ui.builder.{column, row, panel, label, text_widget, button, scroll, statusbar, build_tree_with_title, with_flex}
+use common.ui.theme_registry.{ThemeId, theme_id_key}
+use common.ui.ios.builder.{navigation_bar, search_bar}
+use app.office.mail.message.{Email, EmailAddress, Attachment, MailFolder, new_email, email_preview, folder_name, email_address_display}
+use app.office.mail.compose.{ComposeDraft, new_draft, reply_draft, forward_draft, build_compose_ui}
+use app.office.mail.folders.{default_folders, build_folder_list}
+
+# =========================================================================
+# Application Class
+# =========================================================================
+
+class MailApp:
+    emails: [Email]
+    folders: [MailFolder]
+    active_folder: MailFolder
+    selected_email: text
+    composing: bool
+    search_query: text
+    file_path: text
+
+impl MailApp:
+
+    static fn new() -> MailApp:
+        """Create a new Mail app with default folders and sample data."""
+        return MailApp(
+            emails: _sample_emails(),
+            folders: default_folders(),
+            active_folder: MailFolder.Inbox,
+            selected_email: "",
+            composing: false,
+            search_query: "",
+            file_path: ""
+        )
+
+    me build_ui() -> UITree:
+        """Build the three-column mail UI."""
+        val compose_btn = button("btn_compose", "Compose", "compose")
+        val nav = navigation_bar("nav", "Simple Mail", [], [compose_btn])
+        val search = search_bar("search", "Search mail...", me.search_query)
+        val inbox_count = me.emails.len()
+        val summary = panel("mail_summary", "Messages", [
+            label("mail_summary_count", "{inbox_count} messages")
+        ])
+        var root_children: [WidgetNode] = [nav, search, summary]
+        if me.composing:
+            val compose_ui = build_compose_ui(new_draft())
+            root_children = root_children.push(compose_ui)
+        val unread_n = me.unread_count()
+        val folder_display = folder_name(me.active_folder)
+        val status = statusbar("statusbar",
+            "{folder_display} | {unread_n} unread",
+            "{me.emails.len()} messages"
+        )
+        root_children = root_children.push(status)
+
+        val root = column("root", root_children)
+        return build_tree_with_title(root, "Simple Mail", theme_id_key(ThemeId.IOSLight))
+
+    me handle_event(event: UIEvent):
+        """Handle UI events for the Mail app."""
+        match event:
+            UIEvent.Action(name):
+                match name:
+                    "compose":
+                        me.composing = true
+                    "discard":
+                        me.composing = false
+                    "send":
+                        me.composing = false
+                    "save_draft":
+                        me.composing = false
+                    "reply":
+                        val email = me._find_email(me.selected_email)
+                        if email != nil:
+                            me.composing = true
+                    "forward":
+                        val email = me._find_email(me.selected_email)
+                        if email != nil:
+                            me.composing = true
+                    "delete_email":
+                        me._delete_selected()
+                    "toggle_star":
+                        me._toggle_star_selected()
+                    _:
+                        if name.starts_with("select_email_"):
+                            val email_id = name.substring(13)
+                            me.selected_email = email_id
+                            me._mark_as_read(email_id)
+                        elif name.starts_with("select_folder_"):
+                            val idx_str = name.substring(14)
+                            val idx = _parse_int(idx_str)
+                            me._select_folder(idx)
+            _:
+                pass_do_nothing("non-action UI events do not affect the mail app")
+
+    me filtered_emails() -> [Email]:
+        """Return emails in the active folder matching the search query."""
+        val target_folder = folder_name(me.active_folder)
+        var result: [Email] = []
+        for email in me.emails:
+            if email.folder == target_folder:
+                if me.search_query == "":
+                    result = result.push(email)
+                else:
+                    val q = me.search_query.lower()
+                    val matches = (email.subject.lower().contains(q) or
+                        email.body.lower().contains(q) or
+                        email.from_addr.name.lower().contains(q) or
+                        email.from_addr.address.lower().contains(q))
+                    if matches:
+                        result = result.push(email)
+        return result
+
+    me unread_count() -> i32:
+        """Count unread emails in the active folder."""
+        val target_folder = folder_name(me.active_folder)
+        var count: i32 = 0
+        for email in me.emails:
+            if email.folder == target_folder and not email.read:
+                count = count + 1
+        return count
+
+    me _find_email(id: text) -> Email?:
+        """Find an email by id."""
+        if id == "":
+            return nil
+        for email in me.emails:
+            if email.id == id:
+                return email
+        return nil
+
+    me _build_unread_counts() -> Dict<text, i32>:
+        """Build a dict mapping folder name to unread count."""
+        var counts: Dict<text, i32> = {}
+        for email in me.emails:
+            if not email.read:
+                val current = counts.get(email.folder)
+                if current != nil:
+                    counts = counts.set(email.folder, current + 1)
+                else:
+                    counts = counts.set(email.folder, 1)
+        return counts
+
+    me _mark_as_read(email_id: text):
+        """Mark an email as read."""
+        var updated: [Email] = []
+        for email in me.emails:
+            if email.id == email_id:
+                updated = updated.push(Email(
+                    id: email.id,
+                    from_addr: email.from_addr,
+                    to: email.to,
+                    cc: email.cc,
+                    subject: email.subject,
+                    body: email.body,
+                    date: email.date,
+                    read: true,
+                    starred: email.starred,
+                    thread_id: email.thread_id,
+                    folder: email.folder,
+                    attachments: email.attachments
+                ))
+            else:
+                updated = updated.push(email)
+        me.emails = updated
+
+    me _toggle_star_selected():
+        """Toggle the starred flag on the selected email."""
+        if me.selected_email == "":
+            return
+        var updated: [Email] = []
+        for email in me.emails:
+            if email.id == me.selected_email:
+                updated = updated.push(Email(
+                    id: email.id,
+                    from_addr: email.from_addr,
+                    to: email.to,
+                    cc: email.cc,
+                    subject: email.subject,
+                    body: email.body,
+                    date: email.date,
+                    read: email.read,
+                    starred: not email.starred,
+                    thread_id: email.thread_id,
+                    folder: email.folder,
+                    attachments: email.attachments
+                ))
+            else:
+                updated = updated.push(email)
+        me.emails = updated
+
+    me _delete_selected():
+        """Move the selected email to Trash, or permanently delete if already there."""
+        if me.selected_email == "":
+            return
+        var updated: [Email] = []
+        for email in me.emails:
+            if email.id == me.selected_email:
+                if email.folder == "Trash":
+                    # Permanent delete: skip this email
+                    pass_do_nothing("permanent delete skips the selected trash email")
+                else:
+                    # Move to Trash
+                    updated = updated.push(Email(
+                        id: email.id,
+                        from_addr: email.from_addr,
+                        to: email.to,
+                        cc: email.cc,
+                        subject: email.subject,
+                        body: email.body,
+                        date: email.date,
+                        read: email.read,
+                        starred: email.starred,
+                        thread_id: email.thread_id,
+                        folder: "Trash",
+                        attachments: email.attachments
+                    ))
+            else:
+                updated = updated.push(email)
+        me.emails = updated
+        me.selected_email = ""
+
+    me _select_folder(idx: i32):
+        """Switch to the folder at the given index."""
+        var i: i32 = 0
+        for folder in me.folders:
+            if i == idx:
+                me.active_folder = folder
+                me.selected_email = ""
+                return
+            i = i + 1
+
+# =========================================================================
+# Module Helpers
+# =========================================================================
+
+fn _format_address_list(addrs: [EmailAddress]) -> text:
+    """Format a list of addresses as a comma-separated display string."""
+    var parts: [text] = []
+    for addr in addrs:
+        parts = parts.push(email_address_display(addr))
+    return parts.join(", ")
+
+fn _parse_int(s: text) -> i32:
+    """Parse a non-negative integer from text. Returns 0 on failure."""
+    if s.len() == 0:
+        return 0
+    var result: i32 = 0
+    var i: i32 = 0
+    while i < s.len():
+        val c = s.char_at(i)
+        val code = c.char_code_at(0)
+        if code >= 48 and code <= 57:
+            result = result * 10 + (code - 48)
+        else:
+            return 0
+        i = i + 1
+    return result
+
+fn _sample_address(name: text, address: text) -> EmailAddress:
+    EmailAddress(name: name, address: address)
+
+fn _sample_emails() -> [Email]:
+    val local_user = _sample_address("Simple Office", "me@simple.local")
+    val alex = _sample_address("Alex Rivera", "alex@example.com")
+    val jamie = _sample_address("Jamie Chen", "jamie@example.com")
+    val priya = _sample_address("Priya Singh", "priya@example.com")
+
+    return [
+        Email(
+            id: "mail_1",
+            from_addr: alex,
+            to: [local_user],
+            cc: [],
+            subject: "Quarterly draft is ready",
+            body: "The latest draft is attached in Word. Please review the summary section before lunch.",
+            date: "2026-03-24",
+            read: false,
+            starred: true,
+            thread_id: "thread_1",
+            folder: "Inbox",
+            attachments: [Attachment(filename: "quarterly-report.sdoc", mime_type: "application/simple-word", size: 18432)]
+        ),
+        Email(
+            id: "mail_2",
+            from_addr: jamie,
+            to: [local_user],
+            cc: [],
+            subject: "Updated staffing sheet",
+            body: "I corrected the totals in the staffing sheet and highlighted the rows that changed.",
+            date: "2026-03-23",
+            read: false,
+            starred: false,
+            thread_id: "thread_2",
+            folder: "Inbox",
+            attachments: []
+        ),
+        Email(
+            id: "mail_3",
+            from_addr: local_user,
+            to: [priya],
+            cc: [],
+            subject: "Slides for product review",
+            body: "Sharing the latest presentation deck. I will walk through slides 4 through 8 tomorrow.",
+            date: "2026-03-22",
+            read: true,
+            starred: false,
+            thread_id: "thread_3",
+            folder: "Sent",
+            attachments: [Attachment(filename: "product-review.sslide", mime_type: "application/simple-slides", size: 12288)]
+        ),
+        Email(
+            id: "mail_4",
+            from_addr: local_user,
+            to: [alex],
+            cc: [],
+            subject: "Follow-up draft",
+            body: "This draft is saved locally for later edits.",
+            date: "2026-03-21",
+            read: true,
+            starred: false,
+            thread_id: "thread_4",
+            folder: "Drafts",
+            attachments: []
+        ),
+        Email(
+            id: "mail_5",
+            from_addr: priya,
+            to: [local_user],
+            cc: [],
+            subject: "Old vendor thread",
+            body: "This thread can stay in trash for archive verification.",
+            date: "2026-03-18",
+            read: true,
+            starred: false,
+            thread_id: "thread_5",
+            folder: "Trash",
+            attachments: []
+        )
+    ]

@@ -1,0 +1,370 @@
+# Agent Dashboard Store
+#
+# Central state container for the LLM Agent Dashboard.
+# Aggregates data from JSONL watcher, agent tree, and collectors.
+
+use app.llm_dashboard.data.types.{
+    AgentNode, LLMStatus, LLMProvider, RoomKind, FileActivity, URLActivity,
+    ActivityEntry, AgentMessage, McpStats, ManagedTask, TaskKind, TaskState,
+    provider_name, room_name, format_tokens, total_tokens, mcp_server_name
+}
+use app.llm_dashboard.data.jsonl_watcher.{JsonlWatcher}
+use app.llm_dashboard.data.agent_tree.{AgentTree}
+use app.llm_dashboard.data.jsonl_parser.{DashboardEvent, event_to_activity_entry}
+
+# =========================================================================
+# Dashboard Store
+# =========================================================================
+
+class AgentDashboardStore:
+    watcher: JsonlWatcher
+    tree: AgentTree
+    activity_feed: [ActivityEntry]
+    file_activities: [FileActivity]
+    url_activities: [URLActivity]
+    llm_statuses: [LLMStatus]
+    agent_messages: [AgentMessage]
+    mcp_stats: [McpStats]
+    managed_tasks: [ManagedTask]
+    total_cache_reads: i64
+    total_cache_creates: i64
+    cache_history: [i64]
+    max_feed_size: i32
+    last_update: i64
+    total_events: i64
+
+    static fn new() -> AgentDashboardStore:
+        # Initialize with disconnected statuses for all providers
+        var statuses: [LLMStatus] = []
+        statuses.push(LLMStatus.disconnected(LLMProvider.Claude))
+        statuses.push(LLMStatus.disconnected(LLMProvider.Codex))
+        statuses.push(LLMStatus.disconnected(LLMProvider.Gemini))
+
+        return AgentDashboardStore(
+            watcher: JsonlWatcher.new(),
+            tree: AgentTree.new(),
+            activity_feed: [],
+            file_activities: [],
+            url_activities: [],
+            llm_statuses: statuses,
+            agent_messages: [],
+            mcp_stats: [],
+            managed_tasks: [],
+            total_cache_reads: 0,
+            total_cache_creates: 0,
+            cache_history: [],
+            max_feed_size: 200,
+            last_update: 0,
+            total_events: 0
+        )
+
+    static fn with_dir(dir: text) -> AgentDashboardStore:
+        var statuses: [LLMStatus] = []
+        statuses.push(LLMStatus.disconnected(LLMProvider.Claude))
+        statuses.push(LLMStatus.disconnected(LLMProvider.Codex))
+        statuses.push(LLMStatus.disconnected(LLMProvider.Gemini))
+
+        return AgentDashboardStore(
+            watcher: JsonlWatcher.with_dir(dir),
+            tree: AgentTree.new(),
+            activity_feed: [],
+            file_activities: [],
+            url_activities: [],
+            llm_statuses: statuses,
+            agent_messages: [],
+            mcp_stats: [],
+            managed_tasks: [],
+            total_cache_reads: 0,
+            total_cache_creates: 0,
+            cache_history: [],
+            max_feed_size: 200,
+            last_update: 0,
+            total_events: 0
+        )
+
+# =========================================================================
+# Store Methods
+# =========================================================================
+
+impl AgentDashboardStore:
+
+    # -- Polling ----------------------------------------------------------
+
+    me poll():
+        """Poll for new events and update all state."""
+        val events = self.watcher.poll()
+        for event in events:
+            self._process_event(event)
+            self.total_events = self.total_events + 1
+
+    me _process_event(event: DashboardEvent):
+        """Process a single event, updating tree, feed, and tracking."""
+        # Update agent tree
+        self.tree.update_from_event(event)
+
+        # Update activity feed
+        val entry = event_to_activity_entry(event)
+        if entry != nil:
+            self.activity_feed.push(entry)
+            # Trim feed if too large
+            if self.activity_feed.len() > self.max_feed_size:
+                self.activity_feed = self.activity_feed.slice(
+                    self.activity_feed.len() - self.max_feed_size
+                )
+
+        # Track file and URL activity
+        match event:
+            DashboardEvent.ToolCall(agent_id, tool_name, args, timestamp):
+                if tool_name == "Read" and args.len() > 0:
+                    self.file_activities.push(
+                        FileActivity.new(agent_id, args[0], "read", timestamp)
+                    )
+                elif tool_name == "Write" and args.len() > 0:
+                    self.file_activities.push(
+                        FileActivity.new(agent_id, args[0], "write", timestamp)
+                    )
+                elif tool_name == "Edit" and args.len() > 0:
+                    self.file_activities.push(
+                        FileActivity.new(agent_id, args[0], "edit", timestamp)
+                    )
+                elif tool_name == "WebFetch" and args.len() > 0:
+                    self.url_activities.push(
+                        URLActivity.new(agent_id, args[0], timestamp)
+                    )
+                elif tool_name == "WebSearch" and args.len() > 0:
+                    self.url_activities.push(
+                        URLActivity.new(agent_id, args[0], timestamp)
+                    )
+                elif tool_name.starts_with("mcp__"):
+                    self._track_mcp_call(tool_name, timestamp)
+                else:
+                    pass_dn
+            _: pass_dn
+
+        # Track agent messages on spawn
+        match event:
+            DashboardEvent.AgentSpawn(parent_id, child_id, description, prompt, timestamp):
+                if prompt != "":
+                    self.agent_messages.push(
+                        AgentMessage.new(parent_id, child_id, "send", prompt, timestamp)
+                    )
+                    if self.agent_messages.len() > 200:
+                        self.agent_messages = self.agent_messages.slice(
+                            self.agent_messages.len() - 200
+                        )
+            DashboardEvent.ToolResponse(agent_id, tool_name, response_preview, timestamp):
+                if tool_name == "Agent" and response_preview != "":
+                    self.agent_messages.push(
+                        AgentMessage.new(agent_id, "", "receive", response_preview, timestamp)
+                    )
+                    if self.agent_messages.len() > 200:
+                        self.agent_messages = self.agent_messages.slice(
+                            self.agent_messages.len() - 200
+                        )
+            _: pass_dn
+
+        # Update LLM status from session events
+        match event:
+            DashboardEvent.SessionStart(session_id, model, provider_str, timestamp):
+                self._update_llm_status_connected(provider_str, model, timestamp)
+            DashboardEvent.AssistantMessage(agent_id, input_tokens, output_tokens, cache_read, cache_create, timestamp):
+                self._add_llm_tokens(agent_id, input_tokens, output_tokens, cache_read, cache_create)
+                self.total_cache_reads = self.total_cache_reads + cache_read
+                self.total_cache_creates = self.total_cache_creates + cache_create
+                self.cache_history.push(cache_read)
+                if self.cache_history.len() > 50:
+                    self.cache_history = self.cache_history.slice(
+                        self.cache_history.len() - 50
+                    )
+            _: pass_dn
+
+    # -- LLM Status Updates -----------------------------------------------
+
+    me _update_llm_status_connected(provider_str: text, model: text, timestamp: i64):
+        """Mark an LLM provider as connected."""
+        var i = 0
+        while i < self.llm_statuses.len():
+            val status = self.llm_statuses[i]
+            val pname = provider_name(status.provider).lower()
+            if provider_str.lower().contains(pname) or pname.contains(provider_str.lower()):
+                self.llm_statuses[i].connected = true
+                self.llm_statuses[i].model = model
+                self.llm_statuses[i].last_heartbeat = timestamp
+                self.llm_statuses[i].active_agents = self.llm_statuses[i].active_agents + 1
+                return
+            i = i + 1
+        # Default: update Claude (most likely)
+        if self.llm_statuses.len() > 0:
+            self.llm_statuses[0].connected = true
+            self.llm_statuses[0].model = model
+            self.llm_statuses[0].last_heartbeat = timestamp
+
+    me _add_llm_tokens(agent_id: text, input: i64, output: i64, cache_read: i64, cache_create: i64):
+        """Add token breakdown to the appropriate provider's counter."""
+        val total = input + output + cache_read + cache_create
+        # Find which provider this agent belongs to
+        val agent = self.tree.get_agent(agent_id)
+        if agent == nil:
+            # Default to Claude
+            if self.llm_statuses.len() > 0:
+                self.llm_statuses[0].tokens_used = self.llm_statuses[0].tokens_used + total
+                self.llm_statuses[0].cache_read_tokens = self.llm_statuses[0].cache_read_tokens + cache_read
+                self.llm_statuses[0].cache_create_tokens = self.llm_statuses[0].cache_create_tokens + cache_create
+            return
+        val pname = provider_name(agent.provider).lower()
+        var i = 0
+        while i < self.llm_statuses.len():
+            if provider_name(self.llm_statuses[i].provider).lower() == pname:
+                self.llm_statuses[i].tokens_used = self.llm_statuses[i].tokens_used + total
+                self.llm_statuses[i].cache_read_tokens = self.llm_statuses[i].cache_read_tokens + cache_read
+                self.llm_statuses[i].cache_create_tokens = self.llm_statuses[i].cache_create_tokens + cache_create
+                return
+            i = i + 1
+
+    # -- MCP Tracking ----------------------------------------------------
+
+    me _track_mcp_call(tool_name: text, timestamp: i64):
+        """Track a call to an MCP server."""
+        val server = mcp_server_name(tool_name)
+        if server == "":
+            return
+        var i = 0
+        while i < self.mcp_stats.len():
+            if self.mcp_stats[i].server_name == server:
+                self.mcp_stats[i].call_count = self.mcp_stats[i].call_count + 1
+                self.mcp_stats[i].last_tool = tool_name
+                self.mcp_stats[i].last_call_time = timestamp
+                return
+            i = i + 1
+        # New server
+        var stats = McpStats.new(server)
+        stats.call_count = 1
+        stats.last_tool = tool_name
+        stats.last_call_time = timestamp
+        self.mcp_stats.push(stats)
+
+    # -- Queries ----------------------------------------------------------
+
+    fn get_agents() -> [AgentNode]:
+        return self.tree.all_agents()
+
+    fn get_root_agents() -> [AgentNode]:
+        return self.tree.root_agents()
+
+    fn get_children(parent_id: text) -> [AgentNode]:
+        return self.tree.children_of(parent_id)
+
+    fn get_status(provider: LLMProvider) -> LLMStatus:
+        val pname = provider_name(provider).lower()
+        for status in self.llm_statuses:
+            if provider_name(status.provider).lower() == pname:
+                return status
+        return LLMStatus.disconnected(provider)
+
+    fn get_feed(count: i32) -> [ActivityEntry]:
+        """Get the most recent activity feed entries."""
+        if count >= self.activity_feed.len():
+            return self.activity_feed
+        return self.activity_feed.slice(self.activity_feed.len() - count)
+
+    fn get_feed_for_room(room: RoomKind, count: i32) -> [ActivityEntry]:
+        """Get activity feed entries for a specific room."""
+        var filtered: [ActivityEntry] = []
+        val rname = room_name(room)
+        for entry in self.activity_feed:
+            if room_name(entry.room) == rname:
+                filtered.push(entry)
+        if count >= filtered.len():
+            return filtered
+        return filtered.slice(filtered.len() - count)
+
+    fn get_files_for_agent(agent_id: text) -> [FileActivity]:
+        var result: [FileActivity] = []
+        for fa in self.file_activities:
+            if fa.agent_id == agent_id:
+                result.push(fa)
+        return result
+
+    fn get_urls_for_agent(agent_id: text) -> [URLActivity]:
+        var result: [URLActivity] = []
+        for ua in self.url_activities:
+            if ua.agent_id == agent_id:
+                result.push(ua)
+        return result
+
+    fn total_files_read() -> i32:
+        var count = 0
+        for fa in self.file_activities:
+            if fa.operation == "read":
+                count = count + 1
+        return count
+
+    fn total_files_written() -> i32:
+        var count = 0
+        for fa in self.file_activities:
+            if fa.operation == "write" or fa.operation == "edit":
+                count = count + 1
+        return count
+
+    fn total_urls() -> i32:
+        return self.url_activities.len()
+
+    fn total_tools_used() -> i64:
+        var count: i64 = 0
+        for entry in self.activity_feed:
+            count = count + 1
+        return count
+
+    fn is_available() -> bool:
+        """Check if JSONL watching is available."""
+        return self.watcher.is_available()
+
+    fn get_agent_messages(limit: i32) -> [AgentMessage]:
+        """Get recent agent messages."""
+        if limit >= self.agent_messages.len():
+            return self.agent_messages
+        return self.agent_messages.slice(self.agent_messages.len() - limit)
+
+    fn get_mcp_stats() -> [McpStats]:
+        return self.mcp_stats
+
+    fn get_managed_tasks() -> [ManagedTask]:
+        return self.managed_tasks
+
+    fn session_cache_efficiency_pct() -> i64:
+        """Session-wide cache efficiency as integer percentage."""
+        val total_input = self.total_cache_reads + self.total_cache_creates
+        var uncached: i64 = 0
+        for status in self.llm_statuses:
+            uncached = uncached + status.tokens_used - status.cache_read_tokens - status.cache_create_tokens
+        val total = total_input + uncached
+        if total <= 0:
+            return 0
+        return (self.total_cache_reads * 100) / total
+
+    me add_managed_task(task: ManagedTask):
+        """Add or replace a managed task by ID."""
+        var i = 0
+        while i < self.managed_tasks.len():
+            if self.managed_tasks[i].id == task.id:
+                self.managed_tasks[i] = task
+                return
+            i = i + 1
+        self.managed_tasks.push(task)
+
+    me remove_managed_task(task_id: text):
+        """Remove a managed task by ID."""
+        var kept: [ManagedTask] = []
+        for t in self.managed_tasks:
+            if t.id != task_id:
+                kept.push(t)
+        self.managed_tasks = kept
+
+    fn summary_line() -> text:
+        """One-line summary for status bar."""
+        val agents = self.tree.agent_count()
+        val reads = self.total_files_read()
+        val writes = self.total_files_written()
+        val urls = self.total_urls()
+        val tools = self.total_tools_used()
+        return "Agents: {agents}  Files: {reads}R {writes}W  URLs: {urls}  Tools: {tools}"

@@ -1,0 +1,137 @@
+# Slide Templates
+#
+# Predefined starter slide layouts with editable seed content.
+
+use app.office.slides.slide.{Slide, SlideLayout, SlideElement, SlideElementKind}
+
+# =========================================================================
+# Template Builders
+# =========================================================================
+
+fn template_title(id: text) -> Slide:
+    """Large centered title with subtitle below."""
+    var elements: [SlideElement] = []
+    val title_el = SlideElement(
+        id: "{id}_title",
+        kind: SlideElementKind.TextBox(content: "Title"),
+        x: 120, y: 160,
+        width: 720, height: 100
+    )
+    elements.push(title_el)
+    val subtitle_el = SlideElement(
+        id: "{id}_subtitle",
+        kind: SlideElementKind.TextBox(content: "Subtitle"),
+        x: 180, y: 280,
+        width: 600, height: 60
+    )
+    elements.push(subtitle_el)
+    return Slide(
+        id: id,
+        layout: SlideLayout.TitleSlide,
+        elements: elements,
+        notes: "",
+        background: "#FFFFFF"
+    )
+
+fn template_title_content(id: text) -> Slide:
+    """Title at top with body content area below."""
+    var elements: [SlideElement] = []
+    val title_el = SlideElement(
+        id: "{id}_title",
+        kind: SlideElementKind.TextBox(content: "Title"),
+        x: 50, y: 30,
+        width: 860, height: 60
+    )
+    elements.push(title_el)
+    val body_el = SlideElement(
+        id: "{id}_body",
+        kind: SlideElementKind.TextBox(content: "Content goes here"),
+        x: 50, y: 110,
+        width: 860, height: 400
+    )
+    elements.push(body_el)
+    return Slide(
+        id: id,
+        layout: SlideLayout.TitleContent,
+        elements: elements,
+        notes: "",
+        background: "#FFFFFF"
+    )
+
+fn template_two_column(id: text) -> Slide:
+    """Title at top with two content columns side by side."""
+    var elements: [SlideElement] = []
+    val title_el = SlideElement(
+        id: "{id}_title",
+        kind: SlideElementKind.TextBox(content: "Title"),
+        x: 50, y: 30,
+        width: 860, height: 60
+    )
+    elements.push(title_el)
+    val left_el = SlideElement(
+        id: "{id}_left",
+        kind: SlideElementKind.TextBox(content: "Left column"),
+        x: 50, y: 110,
+        width: 410, height: 400
+    )
+    elements.push(left_el)
+    val right_el = SlideElement(
+        id: "{id}_right",
+        kind: SlideElementKind.TextBox(content: "Right column"),
+        x: 500, y: 110,
+        width: 410, height: 400
+    )
+    elements.push(right_el)
+    return Slide(
+        id: id,
+        layout: SlideLayout.TwoColumn,
+        elements: elements,
+        notes: "",
+        background: "#FFFFFF"
+    )
+
+fn template_section_header(id: text) -> Slide:
+    """Large centered section heading text."""
+    var elements: [SlideElement] = []
+    val heading_el = SlideElement(
+        id: "{id}_heading",
+        kind: SlideElementKind.TextBox(content: "Section Title"),
+        x: 100, y: 200,
+        width: 760, height: 120
+    )
+    elements.push(heading_el)
+    return Slide(
+        id: id,
+        layout: SlideLayout.SectionHeader,
+        elements: elements,
+        notes: "",
+        background: "#FFFFFF"
+    )
+
+fn template_blank(id: text) -> Slide:
+    """Empty slide with no starter elements."""
+    return Slide(
+        id: id,
+        layout: SlideLayout.Blank,
+        elements: [],
+        notes: "",
+        background: "#FFFFFF"
+    )
+
+# =========================================================================
+# Template Application
+# =========================================================================
+
+fn apply_template(slide: Slide, layout: SlideLayout) -> Slide:
+    """Replace a slide's elements with the starter layout content for the given layout."""
+    match layout:
+        SlideLayout.TitleSlide:
+            return template_title(slide.id)
+        SlideLayout.TitleContent:
+            return template_title_content(slide.id)
+        SlideLayout.TwoColumn:
+            return template_two_column(slide.id)
+        SlideLayout.SectionHeader:
+            return template_section_header(slide.id)
+        SlideLayout.Blank:
+            return template_blank(slide.id)

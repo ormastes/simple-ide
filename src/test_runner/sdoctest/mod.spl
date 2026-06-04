@@ -1,0 +1,37 @@
+# SDoctest Module
+#
+# Documentation testing system that extracts code blocks from markdown
+# files and runs them as tests.
+#
+# Usage:
+#   simple test --sdoctest                    # Run all from sdoctest.sdn
+#   simple test --sdoctest path/to/file.md    # Specific file
+#   simple test --sdoctest --list             # List blocks without running
+#   simple test --sdoctest --sdoctest-env=ci  # Use CI environment
+
+use std.test_runner.sdoctest.types.*
+use std.test_runner.sdoctest.config.*
+use std.test_runner.sdoctest.extractor.*
+use std.test_runner.sdoctest.discovery.*
+use std.test_runner.sdoctest.runner.*
+use std.test_runner.sdoctest.result_db.*
+use std.test_runner.sdoctest.doc_gen.*
+use std.test_runner.sdoctest.glob.*
+
+# Re-export all public APIs
+
+# Types
+
+# Config
+
+# Extractor
+
+# Discovery
+
+# Runner
+
+# Result DB
+
+# Doc Gen
+
+# Glob

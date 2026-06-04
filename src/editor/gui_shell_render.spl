@@ -1,0 +1,397 @@
+# Editor GUI Shell — Rendering
+#
+# HTML rendering for the GUI shell: frame composition, panels, popups,
+# diagnostics table, LSP results, wiki graph, escape helpers.
+# Core logic lives in gui_shell_core.spl.
+
+use std.editor.view.diagnostics_panel.*
+use std.editor.view.lsp_result_panel.*
+use std.editor.view.wiki_panel.*
+use std.editor.core.path_text.*
+use std.editor.services.diagnostics.*
+use std.editor.services.md_search.*
+
+extern fn rt_gui_present_html(html: text)
+
+struct GuiFrame:
+    tab_bar_html: text
+    file_tree_html: text
+    editor_html: text
+    status_html: text
+
+fn gui_shell_render_frame(state: GuiShellState) -> GuiFrame:
+    val buffer = state.ctrl.active_buffer()
+    val tab_bar = gui_render_tab_bar_html(state.ctrl.session)
+    var file_tree_html = ""
+    if state.ctrl.file_tree_visible:
+        file_tree_html = gui_render_file_tree_html(state.ctrl.file_tree)
+    var editor_html = ""
+    if state.ctrl.settings_view != nil:
+        editor_html = gui_render_settings_html(state.ctrl.settings_view, state.ctrl.config)
+    elif buffer != nil:
+        val doc = state.ctrl.session.active_document()
+        var lang = "text"
+        var path = buffer.path
+        var diagnostics: [EditorDiagnostic] = []
+        if doc != nil:
+            lang = doc.language_id
+            path = doc.path()
+            diagnostics = state.ctrl.diagnostic_store.diagnostics_for(path)
+        editor_html = gui_render_editor_area_with_diagnostics_and_hover_delay(buffer, lang, buffer.viewport, path, diagnostics, state.ctrl.config.hover_delay_ms)
+    else:
+        editor_html = "<div class=\"empty\">No file open</div>"
+    var right_panel_html = ""
+    val doc_frame = state.ctrl.session.active_document()
+    if state.ctrl.session.dock_layout.active_right == "wiki-panel":
+        var wiki_content = ""
+        if state.ctrl.wiki_panel.title == "Properties":
+            wiki_content = gui_render_wiki_property_form_html_with_root_and_schema(state.ctrl.wiki_panel, state.ctrl.wiki_property_vault_root, state.ctrl.wiki_property_schema_payload)
+        else:
+            if state.ctrl.wiki_panel.title == "Tasks":
+                wiki_content = "<div class=\"task-tools\"><input class=\"task-query\" data-event=\"task-query\" value=\"" + _gui_shell_escape_html(state.ctrl.wiki_task_query) + "\"><button type=\"button\" data-event=\"task-filter\" data-filter=\"open\">Open</button><button type=\"button\" data-event=\"task-filter\" data-filter=\"done\">Done</button><button type=\"button\" data-event=\"task-filter\" data-filter=\"all\">All</button><button type=\"button\" data-event=\"task-batch\" data-value=\"done\">Mark done</button><button type=\"button\" data-event=\"task-batch\" data-value=\"open\">Mark open</button><span class=\"task-count\">" + state.ctrl.wiki_panel.rows.len().to_text() + " tasks</span></div>"
+            elif state.ctrl.wiki_panel.title == "Vault Search":
+                wiki_content = "<div class=\"vault-search-tools\"><button type=\"button\" data-event=\"vault-search-filter\" data-filter=\"all\">All</button><button type=\"button\" data-event=\"vault-search-filter\" data-filter=\"heading\">Headings</button><button type=\"button\" data-event=\"vault-search-filter\" data-filter=\"paragraph\">Paragraphs</button><button type=\"button\" data-event=\"vault-search-filter\" data-filter=\"list\">Lists</button><button type=\"button\" data-event=\"vault-search-filter\" data-filter=\"code\">Code</button><button type=\"button\" data-event=\"vault-search-path-filter\" data-filter=\"all\">All paths</button>"
+                var vspi = 0
+                var seen_paths: [text] = []
+                while vspi < state.ctrl.wiki_panel.rows.len() and seen_paths.len() < 8:
+                    val path = state.ctrl.wiki_panel.rows[vspi].path
+                    if path != "" and not editor_text_list_contains(seen_paths, path):
+                        seen_paths.push(path)
+                        wiki_content = wiki_content + "<button type=\"button\" data-event=\"vault-search-path-filter\" data-filter=\"" + _gui_shell_escape_html(path) + "\">" + _gui_shell_escape_html(editor_path_basename(path)) + "</button>"
+                    vspi = vspi + 1
+                wiki_content = wiki_content + "</div>"
+            elif state.ctrl.wiki_panel.title == "Quick Switch":
+                wiki_content = "<div class=\"quick-switch-tools\"><input class=\"quick-switch-query\" data-event=\"quick-switch-filter\" value=\"" + _gui_shell_escape_html(state.ctrl.wiki_quick_switch_query) + "\"><button type=\"button\" data-event=\"quick-switch-filter\" data-filter=\"\">All notes</button><span class=\"quick-switch-count\">" + state.ctrl.wiki_panel.rows.len().to_text() + " notes</span></div>"
+            elif state.ctrl.wiki_panel.title == "Daily Notes":
+                val daily_date = editor_payload_part(state.ctrl.wiki_daily_note_payload, 0)
+                val daily_folder = editor_payload_part(state.ctrl.wiki_daily_note_payload, 1)
+                val daily_template = editor_payload_part(state.ctrl.wiki_daily_note_payload, 2)
+                val daily_title = editor_payload_part(state.ctrl.wiki_daily_note_payload, 3)
+                val daily_extension = editor_payload_part(state.ctrl.wiki_daily_note_payload, 4)
+                val daily_payload = daily_date + "|" + daily_folder + "|" + daily_template + "|" + daily_title + "|" + daily_extension
+                wiki_content = "<div class=\"daily-note-tools\"><input type=\"date\" class=\"daily-note-date\" data-event=\"daily-note-create\" value=\"" + _gui_shell_escape_html(daily_date) + "\" data-folder=\"" + _gui_shell_escape_html(daily_folder) + "\" data-template=\"" + _gui_shell_escape_html(daily_template) + "\" data-title-format=\"" + _gui_shell_escape_html(daily_title) + "\" data-extension=\"" + _gui_shell_escape_html(daily_extension) + "\"><button type=\"button\" data-event=\"daily-note-create\" data-value=\"" + _gui_shell_escape_html(daily_payload) + "\">Create</button></div>"
+            elif state.ctrl.wiki_panel.title == "Templates":
+                val template_folder = editor_payload_part(state.ctrl.wiki_template_picker_payload, 0)
+                val template_target = editor_payload_part(state.ctrl.wiki_template_picker_payload, 1)
+                val template_title = editor_payload_part(state.ctrl.wiki_template_picker_payload, 2)
+                val template_date = editor_payload_part(state.ctrl.wiki_template_picker_payload, 3)
+                val template_query = editor_payload_part(state.ctrl.wiki_template_picker_payload, 4)
+                val template_filter_payload = template_folder + "|" + template_target + "|" + template_title + "|" + template_date + "|" + template_query
+                wiki_content = "<div class=\"template-tools\"><input class=\"template-query\" data-event=\"template-picker-filter\" value=\"" + _gui_shell_escape_html(template_query) + "\" data-folder=\"" + _gui_shell_escape_html(template_folder) + "\" data-target=\"" + _gui_shell_escape_html(template_target) + "\"><input class=\"template-title\" data-event=\"template-picker-filter\" value=\"" + _gui_shell_escape_html(template_title) + "\"><input type=\"date\" class=\"template-date\" data-event=\"template-picker-filter\" value=\"" + _gui_shell_escape_html(template_date) + "\"><button type=\"button\" data-event=\"template-picker-filter\" data-value=\"" + _gui_shell_escape_html(template_filter_payload) + "\">Filter</button><span class=\"template-count\">" + state.ctrl.wiki_panel.rows.len().to_text() + " templates</span></div>"
+            elif state.ctrl.wiki_panel.title == "Attachment Picker":
+                val attachment_root = editor_payload_part(state.ctrl.wiki_attachment_picker_payload, 0)
+                val attachment_query = editor_payload_part(state.ctrl.wiki_attachment_picker_payload, 1)
+                val attachment_target = editor_payload_part(state.ctrl.wiki_attachment_picker_payload, 2)
+                val attachment_storage = editor_payload_part(state.ctrl.wiki_attachment_picker_payload, 3)
+                val attachment_filter_payload = attachment_root + "|" + attachment_query + "|" + attachment_target + "|" + attachment_storage
+                wiki_content = "<div class=\"attachment-tools\"><input class=\"attachment-query\" data-event=\"attachment-picker-filter\" value=\"" + _gui_shell_escape_html(attachment_query) + "\" data-root=\"" + _gui_shell_escape_html(attachment_root) + "\"><input class=\"attachment-target\" data-event=\"attachment-picker-filter\" value=\"" + _gui_shell_escape_html(attachment_target) + "\"><input class=\"attachment-storage\" data-event=\"attachment-picker-filter\" value=\"" + _gui_shell_escape_html(attachment_storage) + "\"><button type=\"button\" data-event=\"attachment-picker-filter\" data-value=\"" + _gui_shell_escape_html(attachment_filter_payload) + "\">Filter</button><span class=\"attachment-count\">" + state.ctrl.wiki_panel.rows.len().to_text() + " attachments</span></div>"
+            elif state.ctrl.wiki_panel.title == "Graph":
+                wiki_content = gui_render_wiki_graph_html(state.ctrl.wiki_panel)
+            var wpi = state.ctrl.wiki_panel.scroll_offset
+            var rendered_wiki = 0
+            while wpi < state.ctrl.wiki_panel.rows.len() and rendered_wiki < 50:
+                val row = state.ctrl.wiki_panel.rows[wpi]
+                val selected_class = if wpi == state.ctrl.wiki_panel.selected then " selected" else: ""
+                val line = wiki_panel_render_row(state.ctrl.wiki_panel, wpi)
+                var row_controls = ""
+                if state.ctrl.wiki_panel.title == "Templates":
+                    row_controls = "<button type=\"button\" data-event=\"template-insert\" data-value=\"" + _gui_shell_escape_html(row.detail) + "\">Insert</button>"
+                elif state.ctrl.wiki_panel.title == "Quick Switch":
+                    row_controls = "<button type=\"button\" data-event=\"quick-switch-insert\" data-value=\"" + _gui_shell_escape_html(row.detail) + "\">Embed</button>"
+                elif state.ctrl.wiki_panel.title == "Attachment Picker" and row.detail != "":
+                    row_controls = "<button type=\"button\" data-event=\"attachment-insert\" data-value=\"" + _gui_shell_escape_html(row.detail) + "\">Insert</button>"
+                wiki_content = wiki_content + "<div class=\"wiki-row" + selected_class + "\" data-event=\"wiki-panel-click\" data-value=\"" + wpi.to_text() + "\" data-row=\"" + wpi.to_text() + "\" data-path=\"" + _gui_escape_html(row.path) + "\" data-line=\"" + row.line.to_text() + "\">" + _gui_escape_html(line) + row_controls + "</div>"
+                wpi = wpi + 1
+                rendered_wiki = rendered_wiki + 1
+        right_panel_html = "<div class=\"wiki-pane\">" + wiki_content + "</div>"
+    elif state.ctrl.session.dock_layout.active_right == "lsp-panel":
+        var lsp_content = gui_render_lsp_navigation_tools_html(state.ctrl) + gui_render_workspace_edit_tools_html(state.ctrl)
+        right_panel_html = "<div class=\"lsp-results-pane\">" + lsp_content + gui_render_lsp_result_rows_html(state.ctrl.lsp_result_panel) + "</div>"
+    elif state.ctrl.session.dock_layout.active_right == "problems":
+        var problem_content = gui_render_diagnostics_tools_html() + gui_render_diagnostics_table_html(state.ctrl.diagnostics_panel)
+        right_panel_html = "<div class=\"problems-pane\">" + problem_content + "</div>"
+    elif doc_frame != nil and doc_frame.md_state != nil:
+        if doc_frame.md_state.preview_visible:
+            val preview_lines = preview_pane_render_for_editor(doc_frame.md_state.preview, state.ctrl.session.active_buffer(), 50)
+            var preview_content = ""
+            var pli = 0
+            while pli < preview_lines.len():
+                preview_content = preview_content + "<div>" + preview_lines[pli] + "</div>"
+                pli = pli + 1
+            right_panel_html = "<div class=\"preview-pane\">" + preview_content + "</div>"
+        elif doc_frame.md_state.outline_visible:
+            val outline_lines = outline_panel_render(doc_frame.md_state.outline, 50)
+            var outline_content = ""
+            var oli = 0
+            while oli < outline_lines.len():
+                outline_content = outline_content + "<div>" + outline_lines[oli] + "</div>"
+                oli = oli + 1
+            right_panel_html = "<div class=\"outline-pane\">" + outline_content + "</div>"
+    val mode_str = editor_mode_name(state.ctrl.session.mode)
+    var status_extra = ""
+    if doc_frame != nil and doc_frame.language_id == "markdown":
+        status_extra = " | " + md_stats_to_status_bar(doc_frame.cached_md_stats)
+    val hover_html = gui_render_lsp_hover_popup_html(state.ctrl.lsp_hover_popup)
+    val signature_html = gui_render_lsp_signature_popup_html(state.ctrl.lsp_signature_popup)
+    val status_html = "<div class=\"status\">" + mode_str + " | " + state.ctrl.status_msg + status_extra + "</div>"
+    GuiFrame(
+        tab_bar_html: tab_bar,
+        file_tree_html: file_tree_html,
+        editor_html: editor_html + hover_html + signature_html + right_panel_html,
+        status_html: status_html
+    )
+
+fn gui_render_lsp_hover_popup_html(popup: LspHoverPopup) -> text:
+    if not popup.visible:
+        return ""
+    "<div class=\"lsp-hover-popup\" data-line=\"" + popup.line.to_text() + "\" data-col=\"" + popup.col.to_text() + "\"><button type=\"button\" class=\"lsp-hover-close\" data-event=\"lsp-hover-dismiss\">x</button><div class=\"lsp-hover-content\">" + _gui_shell_escape_html(popup.content) + "</div><div class=\"lsp-hover-detail\">" + _gui_shell_escape_html(popup.detail) + "</div></div>"
+
+fn gui_render_lsp_signature_popup_html(popup: LspSignaturePopup) -> text:
+    if not popup.visible:
+        return ""
+    "<div class=\"lsp-signature-popup\" data-line=\"" + popup.line.to_text() + "\" data-col=\"" + popup.col.to_text() + "\" data-active-parameter=\"" + _gui_shell_escape_html(popup.active_parameter) + "\"><div class=\"lsp-signature-controls\"><button type=\"button\" class=\"lsp-signature-prev\" data-event=\"lsp-signature-prev\">Prev</button><button type=\"button\" class=\"lsp-signature-next\" data-event=\"lsp-signature-next\">Next</button><button type=\"button\" class=\"lsp-signature-close\" data-event=\"lsp-signature-dismiss\">x</button></div><div class=\"lsp-signature-label\">" + _gui_render_signature_label_html(popup.label, popup.active_parameter) + "</div><div class=\"lsp-signature-detail\">" + _gui_shell_escape_html(popup.detail) + "</div></div>"
+
+fn _gui_render_signature_label_html(label: text, active_parameter: text) -> text:
+    if active_parameter == "":
+        return _gui_shell_escape_html(label)
+    val idx = label.index_of(active_parameter)
+    if idx < 0:
+        return _gui_shell_escape_html(label)
+    _gui_shell_escape_html(label.slice(0, idx)) + "<span class=\"signature-active-parameter\">" + _gui_shell_escape_html(active_parameter) + "</span>" + _gui_shell_escape_html(label.slice(idx + active_parameter.len(), label.len()))
+
+fn gui_render_wiki_graph_html(panel: WikiPanel) -> text:
+    var html = "<div class=\"wiki-graph\" role=\"list\" data-layout=\"deterministic-grid\">"
+    var i = 0
+    while i < panel.rows.len():
+        val row = panel.rows[i]
+        val selected_class = if i == panel.selected then " selected" else: ""
+        val x = 12 + (i % 4) * 22
+        val y = 12 + (i / 4) * 18
+        val edge_x = if x > 12 then x - 11 else: 12
+        html = html + "<button type=\"button\" role=\"listitem\" class=\"wiki-graph-node" + selected_class + "\" data-event=\"wiki-panel-click\" data-value=\"" + i.to_text() + "\" data-row=\"" + i.to_text() + "\" data-path=\"" + _gui_shell_escape_html(row.path) + "\" data-x=\"" + x.to_text() + "\" data-y=\"" + y.to_text() + "\" style=\"left:" + x.to_text() + "%;top:" + y.to_text() + "%\"> " + _gui_shell_escape_html(row.label) + "</button>"
+        html = html + "<div class=\"wiki-graph-edge wiki-graph-edge-" + _gui_shell_escape_attr_token(row.icon) + "\" data-from-x=\"12\" data-from-y=\"12\" data-to-x=\"" + x.to_text() + "\" data-to-y=\"" + y.to_text() + "\" style=\"left:" + edge_x.to_text() + "%;top:" + y.to_text() + "%\">" + _gui_shell_escape_html(row.detail) + "</div>"
+        i = i + 1
+    html + "</div>"
+
+fn _gui_shell_escape_html(s: text) -> text:
+    var result = ""
+    var i = 0
+    while i < s.len():
+        val ch = s.char_at(i)
+        if ch == "<":
+            result = result + "&lt;"
+        elif ch == ">":
+            result = result + "&gt;"
+        elif ch == "&":
+            result = result + "&amp;"
+        elif ch == "\"":
+            result = result + "&quot;"
+        else:
+            result = result + ch
+        i = i + 1
+    result
+
+fn _gui_shell_escape_attr_token(value: text) -> text:
+    var result = ""
+    val lower = value.to_lower()
+    var i = 0
+    while i < lower.len():
+        val ch = lower.char_at(i)
+        if (ch >= "a" and ch <= "z") or (ch >= "0" and ch <= "9") or ch == "-":
+            result = result + ch
+        i = i + 1
+    if result == "":
+        return "item"
+    result
+
+fn gui_shell_present_frame(frame: GuiFrame):
+    val html = "<html><body>" + frame.tab_bar_html + frame.file_tree_html + frame.editor_html + frame.status_html + "</body></html>"
+    rt_gui_present_html(html)
+
+fn gui_render_diagnostics_tools_html() -> text:
+    "<div class=\"diagnostics-tools\"><button type=\"button\" data-event=\"diagnostics-filter\" data-filter=\"|\">All</button><button type=\"button\" data-event=\"diagnostics-filter\" data-filter=\"error|\">Errors</button><button type=\"button\" data-event=\"diagnostics-filter\" data-filter=\"warning|\">Warnings</button><button type=\"button\" data-event=\"diagnostics-sort\" data-sort=\"severity\">Sort severity</button><button type=\"button\" data-event=\"diagnostics-sort\" data-sort=\"path\">Sort path</button><button type=\"button\" data-event=\"diagnostics-group\" data-group=\"severity\">Group severity</button><button type=\"button\" data-event=\"diagnostics-group\" data-group=\"source\">Group source</button></div>"
+
+fn gui_render_diagnostics_table_html(panel: DiagnosticsPanel) -> text:
+    var html = "<table class=\"diagnostics-table\"><thead><tr><th>Severity</th><th>Message</th><th>Source</th><th>File</th><th>Line</th></tr></thead><tbody>"
+    var i = panel.scroll_offset
+    var rendered = 0
+    while i < panel.rows.len() and rendered < 50:
+        val row = panel.rows[i]
+        val selected_class = if i == panel.selected then " selected" else: ""
+        val source = _gui_diagnostic_source(row)
+        val file_label = if row.path == "" then "" else: editor_path_basename(row.path)
+        html = html + "<tr class=\"diagnostics-row" + selected_class + "\" data-event=\"diagnostics-row\" data-row=\"" + i.to_text() + "\" data-path=\"" + _gui_shell_escape_html(row.path) + "\" data-line=\"" + row.line.to_text() + "\" data-col=\"" + row.col.to_text() + "\"><td class=\"diagnostics-severity\">" + _gui_shell_escape_html(row.icon) + "</td><td class=\"diagnostics-message\">" + _gui_shell_escape_html(row.label) + "</td><td class=\"diagnostics-source\">" + _gui_shell_escape_html(source) + "</td><td class=\"diagnostics-file\">" + _gui_shell_escape_html(file_label) + "</td><td class=\"diagnostics-line\">" + (row.line + 1).to_text() + "</td></tr>"
+        i = i + 1
+        rendered = rendered + 1
+    html + "</tbody></table>"
+
+fn _gui_diagnostic_source(row: DiagnosticsPanelRow) -> text:
+    val idx = row.detail.last_index_of(" ")
+    if idx >= 0 and idx + 1 < row.detail.len():
+        return row.detail.slice(idx + 1, row.detail.len())
+    ""
+
+fn gui_render_workspace_edit_tools_html(ctrl: EditorController) -> text:
+    if ctrl.pending_workspace_edit_json == "":
+        return ""
+    "<div class=\"workspace-edit-tools\"><button type=\"button\" data-event=\"workspace-edit-confirm\">Apply</button><button type=\"button\" data-event=\"workspace-edit-cancel\">Cancel</button></div>"
+
+fn gui_render_lsp_navigation_tools_html(ctrl: EditorController) -> text:
+    if ctrl.lsp_location_stack.len() == 0:
+        return ""
+    val location = ctrl.lsp_location_stack[ctrl.lsp_location_stack.len() - 1]
+    "<div class=\"lsp-navigation-tools\"><button type=\"button\" data-event=\"lsp-back\" data-path=\"" + _gui_shell_escape_html(location.path) + "\" data-line=\"" + location.line.to_text() + "\">Back</button><span class=\"lsp-history-count\">" + ctrl.lsp_location_stack.len().to_text() + " locations</span></div>"
+
+fn gui_render_lsp_result_rows_html(panel: LspResultPanel) -> text:
+    var html = ""
+    if panel.title == "Code Actions":
+        html = html + "<div class=\"code-action-tools\"><button type=\"button\" data-event=\"code-actions-filter\" data-filter=\"all\">All</button><button type=\"button\" data-event=\"code-actions-filter\" data-filter=\"quickfix\">Quick fixes</button><button type=\"button\" data-event=\"code-actions-filter\" data-filter=\"source\">Source actions</button><button type=\"button\" data-event=\"code-actions-group\" data-group=\"kind\">Group kind</button></div>"
+    var lpi = 0
+    while lpi < panel.rows.len():
+        val row = panel.rows[lpi]
+        val selected_class = if lpi == panel.selected then " selected" else: ""
+        var row_controls = ""
+        if row.command_name != "":
+            row_controls = "<div class=\"lsp-command-form\"><input class=\"lsp-command-name\" value=\"" + _gui_shell_escape_html(row.command_name) + "\"><input class=\"lsp-command-args\" value=\"" + _gui_shell_escape_html(row.command_payload) + "\"><button type=\"button\" data-event=\"code-lens-run\" data-value=\"" + _gui_shell_escape_html(row.command_name + "|" + row.command_payload) + "\">Run</button></div>"
+        elif (row.icon == "edit" or row.icon == "conflict") and (panel.title == "Formatting Preview" or panel.title == "Range Formatting Preview" or panel.title == "Rename Preview" or panel.title == "Workspace Edit Preview"):
+            val conflict_badge = if row.icon == "conflict" then "<span class=\"workspace-edit-conflict\">Conflict</span>" else: ""
+            row_controls = "<div class=\"workspace-edit-diff\"><span class=\"diff-before\">" + _gui_shell_escape_html(_gui_workspace_edit_selection_label(row.detail)) + "</span><span class=\"diff-after\">" + _gui_shell_escape_html(row.command_payload) + "</span>" + conflict_badge + "</div>"
+        val conflict_class = if row.icon == "conflict" then " conflict" else: ""
+        html = html + "<div class=\"lsp-result-row" + selected_class + conflict_class + "\" data-event=\"lsp-result-click\" data-row=\"" + lpi.to_text() + "\">" + _gui_shell_escape_html(row.label) + row_controls + "</div>"
+        lpi = lpi + 1
+    html
+
+fn _gui_workspace_edit_selection_label(detail: text) -> text:
+    val idx = detail.index_of(" -> ") ?? -1
+    if idx < 0:
+        return detail
+    detail.slice(0, idx)
+
+# SDL-backed presentation path.
+# Delegates to gui_sdl_present_frame from gui_sdl_bridge.spl.
+# The caller is responsible for creating the window via gui_sdl_init.
+fn gui_shell_present_frame_sdl(window: i64, frame: GuiFrame):
+    gui_sdl_present_frame(window, frame)
+
+# --- Drag/docking for dock panels ---
+
+fn _drag_state_new() -> DragState:
+    DragState(active: false, source_panel_id: "", source_zone: -1, mouse_x: 0, mouse_y: 0, drop_target_zone: -1)
+
+fn gui_handle_mouse_down(state: GuiShellState, drag: DragState, x: i64, y: i64) -> DragState:
+    val dock = state.ctrl.session.dock_layout
+    val zones: [i64] = [DOCK_LEFT, DOCK_RIGHT, DOCK_BOTTOM]
+    var zi = 0
+    while zi < zones.len():
+        val zone = zones[zi]
+        val panels = dock.visible_panels_in(zone)
+        if panels.len() > 0:
+            val hit = _drag_hit_zone_tab(state, zone, x, y)
+            if hit != "":
+                return DragState(active: true, source_panel_id: hit, source_zone: zone, mouse_x: x, mouse_y: y, drop_target_zone: -1)
+        zi = zi + 1
+    drag
+
+fn gui_handle_mouse_move(state: GuiShellState, drag: DragState, x: i64, y: i64) -> DragState:
+    if not drag.active:
+        return drag
+    val target = gui_compute_drop_zone(state, x, y)
+    DragState(active: true, source_panel_id: drag.source_panel_id, source_zone: drag.source_zone, mouse_x: x, mouse_y: y, drop_target_zone: target)
+
+fn gui_handle_mouse_up(state: GuiShellState, drag: DragState) -> DragState:
+    if not drag.active:
+        return drag
+    if drag.drop_target_zone >= 0 and drag.drop_target_zone != drag.source_zone:
+        val dock = state.ctrl.session.dock_layout
+        val panels = dock.visible_panels_in(drag.source_zone)
+        var found_label = ""
+        var found_icon = ""
+        var pi = 0
+        while pi < panels.len():
+            if panels[pi].id == drag.source_panel_id:
+                found_label = panels[pi].label
+                found_icon = panels[pi].icon
+            pi = pi + 1
+        dock.remove_panel(drag.source_panel_id)
+        dock.add_panel(DockPanel(id: drag.source_panel_id, label: found_label, zone: drag.drop_target_zone, icon: found_icon, visible: true))
+        dock.set_active(drag.drop_target_zone, drag.source_panel_id)
+    _drag_state_new()
+
+fn gui_compute_drop_zone(state: GuiShellState, x: i64, y: i64) -> i64:
+    val w = state.config.initial_width
+    val h = state.config.initial_height
+    val left_edge = w / 5
+    val right_edge = w - w / 5
+    val bottom_edge = h - h / 4
+    if x < left_edge:
+        return DOCK_LEFT
+    if x > right_edge:
+        return DOCK_RIGHT
+    if y > bottom_edge:
+        return DOCK_BOTTOM
+    -1
+
+fn gui_render_drop_overlay(drag: DragState, width: i64, height: i64) -> text:
+    if not drag.active:
+        return ""
+    if drag.drop_target_zone < 0:
+        return ""
+    var zone_style = ""
+    if drag.drop_target_zone == DOCK_LEFT:
+        zone_style = "left:0;top:0;width:20%;height:100%"
+    elif drag.drop_target_zone == DOCK_RIGHT:
+        zone_style = "right:0;top:0;width:20%;height:100%"
+    elif drag.drop_target_zone == DOCK_BOTTOM:
+        zone_style = "left:0;bottom:0;width:100%;height:25%"
+    else:
+        return ""
+    "<div class=\"drop-overlay\" style=\"position:absolute;" + zone_style + ";background:rgba(0,120,215,0.3);pointer-events:none;\"></div>"
+
+fn _drag_hit_zone_tab(state: GuiShellState, zone: i64, x: i64, y: i64) -> text:
+    val w = state.config.initial_width
+    val h = state.config.initial_height
+    val tab_h = 28
+    var zone_x = 0
+    var zone_y = 0
+    var zone_w = 0
+    if zone == DOCK_LEFT:
+        zone_x = 0
+        zone_y = 0
+        zone_w = state.ctrl.session.dock_layout.left_width_value() * w / 100
+    elif zone == DOCK_RIGHT:
+        zone_w = state.ctrl.session.dock_layout.right_width_value() * w / 100
+        zone_x = w - zone_w
+        zone_y = 0
+    elif zone == DOCK_BOTTOM:
+        zone_x = 0
+        zone_y = h - state.ctrl.session.dock_layout.bottom.size * h / 100
+        zone_w = w
+    if x >= zone_x and x < zone_x + zone_w and y >= zone_y and y < zone_y + tab_h:
+        val panels = state.ctrl.session.dock_layout.visible_panels_in(zone)
+        if panels.len() > 0:
+            return panels[0].id
+    ""
+
+# --- Event polling and coordinate parsing ---
+
+fn gui_shell_poll_event() -> GuiEvent:
+    GuiEvent(kind: "", data: "")
+
+fn gui_shell_poll_event_sdl() -> GuiEvent:
+    gui_sdl_poll()
+
+fn _parse_mouse_coords(data: text) -> MouseCoords:
+    val comma_idx = data.index_of(",")
+    if comma_idx < 0:
+        return MouseCoords(x: 0, y: 0)
+    val x_str = data.slice(0, comma_idx)
+    val y_str = data.slice(comma_idx + 1, data.len())
+    MouseCoords(x: x_str.to_i64(), y: y_str.to_i64())
+
+fn _gui_shell_basename_without_markdown_ext(path: text) -> text:
+    var name = editor_path_basename(path)
+    if name.ends_with(".markdown"):
+        name = name.slice(0, name.len() - 9)
+    elif name.ends_with(".md"):
+        name = name.slice(0, name.len() - 3)
+    name

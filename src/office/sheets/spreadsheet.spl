@@ -1,0 +1,233 @@
+# Spreadsheet Model
+#
+# Sheet and Workbook types with cell operations.
+
+use app.office.sheets.cell.{Cell, CellValue, CellStyle, CellRef, empty_cell, text_cell, number_cell, formula_cell, cell_ref_to_string, parse_cell_ref, default_style}
+
+# =========================================================================
+# Sheet
+# =========================================================================
+
+class Sheet:
+    name: text
+    cells: Dict<text, Cell>   # Key: "A1", "B2" etc.
+    col_count: i32
+    row_count: i32
+
+impl Sheet:
+
+    static fn new(name: text) -> Sheet:
+        """Create an empty sheet with default 26 columns and 100 rows."""
+        Sheet(
+            name: name,
+            cells: {},
+            col_count: 26,
+            row_count: 100
+        )
+
+    me get_cell(ref_str: text) -> Cell:
+        """Get the cell at the given reference, or an empty cell if none exists."""
+        val key = ref_str.upper()
+        val found = me.cells.get(key)
+        if found != nil:
+            return found
+        empty_cell()
+
+    me set_cell(ref_str: text, cell: Cell):
+        """Set a cell at the given reference."""
+        val key = ref_str.upper()
+        me.cells[key] = cell
+
+    me set_value(ref_str: text, value: text):
+        """Parse a value string and set the appropriate cell type.
+        Strings starting with '=' become formulas, numeric strings become numbers,
+        'true'/'false' become bools, everything else becomes text."""
+        val trimmed = value.trim()
+        if trimmed.len() == 0:
+            me.cells = me.cells.remove(ref_str.upper())
+            return
+
+        # Formula
+        if trimmed.starts_with("="):
+            val expr = trimmed.substring(1)
+            me.set_cell(ref_str, formula_cell(expr))
+            return
+
+        # Boolean
+        val lower = trimmed.lower()
+        if lower == "true":
+            val cell = Cell(value: CellValue.BoolVal(value: true), style: default_style())
+            me.set_cell(ref_str, cell)
+            return
+        if lower == "false":
+            val cell = Cell(value: CellValue.BoolVal(value: false), style: default_style())
+            me.set_cell(ref_str, cell)
+            return
+
+        # Try number
+        val num = _try_parse_number(trimmed)
+        if num != nil:
+            me.set_cell(ref_str, number_cell(num))
+            return
+
+        # Default to text
+        me.set_cell(ref_str, text_cell(trimmed))
+
+    me cell_count() -> i32:
+        """Count non-empty cells."""
+        var count = 0
+        for key in me.cells.keys():
+            count = count + 1
+        count
+
+    me used_range() -> text:
+        """Return the bounding range string like 'A1:D10' based on actual cell content."""
+        var min_col = 999999
+        var max_col = 0
+        var min_row = 999999
+        var max_row = 0
+        var has_cells = false
+
+        for key in me.cells.keys():
+            val ref_val = parse_cell_ref(key)
+            if ref_val != nil:
+                has_cells = true
+                if ref_val.col < min_col:
+                    min_col = ref_val.col
+                if ref_val.col > max_col:
+                    max_col = ref_val.col
+                if ref_val.row < min_row:
+                    min_row = ref_val.row
+                if ref_val.row > max_row:
+                    max_row = ref_val.row
+
+        if not has_cells:
+            return "A1:A1"
+
+        val start_ref = CellRef(col: min_col, row: min_row)
+        val end_ref = CellRef(col: max_col, row: max_row)
+        "{cell_ref_to_string(start_ref)}:{cell_ref_to_string(end_ref)}"
+
+# =========================================================================
+# Workbook
+# =========================================================================
+
+class Workbook:
+    title: text
+    sheets: [Sheet]
+    active_sheet: i32
+
+impl Workbook:
+
+    static fn new(title: text) -> Workbook:
+        """Create a new workbook with one empty sheet named 'Sheet1'."""
+        val first_sheet = Sheet.new("Sheet1")
+        Workbook(
+            title: title,
+            sheets: [first_sheet],
+            active_sheet: 0
+        )
+
+    me active() -> Sheet:
+        """Get the currently active sheet."""
+        me.sheets[me.active_sheet]
+
+    me add_sheet(name: text):
+        """Add a new empty sheet with the given name."""
+        val sheet = Sheet.new(name)
+        var sheets = me.sheets
+        sheets.push(sheet)
+        me.sheets = sheets
+
+    me remove_sheet(index: i32):
+        """Remove the sheet at the given index. Does nothing if only one sheet remains."""
+        if me.sheets.len() <= 1:
+            return
+        if index < 0 or index >= me.sheets.len():
+            return
+        var new_sheets: [Sheet] = []
+        var i = 0
+        for sheet in me.sheets:
+            if i != index:
+                new_sheets.push(sheet)
+            i = i + 1
+        me.sheets = new_sheets
+        # Adjust active_sheet if needed
+        if me.active_sheet >= me.sheets.len():
+            me.active_sheet = me.sheets.len() - 1
+        if me.active_sheet < 0:
+            me.active_sheet = 0
+
+    me set_active(index: i32):
+        """Switch the active sheet to the given index."""
+        if index >= 0 and index < me.sheets.len():
+            me.active_sheet = index
+
+# =========================================================================
+# Internal Helpers
+# =========================================================================
+
+fn _try_parse_number(s: text) -> f64?:
+    """Attempt to parse text as a number. Returns nil if not a valid number."""
+    if s.len() == 0:
+        return nil
+    var has_dot = false
+    var has_digit = false
+    var i = 0
+    # Allow leading minus
+    if s.char_at(0) == "-":
+        if s.len() == 1:
+            return nil
+        i = 1
+    while i < s.len():
+        val c = s.char_at(i)
+        if c == ".":
+            if has_dot:
+                return nil  # Two dots
+            has_dot = true
+        elif _is_digit(c):
+            has_digit = true
+        else:
+            return nil
+        i = i + 1
+    if not has_digit:
+        return nil
+    # Parse it
+    return _parse_f64(s)
+
+fn _parse_f64(s: text) -> f64?:
+    """Parse a float from text. Supports optional leading minus and one decimal point."""
+    var negative = false
+    var start = 0
+    if s.char_at(0) == "-":
+        negative = true
+        start = 1
+    var int_part = 0.0
+    var frac_part = 0.0
+    var frac_divisor = 1.0
+    var in_frac = false
+    var i = start
+    while i < s.len():
+        val c = s.char_at(i)
+        if c == ".":
+            in_frac = true
+        elif _is_digit(c):
+            val d = _digit_val(c)
+            if in_frac:
+                frac_divisor = frac_divisor * 10.0
+                frac_part = frac_part + d.to_f64() / frac_divisor
+            else:
+                int_part = int_part * 10.0 + d.to_f64()
+        i = i + 1
+    var result = int_part + frac_part
+    if negative:
+        result = 0.0 - result
+    return result
+
+fn _is_digit(c: text) -> bool:
+    (c == "0" or c == "1" or c == "2" or c == "3" or c == "4" or
+     c == "5" or c == "6" or c == "7" or c == "8" or c == "9")
+
+fn _digit_val(c: text) -> i32:
+    val code = c.char_code_at(0)
+    code - 48

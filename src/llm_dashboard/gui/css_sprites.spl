@@ -1,0 +1,298 @@
+# CSS Sprites
+#
+# CSS pixel-art agent sprites and animations for the GUI dashboard.
+# Each provider has distinct colors; each state has CSS animation.
+
+# =========================================================================
+# Agent Sprite CSS
+# =========================================================================
+
+fn generate_agent_css() -> text:
+    """Generate CSS for agent pixel-art sprites and animations."""
+    return r"""
+/* Agent Dashboard Sprites */
+.agent-sprite {
+    display: inline-block;
+    width: 32px;
+    height: 48px;
+    position: relative;
+    image-rendering: pixelated;
+}
+
+/* Provider Colors */
+.agent-claude { color: #e67e22; }
+.agent-codex { color: #27ae60; }
+.agent-gemini { color: #3498db; }
+.agent-unknown { color: #95a5a6; }
+
+/* Agent Head (CSS pixel art) */
+.agent-head {
+    width: 24px;
+    height: 24px;
+    border-radius: 4px;
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: bold;
+    font-size: 14px;
+    color: white;
+}
+
+.agent-claude .agent-head { background: #e67e22; }
+.agent-codex .agent-head { background: #27ae60; }
+.agent-gemini .agent-head { background: #3498db; }
+.agent-unknown .agent-head { background: #95a5a6; }
+
+/* Agent Body */
+.agent-body {
+    width: 16px;
+    height: 16px;
+    margin: 2px auto;
+    border-left: 2px solid currentColor;
+    border-right: 2px solid currentColor;
+    border-bottom: 2px solid currentColor;
+}
+
+/* State Indicators */
+.state-thinking { animation: pulse 1s ease-in-out infinite; }
+.state-reading { animation: bob 0.8s ease-in-out infinite; }
+.state-writing { animation: sway 0.6s ease-in-out infinite; }
+.state-searching { animation: scan 1.2s ease-in-out infinite; }
+.state-idle { opacity: 0.5; }
+.state-error { animation: shake 0.3s ease-in-out infinite; color: #e74c3c !important; }
+.state-finished { opacity: 0.3; filter: grayscale(1); }
+
+/* State Badge */
+.state-badge {
+    position: absolute;
+    top: -4px;
+    right: -8px;
+    font-size: 12px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #2c3e50;
+    border: 1px solid currentColor;
+}
+
+.state-thinking .state-badge { content: '*'; background: #f39c12; }
+.state-reading .state-badge { content: 'R'; background: #3498db; }
+.state-writing .state-badge { content: 'W'; background: #27ae60; }
+.state-searching .state-badge { content: '?'; background: #9b59b6; }
+.state-error .state-badge { content: '!'; background: #e74c3c; }
+
+/* Animations */
+@keyframes pulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.1); }
+}
+
+@keyframes bob {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-3px); }
+}
+
+@keyframes sway {
+    0%, 100% { transform: rotate(0deg); }
+    25% { transform: rotate(3deg); }
+    75% { transform: rotate(-3deg); }
+}
+
+@keyframes scan {
+    0%, 100% { transform: translateX(0); }
+    50% { transform: translateX(4px); }
+}
+
+@keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-2px); }
+    75% { transform: translateX(2px); }
+}
+"""
+
+# =========================================================================
+# Room CSS
+# =========================================================================
+
+fn generate_room_css() -> text:
+    """Generate CSS for room grid layout."""
+    return r"""
+/* Room Grid */
+.room-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    gap: 8px;
+    padding: 8px;
+    height: calc(100vh - 200px);
+}
+
+.room {
+    border: 2px solid #34495e;
+    border-radius: 8px;
+    padding: 8px;
+    overflow-y: auto;
+    background: #1a1a2e;
+    min-height: 120px;
+}
+
+.room-title {
+    font-weight: bold;
+    font-size: 14px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #34495e;
+    margin-bottom: 8px;
+}
+
+.room-research { border-color: #9b59b6; }
+.room-research .room-title { color: #9b59b6; }
+.room-code { border-color: #27ae60; }
+.room-code .room-title { color: #27ae60; }
+.room-skills { border-color: #f1c40f; }
+.room-skills .room-title { color: #f1c40f; }
+.room-server { border-color: #3498db; }
+.room-server .room-title { color: #3498db; }
+.room-chat { border-color: #e67e22; }
+.room-chat .room-title { color: #e67e22; }
+.room-testlab { border-color: #e74c3c; }
+.room-testlab .room-title { color: #e74c3c; }
+
+/* Activity entry in room */
+.activity-item {
+    font-family: monospace;
+    font-size: 12px;
+    padding: 2px 4px;
+    color: #bdc3c7;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.activity-item:hover {
+    background: #2c3e50;
+    color: white;
+}
+
+/* Agent Tree Panel */
+.agent-tree {
+    font-family: monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    padding: 8px;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    overflow-y: auto;
+    max-height: 300px;
+}
+
+.tree-node {
+    padding-left: 16px;
+    position: relative;
+}
+
+.tree-node::before {
+    content: '';
+    position: absolute;
+    left: 6px;
+    top: 0;
+    bottom: 0;
+    border-left: 1px solid #30363d;
+}
+
+.tree-node-root { padding-left: 0; }
+.tree-node-root::before { display: none; }
+
+/* Status Bar */
+.status-bar {
+    display: flex;
+    gap: 16px;
+    padding: 8px 16px;
+    background: #161b22;
+    border-top: 1px solid #30363d;
+    font-family: monospace;
+    font-size: 13px;
+    color: #8b949e;
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+}
+
+.status-provider {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+
+.status-dot.connected { background: #27ae60; }
+.status-dot.disconnected { background: #7f8c8d; }
+
+/* Activity Feed */
+.activity-feed {
+    font-family: monospace;
+    font-size: 12px;
+    max-height: 200px;
+    overflow-y: auto;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    background: #0d1117;
+}
+
+.feed-entry {
+    display: flex;
+    gap: 8px;
+    padding: 2px 8px;
+    border-bottom: 1px solid #21262d;
+}
+
+.feed-time { color: #8b949e; min-width: 70px; }
+.feed-agent { color: #58a6ff; min-width: 80px; }
+.feed-summary { color: #c9d1d9; flex: 1; }
+.feed-room { color: #8b949e; min-width: 60px; text-align: right; }
+
+@media (max-width: 1100px) {
+    .room-grid {
+        grid-template-columns: 1fr 1fr;
+        grid-template-rows: auto;
+        height: auto;
+    }
+
+    .agent-tree {
+        max-height: 240px;
+    }
+}
+
+@media (max-width: 720px) {
+    .room-grid {
+        grid-template-columns: 1fr;
+        padding: 0;
+        height: auto;
+    }
+
+    .status-bar {
+        flex-wrap: wrap;
+        gap: 8px;
+        padding: 8px 12px;
+    }
+
+    .feed-entry {
+        flex-wrap: wrap;
+    }
+
+    .feed-time,
+    .feed-agent {
+        min-width: 0;
+    }
+}
+"""
