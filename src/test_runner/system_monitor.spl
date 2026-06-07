@@ -611,7 +611,7 @@ fn ensure_kill_monitor_running():
     - MinGW/MSYS2/Cygwin: run .sh via sh (has bash, can see native Windows procs via cmd.exe)
     - Native Windows (cmd/MSVC): run .bat via cmd /c
     """
-    val sh_path = "scripts/resource/kill_simple_monitor.sh"
+    val sh_path = "scripts/resource/kill_simple_monitor.shs"
     val bat_path = "scripts/resource/kill_simple_monitor.bat"
 
     # Check if already running via PID file + process liveness
@@ -642,7 +642,7 @@ fn ensure_kill_monitor_running():
         # Linux / macOS / FreeBSD / MinGW / MSYS2 / Cygwin: use .sh
         if rt_file_exists(sh_path):
             rt_process_spawn_async("sh", [sh_path])
-            print "[safeguard] Started kill_simple_monitor.sh in background"
+            print "[safeguard] Started kill_simple_monitor.shs in background"
         else:
             print "[safeguard] WARNING: {sh_path} not found, skipping resource monitor"
 

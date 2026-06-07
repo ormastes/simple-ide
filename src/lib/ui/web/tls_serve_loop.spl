@@ -16,7 +16,7 @@ use std.nogc_sync_mut.io.tls_sffi.{
 }
 use std.nogc_sync_mut.io.sffi_common.{is_valid_handle}
 use std.nogc_sync_mut.io.tcp.{TcpStream}
-use std.nogc_async_mut.concurrent.thread.{thread_spawn2, thread_sleep}
+use std.nogc_async_mut.concurrent.thread.{thread_spawn_with_args, thread_sleep}
 use common.ui.widget.{UIEvent, UIState}
 use nogc_sync_mut.ui.parse.sdn_tree.{parse_ui_to_tree}
 use common.ui.state.{init_state}
@@ -233,7 +233,7 @@ class TlsWebServer:
         """Accept-loop on the already-created TLS server handle."""
         val file_path_copy = self.file_path
         val event_ch = self.event_channel
-        val watcher = thread_spawn2(file_path_copy, event_ch, \fp, ch:
+        val watcher = thread_spawn_with_args(file_path_copy, event_ch, \fp, ch:
             _tls_file_watcher_loop(fp, ch)
         )
 
@@ -253,7 +253,7 @@ class TlsWebServer:
             val conn_handle = rt_tls_server_accept(tls_server_handle)
             if is_valid_handle(conn_handle):
                 var conn = ConnStream.from_tls(conn_handle)
-                val handler = thread_spawn2(conn, self, \c, server:
+                val handler = thread_spawn_with_args(conn, self, \c, server:
                     val tls_server: TlsWebServer = server
                     TlsWebServer.handle_connection_thread(tls_server, c)
                 )
